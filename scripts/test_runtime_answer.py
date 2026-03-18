@@ -14,9 +14,8 @@ if str(ROOT) not in sys.path:
 from app.config.settings import load_settings
 from app.db.models.enums import ChannelTypeEnum, QuestionIntentEnum
 from app.db.session import DatabaseSessionManager
-from app.services.answers.answer_orchestrator import AnswerOrchestrator
-from app.services.generation.generation_pipeline import GenerationRequest
-from app.services.retrieval.retrieval_orchestrator import RetrievalInput
+from app.runtime.app_runtime import AppRuntime, AppRuntimeConfig
+from app.services.answers.runtime_answer_service import RuntimeAnswerInput
 
 
 QUESTION_PRESETS: dict[str, tuple[str, QuestionIntentEnum]] = {
@@ -52,32 +51,22 @@ def _resolve_question(raw_question: str | None, preset: str | None) -> str:
 
 async def run(question_text: str, intent: QuestionIntentEnum) -> int:
     settings = load_settings()
-    manager = DatabaseSessionManager(settings.database)
-    manager.initialize()
-    await manager.check_connection()
+
+    runtime = AppRuntime(
+        AppRuntimeConfig(
+            database=settings.database,
+        )
+    )
+    await runtime.startup()
 
     try:
-        async with manager.session_scope() as session:
-            orchestrator = AnswerOrchestrator(session)
+        async with runtime.session_scope() as session:
+            factory = runtime.build_service_factory(session)
+            runtime_answer_service = factory.get_runtime_answer_service()
 
-            retrieval_input = RetrievalInput(
-                question_event_id=uuid4(),
-                question_text_raw=question_text,
-                question_text_normalized=question_text,
-                intent_type=intent,
-                measure_code="edv" if "едв" in question_text.lower() else None,
-                query_terms=[],
-                constraints_json={},
-                top_k_facts=12,
-                top_k_tables=12,
-                top_k_rows=16,
-                top_k_blocks=12,
-                final_top_k=12,
-            )
-
-            generation_request = GenerationRequest(
+            payload = RuntimeAnswerInput(
                 session_id=uuid4(),
-                question_event_id=retrieval_input.question_event_id,
+                question_event_id=uuid4(),
                 channel_code=ChannelTypeEnum.TELEGRAM,
                 question_text_raw=question_text,
                 question_text_normalized=question_text,
@@ -88,24 +77,28 @@ async def run(question_text: str, intent: QuestionIntentEnum) -> int:
                 routing_payload_json={},
                 query_constraints_json={},
                 request_metadata_json={},
+                query_terms=[],
+                top_k_facts=12,
+                top_k_tables=12,
+                top_k_rows=16,
+                top_k_blocks=12,
+                final_top_k=12,
             )
 
-            result = await orchestrator.run_runtime_answer(
-                retrieval_input=retrieval_input,
-                generation_request=generation_request,
-            )
+            result = await runtime_answer_service.build_answer(payload)
 
             print(json.dumps({
-                "answer_mode": getattr(result, "answer_mode", None).value if getattr(result, "answer_mode", None) else None,
-                "answer_text": getattr(result, "answer_text", None),
-                "citations_json": getattr(result, "citations_json", None),
-                "answer_payload_json": getattr(result, "answer_payload_json", None),
-                "reuse_decision_payload_json": getattr(result, "reuse_decision_payload_json", None),
+                "answer_mode": result.generation_result.answer_mode.value if result.generation_result.answer_mode else None,
+                "answer_text": result.generation_result.answer_text,
+                "citations_json": result.generation_result.citations_json,
+                "answer_payload_json": result.generation_result.answer_payload_json,
+                "reuse_decision_payload_json": result.generation_result.reuse_decision_payload_json,
+                "runtime_payload_json": result.runtime_payload_json,
             }, ensure_ascii=False, indent=2, default=str))
 
         return 0
     finally:
-        await manager.dispose()
+        await runtime.shutdown()
 
 
 def main() -> int:
