@@ -1799,96 +1799,133 @@ class RetrievalOrchestrator:
         return selected_document_ids
 
     def _select_final_candidates(
-        self,
-        *,
-        payload: RetrievalInput,
-        strategy: RetrievalStrategy,
-        candidates: list[RetrievedCandidate],
-        document_stats: dict[UUID, dict[str, Any]],
-        priority_document_ids: list[UUID],
-    ) -> list[RetrievedCandidate]:
-        """
-        Select final balanced evidence set.
+            self,
+            *,
+            payload: RetrievalInput,
+            strategy: RetrievalStrategy,
+            candidates: list[RetrievedCandidate],
+            document_stats: dict[UUID, dict[str, Any]],
+            priority_document_ids: list[UUID],
+        ) -> list[RetrievedCandidate]:
+            """
+            Select final balanced evidence set.
 
-        Rules:
-        - keep top-ranked candidates
-        - prefer 1-2 priority documents
-        - avoid overloading from a single source type
-        - avoid too many items from same document
-        - keep fallback path if balancing becomes too strict
-        """
-        if not candidates:
-            return []
+            Special rule for DOCUMENTS_QUESTION:
+            - prefer table_row evidence from the priority document
+            - allow a noticeably larger pool of row candidates
+            - suppress noisy blocks/facts because deterministic builder
+              needs rows, not a mixed bag of snippets
+            """
+            if not candidates:
+                return []
 
-        type_caps = {
-            "legal_fact": max(2, min(5, payload.final_top_k)),
-            "table": max(2, min(4, payload.final_top_k)),
-            "table_row": max(2, min(5, payload.final_top_k)),
-            "block": max(2, min(5, payload.final_top_k)),
-        }
+            is_documents_question = payload.intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION
 
-        priority_document_set = set(priority_document_ids)
-        min_score_threshold = self._get_min_candidate_score_threshold(
-            payload=payload,
-            strategy=strategy,
-            document_stats=document_stats,
-        )
-
-        priority_candidates: list[RetrievedCandidate] = []
-        non_priority_candidates: list[RetrievedCandidate] = []
-
-        for candidate in candidates:
-            if candidate.document_id in priority_document_set:
-                priority_candidates.append(candidate)
+            if is_documents_question:
+                # Для questions типа "какие документы нужны..."
+                # builder должен получить достаточный пул row-кандидатов.
+                type_caps = {
+                    "legal_fact": 1,
+                    "table": min(2, payload.final_top_k),
+                    "table_row": min(max(10, payload.final_top_k), 14),
+                    "block": 1,
+                }
             else:
-                non_priority_candidates.append(candidate)
+                type_caps = {
+                    "legal_fact": max(2, min(5, payload.final_top_k)),
+                    "table": max(2, min(4, payload.final_top_k)),
+                    "table_row": max(2, min(5, payload.final_top_k)),
+                    "block": max(2, min(5, payload.final_top_k)),
+                }
 
-        ordered_candidates = [*priority_candidates, *non_priority_candidates]
+            priority_document_set = set(priority_document_ids)
+            min_score_threshold = self._get_min_candidate_score_threshold(
+                payload=payload,
+                strategy=strategy,
+                document_stats=document_stats,
+            )
 
-        selected: list[RetrievedCandidate] = []
-        selected_keys: set[tuple[str, UUID]] = set()
-        type_counts: dict[str, int] = {}
-        document_counts: dict[UUID, int] = {}
+            priority_candidates: list[RetrievedCandidate] = []
+            non_priority_candidates: list[RetrievedCandidate] = []
 
-        for candidate in ordered_candidates:
-            if len(selected) >= payload.final_top_k:
-                break
+            for candidate in candidates:
+                if candidate.document_id in priority_document_set:
+                    priority_candidates.append(candidate)
+                else:
+                    non_priority_candidates.append(candidate)
 
-            candidate_key = (candidate.source_type, candidate.source_id)
-            if candidate_key in selected_keys:
-                continue
+            ordered_candidates = [*priority_candidates, *non_priority_candidates]
 
-            effective_score = self._candidate_effective_score(candidate)
-            if effective_score < min_score_threshold:
-                continue
+            # Для documents-question поднимаем наверх table_row из documents-table,
+            # чтобы сначала отбирать именно answer-bearing rows.
+            if is_documents_question:
+                ordered_candidates.sort(
+                    key=lambda candidate: (
+                        0 if (
+                            candidate.document_id in priority_document_set
+                            and candidate.source_type == "table_row"
+                            and self._has_table_semantic_type(candidate, "documents")
+                        ) else
+                        1 if (
+                            candidate.document_id in priority_document_set
+                            and candidate.source_type == "table"
+                            and self._has_table_semantic_type(candidate, "documents")
+                        ) else
+                        2 if candidate.document_id in priority_document_set else 3,
+                        -self._candidate_effective_score(candidate),
+                    )
+                )
 
-            current_type_count = type_counts.get(candidate.source_type, 0)
-            if current_type_count >= type_caps.get(candidate.source_type, payload.final_top_k):
-                continue
+            selected: list[RetrievedCandidate] = []
+            selected_keys: set[tuple[str, UUID]] = set()
+            type_counts: dict[str, int] = {}
+            document_counts: dict[UUID, int] = {}
 
-            current_doc_count = document_counts.get(candidate.document_id, 0)
-            max_per_document = 6 if candidate.document_id in priority_document_set else 3
-            if current_doc_count >= max_per_document:
-                continue
-
-            selected.append(candidate)
-            selected_keys.add(candidate_key)
-            type_counts[candidate.source_type] = current_type_count + 1
-            document_counts[candidate.document_id] = current_doc_count + 1
-
-        if len(selected) < min(3, payload.final_top_k):
             for candidate in ordered_candidates:
-                if len(selected) >= payload.final_top_k:
-                    break
-
                 candidate_key = (candidate.source_type, candidate.source_id)
                 if candidate_key in selected_keys:
                     continue
 
+                effective_score = self._candidate_effective_score(candidate)
+                if effective_score < min_score_threshold:
+                    continue
+
+                current_type_count = type_counts.get(candidate.source_type, 0)
+                if current_type_count >= type_caps.get(candidate.source_type, payload.final_top_k):
+                    continue
+
+                current_doc_count = document_counts.get(candidate.document_id, 0)
+                if is_documents_question:
+                    max_per_document = 12 if candidate.document_id in priority_document_set else 4
+                else:
+                    max_per_document = 6 if candidate.document_id in priority_document_set else 3
+
+                if current_doc_count >= max_per_document:
+                    continue
+
                 selected.append(candidate)
                 selected_keys.add(candidate_key)
+                type_counts[candidate.source_type] = current_type_count + 1
+                document_counts[candidate.document_id] = current_doc_count + 1
 
-        return selected
+                if len(selected) >= payload.final_top_k:
+                    break
+
+            # Fallback: если балансировка оказалась слишком строгой,
+            # добираем ещё кандидатов без type/doc caps, но только до final_top_k.
+            if len(selected) < min(3, payload.final_top_k):
+                for candidate in ordered_candidates:
+                    if len(selected) >= payload.final_top_k:
+                        break
+
+                    candidate_key = (candidate.source_type, candidate.source_id)
+                    if candidate_key in selected_keys:
+                        continue
+
+                    selected.append(candidate)
+                    selected_keys.add(candidate_key)
+
+            return selected
 
     def _build_evidence_package(
         self,

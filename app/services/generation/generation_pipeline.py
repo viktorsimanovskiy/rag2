@@ -263,11 +263,17 @@ class GenerationPipeline:
                 },
             )
 
+        documents_answer_payload = self._prepare_documents_table_answer(
+            payload=payload,
+            evidence_package=evidence_package,
+        )
+
         answer_text = self._compose_answer_text(
             payload=payload,
             plan=plan,
             evidence_package=evidence_package,
             hydrated_objects=hydrated_objects,
+            documents_answer_payload=documents_answer_payload,
         )
 
         answer_text_short = self._build_short_answer(
@@ -345,6 +351,7 @@ class GenerationPipeline:
                 "evidence_metrics": evidence_package.metrics_json,
                 "evidence_quality": evidence_quality or None,
                 "guard_reason": guard_reason or None,
+                "documents_builder_debug": documents_answer_payload.get("debug"),
             },
             reuse_decision_payload_json={
                 "reuse_allowed": reuse_allowed,
@@ -377,31 +384,47 @@ class GenerationPipeline:
 
         return None
 
-    def _try_build_documents_table_answer(
-        self,
-        *,
-        payload: GenerationRequest,
-        evidence_package: EvidencePackage,
-    ) -> Optional[str]:
-        if payload.intent_type != QuestionIntentEnum.DOCUMENTS_QUESTION:
-            return None
+    def _prepare_documents_table_answer(
+            self,
+            *,
+            payload: GenerationRequest,
+            evidence_package: EvidencePackage,
+        ) -> dict[str, Any]:
+            if payload.intent_type != QuestionIntentEnum.DOCUMENTS_QUESTION:
+                return {
+                    "answer_text": None,
+                    "debug": {
+                        "skipped": True,
+                        "reason": "not_documents_question",
+                    },
+                }
 
-        submission_channel = self._extract_submission_channel(
-            payload=payload,
-            evidence_package=evidence_package,
-        )
+            submission_channel = self._extract_submission_channel(
+                payload=payload,
+                evidence_package=evidence_package,
+            )
 
-        result = self.table_documents_answer_builder.build(
-            candidates=evidence_package.selected_candidates or [],
-            submission_channel=submission_channel,
-        )
-        if not result.can_answer:
-            return None
+            result = self.table_documents_answer_builder.build(
+                candidates=evidence_package.selected_candidates or [],
+                submission_channel=submission_channel,
+            )
 
-        return self.table_documents_answer_builder.render_text(
-            result=result,
-            submission_channel=submission_channel,
-        )
+            answer_text = None
+            if result.can_answer:
+                answer_text = self.table_documents_answer_builder.render_text(
+                    result=result,
+                    submission_channel=submission_channel,
+                )
+
+            debug_payload = result.debug_payload(
+                submission_channel=submission_channel,
+            )
+            debug_payload["can_answer"] = result.can_answer
+
+            return {
+                "answer_text": answer_text,
+                "debug": debug_payload,
+            }
 
     # --------------------------------------------------------
     # Evidence hydration
@@ -664,36 +687,39 @@ class GenerationPipeline:
     # --------------------------------------------------------
 
     def _compose_answer_text(
-        self,
-        *,
-        payload: GenerationRequest,
-        plan: AnswerPlan,
-        evidence_package: EvidencePackage,
-        hydrated_objects: dict[str, dict[UUID, Any]],
-    ) -> str:
-        if plan.answer_mode == AnswerModeEnum.SAFE_NO_ANSWER:
-            return self._compose_safe_no_answer_text(
+            self,
+            *,
+            payload: GenerationRequest,
+            plan: AnswerPlan,
+            evidence_package: EvidencePackage,
+            hydrated_objects: dict[str, dict[UUID, Any]],
+            documents_answer_payload: Optional[dict[str, Any]] = None,
+        ) -> str:
+            # Для documents-question сначала всегда пробуем deterministic path.
+            if payload.intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION:
+                deterministic_text = None
+                if isinstance(documents_answer_payload, dict):
+                    deterministic_text = documents_answer_payload.get("answer_text")
+
+                if deterministic_text:
+                    return deterministic_text
+
+            if plan.answer_mode == AnswerModeEnum.SAFE_NO_ANSWER:
+                return self._compose_safe_no_answer_text(
+                    payload=payload,
+                    plan=plan,
+                )
+
+            if plan.answer_mode == AnswerModeEnum.DIRECT_STRUCTURED:
+                return self._compose_direct_structured_answer(
+                    payload=payload,
+                    plan=plan,
+                )
+
+            return self._compose_grounded_narrative_answer(
                 payload=payload,
                 plan=plan,
             )
-
-        deterministic_documents_answer = self._try_build_documents_table_answer(
-            payload=payload,
-            evidence_package=evidence_package,
-        )
-        if deterministic_documents_answer:
-            return deterministic_documents_answer
-
-        if plan.answer_mode == AnswerModeEnum.DIRECT_STRUCTURED:
-            return self._compose_direct_structured_answer(
-                payload=payload,
-                plan=plan,
-            )
-
-        return self._compose_grounded_narrative_answer(
-            payload=payload,
-            plan=plan,
-        )
 
     def _compose_direct_structured_answer(
         self,
