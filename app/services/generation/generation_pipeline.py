@@ -948,25 +948,68 @@ class GenerationPipeline:
     ) -> Optional[dict[str, Any]]:
         document = hydrated_objects["documents"].get(candidate.document_id)
         document_name = getattr(document, "document_name", None) if document else candidate.document_name
+
         download_url = None
         if document is not None:
             publication_payload = getattr(document, "publication_payload_json", {}) or {}
             download_url = publication_payload.get("download_url")
 
+        display_label = self._build_display_label(
+            candidate,
+            hydrated_objects,
+            document_name,
+        )
         citation_text = self._build_citation_text(candidate, hydrated_objects)
+
+        metadata_json = {
+            "source_score": getattr(candidate, "final_score", None),
+            "rerank_score": getattr(candidate, "rerank_score", None),
+        }
+
+        citation_document_name = document_name
+
+        if candidate.source_type == "table_row":
+            row = hydrated_objects["rows"].get(candidate.source_id)
+            if row is not None:
+                metadata = getattr(row, "metadata_json", {}) or {}
+                cells = (
+                    metadata.get("cells_by_semantic_key")
+                    or metadata.get("cells_by_header_key")
+                    or {}
+                )
+                if not isinstance(cells, dict):
+                    cells = {}
+
+                short_name = self._normalize_citation_document_name(cells.get("document_name"))
+                if short_name:
+                    citation_document_name = short_name
+
+                table = None
+                table_id = getattr(row, "table_id", None)
+                if table_id:
+                    table = hydrated_objects["tables"].get(table_id)
+
+                table_title = str(getattr(table, "table_title", "") or "").strip() if table else ""
+                table_number = getattr(table, "table_number", None) if table else None
+                row_order = getattr(row, "row_order", None)
+
+                metadata_json.update(
+                    {
+                        "table_title": table_title or None,
+                        "table_number": table_number,
+                        "row_order": row_order,
+                    }
+                )
 
         return {
             "source_type": candidate.source_type,
-            "source_id": str(candidate.source_id),
             "document_id": str(candidate.document_id),
-            "document_name": document_name,
-            "display_label": self._build_display_label(candidate, hydrated_objects, document_name),
+            "source_id": str(candidate.source_id),
+            "display_label": display_label,
             "citation_text": citation_text,
+            "document_name": citation_document_name,
             "download_url": download_url,
-            "metadata_json": {
-                "score": candidate.score,
-                "rerank_score": candidate.rerank_score,
-            },
+            "metadata_json": metadata_json,
         }
 
     def _build_display_label(
