@@ -245,6 +245,28 @@ class TableDocumentsAnswerBuilder:
         lines.append("Итоговый перечень зависит от конкретной жизненной ситуации, основания обращения и категории заявителя.")
 
         return "\n".join(lines)
+        
+    def _normalize_display_name(
+        self,
+        *,
+        document_name: str,
+        document_family: str,
+    ) -> str:
+        text = self._clean(document_name) or ""
+        normalized = self._normalize(text)
+
+        # Универсальная нормализация identity-документов
+        if document_family == "identity_document":
+            return "Паспорт или иной документ, удостоверяющий личность"
+
+        # Убираем служебные хвосты в скобках (представителя и т.п.)
+        if "(" in text and ")" in text:
+            # аккуратно убираем только последние скобки
+            base = text.split("(")[0].strip()
+            if base:
+                return base
+
+        return text
 
     def _merge_similar_items(
         self,
@@ -263,6 +285,10 @@ class TableDocumentsAnswerBuilder:
             merged_name = self._choose_merged_display_name(
                 document_family=document_family,
                 group_items=group_items,
+            )
+            merged_name = self._normalize_display_name(
+                document_name=merged_name,
+                document_family=document_family,
             )
             merged_submission_note = self._merge_submission_notes(group_items)
 
