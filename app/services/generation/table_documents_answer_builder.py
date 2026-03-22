@@ -253,7 +253,6 @@ class TableDocumentsAnswerBuilder:
         document_family: str,
     ) -> str:
         text = self._clean(document_name) or ""
-        normalized = self._normalize(text)
 
         # Универсальная нормализация identity-документов
         if document_family == "identity_document":
