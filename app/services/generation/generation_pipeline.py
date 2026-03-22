@@ -812,6 +812,109 @@ class GenerationPipeline:
         }:
             return "Для точного ответа обычно нужны уточняющие условия или категория получателя."
         return None
+        
+    def _build_table_row_citation_parts(
+        self,
+        *,
+        row: Any,
+        document: Any | None,
+        tables_by_id: dict[UUID, Any],
+    ) -> tuple[str, str, Optional[str], dict[str, Any]]:
+        metadata = getattr(row, "metadata_json", {}) or {}
+        cells = (
+            metadata.get("cells_by_semantic_key")
+            or metadata.get("cells_by_header_key")
+            or {}
+        )
+        if not isinstance(cells, dict):
+            cells = {}
+
+        raw_document_name = cells.get("document_name")
+        short_document_name = self._normalize_citation_document_name(raw_document_name)
+
+        table_id = getattr(row, "table_id", None)
+        table = tables_by_id.get(table_id) if table_id else None
+
+        table_title = ""
+        table_number = None
+        if table is not None:
+            table_title = str(getattr(table, "table_title", "") or "").strip()
+            table_number = getattr(table, "table_number", None)
+
+        row_order = getattr(row, "row_order", None)
+
+        table_label = self._build_table_label(
+            table_title=table_title,
+            table_number=table_number,
+        )
+
+        if row_order is not None:
+            location_part = f"{table_label}, строка {row_order}"
+        else:
+            location_part = table_label
+
+        if short_document_name:
+            display_label = f"{short_document_name} — {location_part}"
+        else:
+            display_label = location_part
+
+        citation_text_parts: list[str] = []
+        if document is not None:
+            document_name = str(getattr(document, "document_name", "") or "").strip()
+            if document_name:
+                citation_text_parts.append(document_name)
+        citation_text_parts.append(location_part)
+        if short_document_name:
+            citation_text_parts.append(short_document_name)
+
+        citation_text = " | ".join(part for part in citation_text_parts if part)
+
+        return (
+            display_label,
+            citation_text,
+            short_document_name,
+            {
+                "table_title": table_title or None,
+                "table_number": table_number,
+                "row_order": row_order,
+                "document_name_short": short_document_name,
+            },
+        )
+        
+    def _build_table_label(
+        self,
+        *,
+        table_title: str,
+        table_number: Any,
+    ) -> str:
+        normalized_title = " ".join(str(table_title).split()).strip()
+
+        if normalized_title:
+            return normalized_title
+
+        if table_number not in (None, ""):
+            return f"Таблица {table_number}"
+
+        return "Таблица документов"
+
+
+    def _normalize_citation_document_name(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+
+        text = " ".join(str(value).strip().split())
+        if not text:
+            return None
+
+        lowered = text.lower()
+
+        if "удостоверяющ" in lowered and "личност" in lowered:
+            return "Паспорт или иной документ, удостоверяющий личность"
+
+        if lowered.startswith("заявление"):
+            return "Заявление"
+
+        return text
 
     # --------------------------------------------------------
     # Citations
@@ -887,7 +990,44 @@ class GenerationPipeline:
                 return f"{base} — таблица: {table_title}"
 
         if candidate.source_type == "table_row":
-            return f"{base} — строка таблицы"
+            row = hydrated_objects["rows"].get(candidate.source_id)
+            if row is None:
+                return f"{base} — строка таблицы"
+
+            metadata = getattr(row, "metadata_json", {}) or {}
+            cells = (
+                metadata.get("cells_by_semantic_key")
+                or metadata.get("cells_by_header_key")
+                or {}
+            )
+            if not isinstance(cells, dict):
+                cells = {}
+
+            short_name = self._normalize_citation_document_name(cells.get("document_name"))
+
+            table = None
+            table_id = getattr(row, "table_id", None)
+            if table_id:
+                table = hydrated_objects["tables"].get(table_id)
+
+            table_title = str(getattr(table, "table_title", "") or "").strip() if table else ""
+            table_number = getattr(table, "table_number", None) if table else None
+            row_order = getattr(row, "row_order", None)
+
+            table_label = self._build_table_label(
+                table_title=table_title,
+                table_number=table_number,
+            )
+
+            if row_order not in (None, ""):
+                location = f"{table_label}, строка {row_order}"
+            else:
+                location = table_label
+
+            if short_name:
+                return f"{short_name} — {location}"
+
+            return f"{base} — {location}"
 
         if candidate.source_type == "block":
             block = hydrated_objects["blocks"].get(candidate.source_id)
@@ -923,9 +1063,45 @@ class GenerationPipeline:
         if candidate.source_type == "table_row":
             row = hydrated_objects["rows"].get(candidate.source_id)
             if row is not None:
+                metadata = getattr(row, "metadata_json", {}) or {}
+                cells = (
+                    metadata.get("cells_by_semantic_key")
+                    or metadata.get("cells_by_header_key")
+                    or {}
+                )
+                if not isinstance(cells, dict):
+                    cells = {}
+
+                short_name = self._normalize_citation_document_name(cells.get("document_name"))
+
+                table = None
+                table_id = getattr(row, "table_id", None)
+                if table_id:
+                    table = hydrated_objects["tables"].get(table_id)
+
+                table_title = str(getattr(table, "table_title", "") or "").strip() if table else ""
+                table_number = getattr(table, "table_number", None) if table else None
+                row_order = getattr(row, "row_order", None)
+
+                table_label = self._build_table_label(
+                    table_title=table_title,
+                    table_number=table_number,
+                )
+
+                if row_order not in (None, ""):
+                    location = f"{table_label}, строка {row_order}"
+                else:
+                    location = table_label
+
                 row_summary = str(getattr(row, "row_summary", "") or "").strip()
-                if row_summary:
-                    return self._shorten_text(row_summary, limit=220) or "Строка таблицы"
+
+                parts: list[str] = [location]
+                if short_name:
+                    parts.append(short_name)
+                elif row_summary:
+                    parts.append(self._shorten_text(row_summary, limit=180) or "Строка таблицы")
+
+                return " | ".join(parts)
 
         if candidate.source_type == "block":
             block = hydrated_objects["blocks"].get(candidate.source_id)
