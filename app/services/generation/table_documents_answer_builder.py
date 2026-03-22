@@ -143,6 +143,7 @@ class TableDocumentsAnswerBuilder:
             applicability = self._infer_applicability(
                 document_name=document_name,
                 applicant_category_id=applicant_category_id,
+                document_family=document_family,
             )
 
             raw_items.append(
@@ -351,11 +352,8 @@ class TableDocumentsAnswerBuilder:
     ) -> str:
         text = self._normalize(document_name)
 
-        if any(marker in text for marker in [
-            "полномоч",
-            "доверенн",
-            "представител",
-        ]):
+        # Сначала решаем по семейству документа, а не по случайным словам в тексте.
+        if document_family == "authority_document":
             return "representative_only"
 
         if document_family in {
@@ -369,6 +367,14 @@ class TableDocumentsAnswerBuilder:
         }:
             return "general_document"
 
+        # Страховка на случай, если family не распознался, но текст явно про представителя.
+        if any(marker in text for marker in [
+            "полномоч",
+            "доверенн",
+            "представител",
+        ]):
+            return "representative_only"
+
         return "general_document"
 
     def _infer_applicability(
@@ -376,9 +382,11 @@ class TableDocumentsAnswerBuilder:
         *,
         document_name: str,
         applicant_category_id: Optional[str],
+        document_family: str,
     ) -> str:
         text = self._normalize(document_name)
 
+        # Явные условные маркеры всегда сильнее всего остального.
         if any(marker in text for marker in [
             "в случае",
             "при отсутствии",
@@ -399,6 +407,14 @@ class TableDocumentsAnswerBuilder:
             "рождени",
         ]):
             return "conditional"
+
+        # Базовые семейства не должны автоматически улетать в category_specific
+        # только из-за applicant_category_id.
+        if document_family in {
+            "identity_document",
+            "application_request",
+        }:
+            return "always"
 
         if applicant_category_id:
             return "category_specific"
