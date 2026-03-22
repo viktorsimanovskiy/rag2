@@ -927,17 +927,43 @@ class GenerationPipeline:
         hydrated_objects: dict[str, dict[UUID, Any]],
     ) -> list[dict[str, Any]]:
         citations: list[dict[str, Any]] = []
-        seen_keys: set[tuple[str, UUID]] = set()
 
-        for candidate in plan.primary_candidates[:6]:
-            key = (candidate.source_type, candidate.source_id)
-            if key in seen_keys:
+        # 1. защита от точных дублей одного и того же источника
+        seen_source_keys: set[tuple[str, UUID]] = set()
+
+        # 2. защита от смысловых дублей table_row citations
+        #    ключ: (source_type, normalized document_name)
+        seen_semantic_row_keys: set[tuple[str, str]] = set()
+
+        for candidate in plan.primary_candidates[:10]:
+            source_key = (candidate.source_type, candidate.source_id)
+            if source_key in seen_source_keys:
                 continue
-            seen_keys.add(key)
+            seen_source_keys.add(source_key)
 
             citation = self._candidate_to_citation(candidate, hydrated_objects)
-            if citation:
-                citations.append(citation)
+            if not citation:
+                continue
+
+            if citation.get("source_type") == "table_row":
+                normalized_doc_name = " ".join(
+                    str(citation.get("document_name") or "").strip().lower().split()
+                )
+                semantic_key = ("table_row", normalized_doc_name)
+
+                # если document_name уже нормализован и такой citation уже был,
+                # пропускаем повтор
+                if normalized_doc_name and semantic_key in seen_semantic_row_keys:
+                    continue
+
+                if normalized_doc_name:
+                    seen_semantic_row_keys.add(semantic_key)
+
+            citations.append(citation)
+
+            # мягкий лимит на итоговое число citations
+            if len(citations) >= 5:
+                break
 
         return citations
 
