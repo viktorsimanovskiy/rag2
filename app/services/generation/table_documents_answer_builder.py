@@ -255,26 +255,34 @@ class TableDocumentsAnswerBuilder:
     ) -> str:
         text = self._normalize(document_name)
 
+        # 1. Сначала базовые документы
         if any(marker in text for marker in [
-            "представител",
-            "доверенн",
+            "заявление",
+            "запрос",
+            "паспорт",
+            "документ удостоверяющий личность",
+            "иной документ удостоверяющий личность",
+        ]):
+            return "base_required"
+
+        # 2. Отдельно документы представителя
+        if any(marker in text for marker in [
             "полномоч",
-            "удостоверяющ полномоч",
+            "доверенн",
+            "представител",
         ]):
             return "representative_only"
 
-        if applicant_category_id:
-            return "category_specific"
-
+        # 3. Явно условные документы
         if any(marker in text for marker in [
             "в случае",
             "при отсутствии",
-            "подтверждающ",
             "решение суда",
+            "подтверждающ",
             "регистрац",
             "проживани",
-            "перемен",
             "смен",
+            "перемен",
             "смерт",
             "усынов",
             "опек",
@@ -285,15 +293,10 @@ class TableDocumentsAnswerBuilder:
         ]):
             return "conditional_required"
 
-        if any(marker in text for marker in [
-            "заявление",
-            "паспорт",
-            "документ, удостоверяющий личность",
-            "иной документ, удостоверяющий личность",
-        ]):
-            return "base_required"
+        # 4. category_specific — только если нет более сильных признаков
+        if applicant_category_id:
+            return "category_specific"
 
-        # По умолчанию документ лучше считать условным, чем базовым.
         return "conditional_required"
 
     def _extract_submission_note(
@@ -318,14 +321,15 @@ class TableDocumentsAnswerBuilder:
 
     def _is_service_value(self, value: str) -> bool:
         text = self._normalize(value)
-        markers = [
+        service_values = {
+            "наименование документа",
+            "наименование документов",
+            "документы",
             "документы информация необходимые",
             "исчерпывающий перечень документов",
             "способ подачи в уполномоченное учреждение",
-            "наименование документа",
-            "наименование документов",
-        ]
-        return any(marker in text for marker in markers)
+        }
+        return text in service_values
 
     def _canonical_document_key(self, value: str) -> str:
         text = self._normalize(value)
