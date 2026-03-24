@@ -99,7 +99,7 @@ async def run(
     await runtime.startup()
     try:
         async with runtime.session_scope() as session:
-            service = runtime.build_service_factory(session).runtime_answer_service
+            service = runtime.build_service_factory(session).get_runtime_answer_service()
 
             result = await service.build_answer(
                 RuntimeAnswerInput(
