@@ -14,7 +14,7 @@ if str(ROOT) not in sys.path:
 from app.config.settings import load_settings
 from app.db.models.enums import ChannelTypeEnum, QuestionIntentEnum
 from app.db.session import DatabaseSessionManager
-from app.runtime.app_runtime import build_app_runtime
+from app.runtime.app_runtime import AppRuntime, AppRuntimeConfig
 from app.services.answers.runtime_answer_service import RuntimeAnswerInput
 
 
@@ -90,46 +90,47 @@ async def run(
     question_text: str,
     intent,
 ) -> None:
-    runtime = await build_app_runtime()
+    runtime = AppRuntime()
+    await runtime.startup()
     try:
-        service = runtime.runtime_answer_service
+        async with runtime.session_scope() as session:
+            service = runtime.build_service_factory(session).runtime_answer_service
 
-        result = await service.build_answer(
-            RuntimeAnswerInput(
-                question_text_raw=question_text,
-                intent_type=intent,
+            result = await service.build_answer(
+                RuntimeAnswerInput(
+                    question_text_raw=question_text,
+                    intent_type=intent,
+                )
             )
-        )
 
-        print("=" * 80)
-        print("QUESTION:")
-        print(question_text)
-        print()
-        print("INTENT:")
-        print(getattr(intent, "value", str(intent)))
-        print()
-        print("ANSWER:")
-        print(result.answer_text or "<empty>")
-        print()
-        print("ANSWER MODE:")
-        print(getattr(result.answer_mode, "value", str(result.answer_mode)))
-        print()
-        print("CONFIDENCE:")
-        print(result.confidence_score)
-        print()
-        print("CITATIONS:")
-        if not result.citations:
-            print("<none>")
-        else:
-            for index, citation in enumerate(result.citations, start=1):
-                print(f"{index}. {citation}")
-        print()
-        print("PAYLOAD JSON:")
-        print(result.answer_payload_json)
-        print("=" * 80)
+            print("=" * 80)
+            print("QUESTION:")
+            print(question_text)
+            print()
+            print("INTENT:")
+            print(getattr(intent, "value", str(intent)))
+            print()
+            print("ANSWER:")
+            print(result.answer_text or "<empty>")
+            print()
+            print("ANSWER MODE:")
+            print(getattr(result.answer_mode, "value", str(result.answer_mode)))
+            print()
+            print("CONFIDENCE:")
+            print(result.confidence_score)
+            print()
+            print("CITATIONS:")
+            if not result.citations:
+                print("<none>")
+            else:
+                for index, citation in enumerate(result.citations, start=1):
+                    print(f"{index}. {citation}")
+            print()
+            print("PAYLOAD JSON:")
+            print(result.answer_payload_json)
+            print("=" * 80)
     finally:
-        await runtime.dispose()
-
+        await runtime.shutdown()
 
 def main() -> None:
     parser = argparse.ArgumentParser(
