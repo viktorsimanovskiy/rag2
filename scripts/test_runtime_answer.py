@@ -14,7 +14,7 @@ if str(ROOT) not in sys.path:
 from app.config.settings import load_settings
 from app.db.models.enums import ChannelTypeEnum, QuestionIntentEnum
 from app.db.session import DatabaseSessionManager
-from app.runtime.app_runtime import AppRuntime, AppRuntimeConfig
+from app.runtime.app_runtime import build_app_runtime
 from app.services.answers.runtime_answer_service import RuntimeAnswerInput
 
 
