@@ -41,6 +41,7 @@ from app.db.models.enums import AnswerModeEnum, QuestionIntentEnum, ValidationSt
 from app.services.feedback.feedback_service import EvidenceItemInput
 from app.services.retrieval.retrieval_orchestrator import EvidencePackage, RetrievedCandidate
 from app.services.generation.table_documents_answer_builder import TableDocumentsAnswerBuilder
+from app.services.generation.table_deadlines_answer_builder import TableDeadlinesAnswerBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +202,7 @@ class GenerationPipeline:
         self.deterministic_validator = deterministic_validator
         self.semantic_validator = semantic_validator
         self.table_documents_answer_builder = TableDocumentsAnswerBuilder()
+        self.table_deadlines_answer_builder = TableDeadlinesAnswerBuilder()
 
     # --------------------------------------------------------
     # Public API
@@ -268,12 +270,18 @@ class GenerationPipeline:
             evidence_package=evidence_package,
         )
 
+        deadlines_answer_payload = self._prepare_deadlines_table_answer(
+            payload=payload,
+            evidence_package=evidence_package,
+        )
+
         answer_text = self._compose_answer_text(
             payload=payload,
             plan=plan,
             evidence_package=evidence_package,
             hydrated_objects=hydrated_objects,
             documents_answer_payload=documents_answer_payload,
+            deadlines_answer_payload=deadlines_answer_payload,
         )
 
         answer_text_short = self._build_short_answer(
@@ -352,6 +360,7 @@ class GenerationPipeline:
                 "evidence_quality": evidence_quality or None,
                 "guard_reason": guard_reason or None,
                 "documents_builder_debug": documents_answer_payload.get("debug"),
+                "deadlines_builder_debug": deadlines_answer_payload.get("debug"),
             },
             reuse_decision_payload_json={
                 "reuse_allowed": reuse_allowed,
@@ -425,6 +434,40 @@ class GenerationPipeline:
                 "answer_text": answer_text,
                 "debug": debug_payload,
             }
+
+    def _prepare_deadlines_table_answer(
+        self,
+        *,
+        payload: GenerationRequest,
+        evidence_package: EvidencePackage,
+    ) -> dict[str, Any]:
+        if payload.intent_type != QuestionIntentEnum.DEADLINE_QUESTION:
+            return {
+                "answer_text": None,
+                "debug": {
+                    "skipped": True,
+                    "reason": "not_deadline_question",
+                },
+            }
+
+        result = self.table_deadlines_answer_builder.build(
+            candidates=evidence_package.selected_candidates or [],
+            question_text=payload.question_text_normalized or payload.question_text_raw,
+        )
+
+        answer_text = None
+        if result.can_answer:
+            answer_text = self.table_deadlines_answer_builder.render_text(
+                result=result,
+            )
+
+        debug_payload = result.debug_payload()
+        debug_payload["can_answer"] = result.can_answer
+
+        return {
+            "answer_text": answer_text,
+            "debug": debug_payload,
+        }
 
     # --------------------------------------------------------
     # Evidence hydration
@@ -687,39 +730,49 @@ class GenerationPipeline:
     # --------------------------------------------------------
 
     def _compose_answer_text(
-            self,
-            *,
-            payload: GenerationRequest,
-            plan: AnswerPlan,
-            evidence_package: EvidencePackage,
-            hydrated_objects: dict[str, dict[UUID, Any]],
-            documents_answer_payload: Optional[dict[str, Any]] = None,
-        ) -> str:
-            # Для documents-question сначала всегда пробуем deterministic path.
-            if payload.intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION:
-                deterministic_text = None
-                if isinstance(documents_answer_payload, dict):
-                    deterministic_text = documents_answer_payload.get("answer_text")
+        self,
+        *,
+        payload: GenerationRequest,
+        plan: AnswerPlan,
+        evidence_package: EvidencePackage,
+        hydrated_objects: dict[str, dict[UUID, Any]],
+        documents_answer_payload: Optional[dict[str, Any]] = None,
+        deadlines_answer_payload: Optional[dict[str, Any]] = None,
+    ) -> str:
+        # Для documents-question сначала всегда пробуем deterministic path.
+        if payload.intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION:
+            deterministic_text = None
+            if isinstance(documents_answer_payload, dict):
+                deterministic_text = documents_answer_payload.get("answer_text")
 
-                if deterministic_text:
-                    return deterministic_text
+            if deterministic_text:
+                return deterministic_text
 
-            if plan.answer_mode == AnswerModeEnum.SAFE_NO_ANSWER:
-                return self._compose_safe_no_answer_text(
-                    payload=payload,
-                    plan=plan,
-                )
+        # Для deadline-question сначала всегда пробуем deterministic path.
+        if payload.intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
+            deterministic_text = None
+            if isinstance(deadlines_answer_payload, dict):
+                deterministic_text = deadlines_answer_payload.get("answer_text")
 
-            if plan.answer_mode == AnswerModeEnum.DIRECT_STRUCTURED:
-                return self._compose_direct_structured_answer(
-                    payload=payload,
-                    plan=plan,
-                )
+            if deterministic_text:
+                return deterministic_text
 
-            return self._compose_grounded_narrative_answer(
+        if plan.answer_mode == AnswerModeEnum.SAFE_NO_ANSWER:
+            return self._compose_safe_no_answer_text(
                 payload=payload,
                 plan=plan,
             )
+
+        if plan.answer_mode == AnswerModeEnum.DIRECT_STRUCTURED:
+            return self._compose_direct_structured_answer(
+                payload=payload,
+                plan=plan,
+            )
+
+        return self._compose_grounded_narrative_answer(
+            payload=payload,
+            plan=plan,
+        )
 
     def _compose_direct_structured_answer(
         self,

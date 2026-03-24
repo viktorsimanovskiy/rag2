@@ -833,11 +833,13 @@ class RetrievalOrchestrator:
         - documents_base
         - documents_by_submission_channel
         """
+        if intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
+            return "deadline"
+
         if intent_type != QuestionIntentEnum.DOCUMENTS_QUESTION:
             return None
 
         text = self._normalize_text(question_text)
-
         documents_markers = [
             "какие документы",
             "какие нужны документы",
@@ -868,7 +870,6 @@ class RetrievalOrchestrator:
     ) -> list[str]:
         """
         Hints for downstream retrieval / ranking / debug.
-
         This does not assume exact DB schema for columns.
         These are normalized semantic hints.
         """
@@ -876,6 +877,20 @@ class RetrievalOrchestrator:
             return [
                 "document_name",
                 "наименование документа",
+            ]
+
+        if table_question_profile == "deadline":
+            return [
+                "deadline_value",
+                "срок",
+                "сроки",
+                "срок предоставления",
+                "срок предоставления государственной услуги",
+                "срок принятия решения",
+                "срок рассмотрения",
+                "максимальный срок",
+                "рабочих дней",
+                "календарных дней",
             ]
 
         if table_question_profile == "documents_by_submission_channel":
@@ -887,7 +902,6 @@ class RetrievalOrchestrator:
                     "при электронной подаче посредством епгу",
                     "электронной подаче",
                     "единого портала",
-                    
                 ],
                 "regional_portal": [
                     "document_name",
@@ -991,6 +1005,33 @@ class RetrievalOrchestrator:
             ]
             if any(marker in text for marker in real_doc_markers):
                 return False
+            return True
+
+        return False
+        
+    def _looks_like_service_deadline_row(self, candidate: RetrievedCandidate) -> bool:
+        metadata = candidate.metadata_json or {}
+        cells = metadata.get("cells_by_semantic_key") or metadata.get("cells_by_header_key") or {}
+        if not isinstance(cells, dict):
+            return False
+
+        service_values = {
+            "срок",
+            "сроки",
+            "срок предоставления",
+            "срок предоставления государственной услуги",
+            "максимальный срок",
+            "рабочих дней",
+            "календарных дней",
+        }
+
+        for value in cells.values():
+            normalized = self._normalize_text(value)
+            if normalized in service_values:
+                return True
+
+        text_blob = self._normalize_text(self._candidate_text_blob(candidate))
+        if text_blob.startswith("срок ") and len(text_blob.split()) <= 4:
             return True
 
         return False
@@ -2350,13 +2391,52 @@ class RetrievalOrchestrator:
                     else:
                         if candidate.source_type == "block":
                             score -= 0.10
-
-            # -------------------------------
-            # Deadlines
-            # -------------------------------
+                            
             elif intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
-                if "рабочих дней" in text or "календарных дней" in text or "срок" in text:
-                    score += 0.18
+                metadata = candidate.metadata_json or {}
+                text_norm = self._normalize_text(text)
+
+                if self._has_table_semantic_type(candidate, "deadlines") or self._has_table_semantic_type(candidate, "deadline"):
+                    if candidate.source_type == "table_row":
+                        score += 0.45
+                    elif candidate.source_type == "table":
+                        score += 0.22
+
+                cells = metadata.get("cells_by_semantic_key") or {}
+                if isinstance(cells, dict) and cells.get("deadline_value"):
+                    score += 0.25
+
+                if any(marker in text_norm for marker in [
+                    "срок",
+                    "в течение",
+                    "рабочих дней",
+                    "календарных дней",
+                    "не позднее",
+                    "не более",
+                ]):
+                    score += 0.18 if candidate.source_type == "table_row" else 0.08
+
+                if self._looks_like_service_deadline_row(candidate):
+                    if candidate.source_type == "table_row":
+                        score -= 0.55
+                    elif candidate.source_type == "table":
+                        score -= 0.25
+                    else:
+                        score -= 0.10
+
+                question_norm = self._normalize_text(
+                    payload.question_text_normalized or payload.question_text_raw
+                )
+                for term in [
+                    "принятия решения",
+                    "рассмотрения заявления",
+                    "предоставления услуги",
+                    "регистрации заявления",
+                    "выплаты",
+                    "перечисления",
+                ]:
+                    if term in question_norm and term in text_norm:
+                        score += 0.10
 
             # -------------------------------
             # Rejection
@@ -2405,15 +2485,15 @@ class RetrievalOrchestrator:
         min_matches: int = 2,
     ) -> bool:
         text = self._candidate_text_blob(candidate)
-
         matched = 0
+
         for term in query_terms:
             if not term or len(term) < 3:
                 continue
             if term in text:
                 matched += 1
-            if matched >= min_matches:
-                return True
+                if matched >= min_matches:
+                    return True
 
         return False
         
@@ -2455,3 +2535,19 @@ class RetrievalOrchestrator:
             matches += 1
 
         return matches >= 2
+        
+    def _deadline_candidate_rank_key(self, candidate: RetrievedCandidate) -> tuple[int, float]:
+        metadata = candidate.metadata_json or {}
+        cells = metadata.get("cells_by_semantic_key") or {}
+
+        has_deadline_value = isinstance(cells, dict) and bool(cells.get("deadline_value"))
+        is_deadline_row = candidate.source_type == "table_row" and has_deadline_value
+        is_block = candidate.source_type == "block"
+
+        priority_bucket = 2
+        if is_deadline_row:
+            priority_bucket = 0
+        elif is_block:
+            priority_bucket = 1
+
+        return (priority_bucket, -float(candidate.score or 0.0))

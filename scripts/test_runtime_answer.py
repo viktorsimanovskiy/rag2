@@ -30,87 +30,142 @@ QUESTION_PRESETS: dict[str, tuple[str, QuestionIntentEnum]] = {
 }
 
 
-def _parse_intent(value: str) -> QuestionIntentEnum:
-    normalized = value.strip().lower()
-    for key, (_, intent) in QUESTION_PRESETS.items():
-        if key == normalized:
-            return intent
-    for item in QuestionIntentEnum:
-        if item.value == normalized:
-            return item
-    raise ValueError(f"Unknown intent: {value}")
+def _parse_intent(value: str):
+    normalized = (value or "").strip().lower()
+
+    mapping = {
+        "documents": QuestionIntentEnum.DOCUMENTS_QUESTION,
+        "documents_question": QuestionIntentEnum.DOCUMENTS_QUESTION,
+        "docs": QuestionIntentEnum.DOCUMENTS_QUESTION,
+
+        "deadline": QuestionIntentEnum.DEADLINE_QUESTION,
+        "deadlines": QuestionIntentEnum.DEADLINE_QUESTION,
+        "deadline_question": QuestionIntentEnum.DEADLINE_QUESTION,
+
+        "procedure": QuestionIntentEnum.PROCEDURE_QUESTION,
+        "procedure_question": QuestionIntentEnum.PROCEDURE_QUESTION,
+
+        "refusal": QuestionIntentEnum.REFUSAL_REASONS_QUESTION,
+        "refusal_reasons": QuestionIntentEnum.REFUSAL_REASONS_QUESTION,
+        "refusal_reasons_question": QuestionIntentEnum.REFUSAL_REASONS_QUESTION,
+    }
+
+    if normalized not in mapping:
+        supported = ", ".join(sorted(mapping.keys()))
+        raise ValueError(
+            f"Unsupported intent '{value}'. Supported values: {supported}"
+        )
+
+    return mapping[normalized]
 
 
 def _resolve_question(raw_question: str | None, preset: str | None) -> str:
     if raw_question and raw_question.strip():
         return raw_question.strip()
-    if preset and preset in QUESTION_PRESETS:
-        return QUESTION_PRESETS[preset][0]
-    raise ValueError("question is required if preset is not used")
 
+    normalized_preset = (preset or "").strip().lower()
 
-async def run(question_text: str, intent: QuestionIntentEnum) -> int:
-    settings = load_settings()
+    preset_questions = {
+        "documents": "какие документы нужны для едв",
+        "documents_epgu": "какие документы нужны для едв при подаче через епгу",
+        "deadline": "срок принятия решения по едв",
+        "deadline_review": "срок рассмотрения заявления по едв",
+        "procedure": "как назначается едв",
+        "refusal": "по каким основаниям могут отказать в едв",
+    }
 
-    runtime = AppRuntime(
-        AppRuntimeConfig(
-            database=settings.database,
+    if normalized_preset in preset_questions:
+        return preset_questions[normalized_preset]
+
+    if normalized_preset:
+        raise ValueError(
+            f"Unknown preset '{preset}'. Supported presets: {', '.join(sorted(preset_questions.keys()))}"
         )
-    )
-    await runtime.startup()
 
+    return "срок принятия решения по едв"
+
+
+async def run(
+    *,
+    question_text: str,
+    intent,
+) -> None:
+    runtime = await build_app_runtime()
     try:
-        async with runtime.session_scope() as session:
-            factory = runtime.build_service_factory(session)
-            runtime_answer_service = factory.get_runtime_answer_service()
+        service = runtime.runtime_answer_service
 
-            payload = RuntimeAnswerInput(
-                session_id=uuid4(),
-                question_event_id=uuid4(),
-                channel_code=ChannelTypeEnum.TELEGRAM,
+        result = await service.build_answer(
+            RuntimeAnswerInput(
                 question_text_raw=question_text,
-                question_text_normalized=question_text,
-                language_code="ru",
                 intent_type=intent,
-                measure_code="edv" if "едв" in question_text.lower() else None,
-                subject_category_code=None,
-                routing_payload_json={},
-                query_constraints_json={},
-                request_metadata_json={},
-                query_terms=[],
-                top_k_facts=12,
-                top_k_tables=12,
-                top_k_rows=16,
-                top_k_blocks=12,
-                final_top_k=12,
             )
+        )
 
-            result = await runtime_answer_service.build_answer(payload)
-
-            print(json.dumps({
-                "answer_mode": result.generation_result.answer_mode.value if result.generation_result.answer_mode else None,
-                "answer_text": result.generation_result.answer_text,
-                "citations_json": result.generation_result.citations_json,
-                "answer_payload_json": result.generation_result.answer_payload_json,
-                "reuse_decision_payload_json": result.generation_result.reuse_decision_payload_json,
-                "runtime_payload_json": result.runtime_payload_json,
-            }, ensure_ascii=False, indent=2, default=str))
-
-        return 0
+        print("=" * 80)
+        print("QUESTION:")
+        print(question_text)
+        print()
+        print("INTENT:")
+        print(getattr(intent, "value", str(intent)))
+        print()
+        print("ANSWER:")
+        print(result.answer_text or "<empty>")
+        print()
+        print("ANSWER MODE:")
+        print(getattr(result.answer_mode, "value", str(result.answer_mode)))
+        print()
+        print("CONFIDENCE:")
+        print(result.confidence_score)
+        print()
+        print("CITATIONS:")
+        if not result.citations:
+            print("<none>")
+        else:
+            for index, citation in enumerate(result.citations, start=1):
+                print(f"{index}. {citation}")
+        print()
+        print("PAYLOAD JSON:")
+        print(result.answer_payload_json)
+        print("=" * 80)
     finally:
-        await runtime.shutdown()
+        await runtime.dispose()
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Run full runtime answer smoke test.")
-    parser.add_argument("--question", default=None)
-    parser.add_argument("--preset", default=None, choices=list(QUESTION_PRESETS.keys()))
-    parser.add_argument("--intent", default="documents")
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Smoke-test for runtime answer path"
+    )
+    parser.add_argument(
+        "--intent",
+        required=True,
+        help="documents | deadline | procedure | refusal",
+    )
+    parser.add_argument(
+        "--question",
+        required=False,
+        help="Raw user question text",
+    )
+    parser.add_argument(
+        "--preset",
+        required=False,
+        help="Question preset: documents, documents_epgu, deadline, deadline_review, procedure, refusal",
+    )
+
     args = parser.parse_args()
 
     intent = _parse_intent(args.intent)
     question_text = _resolve_question(args.question, args.preset)
-    return asyncio.run(run(question_text, intent))
+
+    asyncio.run(
+        run(
+            question_text=question_text,
+            intent=intent,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
