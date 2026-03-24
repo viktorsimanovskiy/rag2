@@ -101,9 +101,16 @@ async def run(
         async with runtime.session_scope() as session:
             service = runtime.build_service_factory(session).get_runtime_answer_service()
 
+            normalized_question = " ".join(question_text.strip().lower().split())
+
             result = await service.build_answer(
                 RuntimeAnswerInput(
+                    session_id=uuid4(),
+                    question_event_id=uuid4(),
+                    channel_code="CLI_TEST",
                     question_text_raw=question_text,
+                    question_text_normalized=normalized_question,
+                    language_code="ru",
                     intent_type=intent,
                 )
             )
