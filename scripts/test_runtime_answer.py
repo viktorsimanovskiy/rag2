@@ -90,7 +90,7 @@ async def run(
     question_text: str,
     intent,
 ) -> None:
-    runtime = AppRuntime()
+    runtime = AppRuntime(config=AppRuntimeConfig())
     await runtime.startup()
     try:
         async with runtime.session_scope() as session:
