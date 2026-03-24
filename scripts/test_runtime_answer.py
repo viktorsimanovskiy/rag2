@@ -45,9 +45,9 @@ def _parse_intent(value: str):
         "procedure": QuestionIntentEnum.PROCEDURE_QUESTION,
         "procedure_question": QuestionIntentEnum.PROCEDURE_QUESTION,
 
-        "refusal": QuestionIntentEnum.REFUSAL_REASONS_QUESTION,
-        "refusal_reasons": QuestionIntentEnum.REFUSAL_REASONS_QUESTION,
-        "refusal_reasons_question": QuestionIntentEnum.REFUSAL_REASONS_QUESTION,
+        "refusal": QuestionIntentEnum.REJECTION_QUESTION,
+        "refusal_reasons": QuestionIntentEnum.REJECTION_QUESTION,
+        "refusal_reasons_question": QuestionIntentEnum.REJECTION_QUESTION,
     }
 
     if normalized not in mapping:
