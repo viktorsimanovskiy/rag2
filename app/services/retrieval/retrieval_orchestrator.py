@@ -481,9 +481,14 @@ class RetrievalOrchestrator:
             intent_type=payload.intent_type,
         )
         submission_channel = self._detect_submission_channel(normalized_text)
+        deadline_question_kind = self._detect_deadline_question_kind(
+            question_text=normalized_text,
+            intent_type=payload.intent_type,
+        )
         requested_column_hints = self._build_requested_column_hints(
             table_question_profile=table_question_profile,
             submission_channel=submission_channel,
+            deadline_question_kind=deadline_question_kind,
         )
         table_scope_hints = self._infer_table_scope_hints(
             intent_type=payload.intent_type,
@@ -496,6 +501,7 @@ class RetrievalOrchestrator:
             measure_code=payload.measure_code,
             submission_channel=submission_channel,
             requested_column_hints=requested_column_hints,
+            deadline_question_kind=deadline_question_kind,
         )
 
         query_terms = self._deduplicate_preserve_order(
@@ -516,6 +522,7 @@ class RetrievalOrchestrator:
             "submission_channel": submission_channel,
             "requested_column_hints": requested_column_hints,
             "table_scope_hints": table_scope_hints,
+            "deadline_question_kind": deadline_question_kind,
         }
 
 
@@ -527,6 +534,7 @@ class RetrievalOrchestrator:
         measure_code: Optional[str],
         submission_channel: Optional[str] = None,
         requested_column_hints: Optional[list[str]] = None,
+        deadline_question_kind: Optional[str] = None,
     ) -> list[str]:
         terms: list[str] = []
 
@@ -559,6 +567,30 @@ class RetrievalOrchestrator:
                     "дней",
                 ]
             )
+
+            deadline_kind_mapping = {
+                "decision": [
+                    "принятия решения",
+                    "принятие решения",
+                    "рассмотрения заявления",
+                    "рассмотрение заявления",
+                    "регистрации заявления",
+                    "назначение",
+                ],
+                "notification": [
+                    "уведомления",
+                    "направления уведомления",
+                    "информирования",
+                    "сообщения о решении",
+                ],
+                "payment": [
+                    "выплаты",
+                    "перечисления",
+                    "зачисления",
+                    "осуществления выплаты",
+                ],
+            }
+            terms.extend(deadline_kind_mapping.get(deadline_question_kind or "", []))
 
         elif intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION:
             terms.extend(
@@ -821,6 +853,70 @@ class RetrievalOrchestrator:
             return "mfc"
 
         return None
+    def _detect_deadline_question_kind(
+        self,
+        *,
+        question_text: str,
+        intent_type: QuestionIntentEnum,
+    ) -> str:
+        """
+        Detect the specific subtype of deadline question.
+
+        This is generic domain logic for administrative procedures,
+        not a rule for a single service/document.
+        """
+        if intent_type != QuestionIntentEnum.DEADLINE_QUESTION:
+            return "other"
+
+        text = self._normalize_text(question_text)
+        if not text:
+            return "other"
+
+        marker_map: dict[str, list[str]] = {
+            "decision": [
+                "принятия решения",
+                "принятие решения",
+                "рассмотрения заявления",
+                "рассмотрение заявления",
+                "рассмотрения документов",
+                "регистрации заявления",
+                "назначения",
+                "назначение",
+                "предоставления услуги",
+            ],
+            "notification": [
+                "уведомления",
+                "направления уведомления",
+                "информирования",
+                "сообщения о решении",
+                "извещения",
+            ],
+            "payment": [
+                "выплаты",
+                "выплата",
+                "перечисления",
+                "перечисление",
+                "зачисления",
+                "зачисление",
+            ],
+        }
+
+        scores = {kind: 0 for kind in marker_map}
+        for kind, markers in marker_map.items():
+            for marker in markers:
+                if marker in text:
+                    scores[kind] += 1
+
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        best_kind, best_score = ranked[0]
+        second_score = ranked[1][1] if len(ranked) > 1 else 0
+
+        if best_score <= 0:
+            return "other"
+        if second_score == best_score and best_score > 0:
+            return "other"
+        return best_kind
+
 
     def _detect_table_question_profile(
         self,
@@ -867,6 +963,7 @@ class RetrievalOrchestrator:
         *,
         table_question_profile: Optional[str],
         submission_channel: Optional[str],
+        deadline_question_kind: Optional[str] = None,
     ) -> list[str]:
         """
         Hints for downstream retrieval / ranking / debug.
@@ -880,7 +977,7 @@ class RetrievalOrchestrator:
             ]
 
         if table_question_profile == "deadline":
-            return [
+            hints = [
                 "deadline_value",
                 "срок",
                 "сроки",
@@ -892,6 +989,33 @@ class RetrievalOrchestrator:
                 "рабочих дней",
                 "календарных дней",
             ]
+
+            kind_mapping = {
+                "decision": [
+                    "принятия решения",
+                    "принятие решения",
+                    "рассмотрения заявления",
+                    "рассмотрение заявления",
+                    "регистрации заявления",
+                    "назначение",
+                ],
+                "notification": [
+                    "срок уведомления",
+                    "уведомления",
+                    "направления уведомления",
+                    "сообщения о решении",
+                    "информирования",
+                ],
+                "payment": [
+                    "срок выплаты",
+                    "выплаты",
+                    "перечисления",
+                    "зачисления",
+                    "осуществления выплаты",
+                ],
+            }
+            hints.extend(kind_mapping.get(deadline_question_kind or "", []))
+            return self._deduplicate_preserve_order(hints)
 
         if table_question_profile == "documents_by_submission_channel":
             mapping = {
@@ -1088,6 +1212,77 @@ class RetrievalOrchestrator:
         }
 
         return any(marker in text for marker in channel_markers.get(submission_channel, []))
+
+    def _classify_deadline_candidate_kind(
+        self,
+        candidate: RetrievedCandidate,
+    ) -> str:
+        """
+        Infer which kind of deadline a candidate is about.
+
+        The method intentionally inspects both row cells and the richer text blob,
+        because some extractions keep action/stage labels only in metadata.
+        """
+        metadata = candidate.metadata_json or {}
+        cells = metadata.get("cells_by_semantic_key") or metadata.get("cells_by_header_key") or {}
+
+        parts: list[tuple[str, float]] = []
+        if isinstance(cells, dict):
+            for key, value in cells.items():
+                if value is None:
+                    continue
+                weight = 1.35 if str(key).strip().lower() in {"step", "action", "result", "comment", "procedure_stage"} else 1.0
+                parts.append((self._normalize_text(value), weight))
+
+        parts.append((self._candidate_text_blob(candidate), 1.0))
+
+        marker_map: dict[str, list[str]] = {
+            "decision": [
+                "принятия решения",
+                "принятие решения",
+                "рассмотрения заявления",
+                "рассмотрение заявления",
+                "рассмотрения документов",
+                "регистрации заявления",
+                "назначение",
+                "предоставления услуги",
+            ],
+            "notification": [
+                "уведомления",
+                "направления уведомления",
+                "информирования",
+                "сообщения о решении",
+                "извещения",
+            ],
+            "payment": [
+                "выплаты",
+                "выплата",
+                "перечисления",
+                "перечисление",
+                "зачисления",
+                "зачисление",
+                "осуществления выплаты",
+            ],
+        }
+
+        scores = {kind: 0.0 for kind in marker_map}
+        for text, weight in parts:
+            if not text:
+                continue
+            for kind, markers in marker_map.items():
+                for marker in markers:
+                    if marker in text:
+                        scores[kind] += weight
+
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        best_kind, best_score = ranked[0]
+        second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+
+        if best_score <= 0.0:
+            return "other"
+        if second_score > 0.0 and abs(best_score - second_score) < 0.6:
+            return "other"
+        return best_kind
 
     def _infer_table_scope_hints(
         self,
@@ -2071,6 +2266,7 @@ class RetrievalOrchestrator:
                 "submission_channel": query_bundle.get("submission_channel"),
                 "requested_column_hints": query_bundle.get("requested_column_hints"),
                 "table_scope_hints": query_bundle.get("table_scope_hints"),
+                "deadline_question_kind": query_bundle.get("deadline_question_kind"),
             },
             "selected_candidates_preview": [
                 {
@@ -2447,11 +2643,39 @@ class RetrievalOrchestrator:
                 question_norm = self._normalize_text(
                     payload.question_text_normalized or payload.question_text_raw
                 )
+                deadline_question_kind = str(
+                    query_bundle.get("deadline_question_kind") or "other"
+                ).strip().lower()
+                candidate_deadline_kind = self._classify_deadline_candidate_kind(candidate)
+
+                if deadline_question_kind != "other":
+                    if candidate_deadline_kind == deadline_question_kind:
+                        if candidate.source_type == "table_row":
+                            score += 0.30
+                        elif candidate.source_type == "table":
+                            score += 0.16
+                        else:
+                            score += 0.08
+                    elif candidate_deadline_kind == "other":
+                        if candidate.source_type == "table_row":
+                            score -= 0.06
+                        else:
+                            score -= 0.03
+                    else:
+                        if candidate.source_type == "table_row":
+                            score -= 0.24
+                        elif candidate.source_type == "table":
+                            score -= 0.12
+                        else:
+                            score -= 0.08
+
                 for term in [
                     "принятия решения",
                     "рассмотрения заявления",
                     "предоставления услуги",
                     "регистрации заявления",
+                    "уведомления",
+                    "направления уведомления",
                     "выплаты",
                     "перечисления",
                 ]:
