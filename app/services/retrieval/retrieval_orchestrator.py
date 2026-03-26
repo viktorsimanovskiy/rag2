@@ -281,10 +281,7 @@ class RetrievalOrchestrator:
                 merged_candidates = [
                     c
                     for c in merged_candidates
-                    if (
-                        (c.source_type != "block" or self._has_meaningful_lexical_match(c, query_bundle["query_terms"]))
-                        and self._is_meaningful_deadline_candidate(c, deadline_question_kind)
-                    )
+                    if self._is_meaningful_deadline_candidate(c, deadline_question_kind)
                 ]
             else:
                 merged_candidates = [
@@ -1163,8 +1160,14 @@ class RetrievalOrchestrator:
             "выплата",
             "перечисления",
             "перечислить",
+            "перечисление",
+            "выплачивается",
+            "выплачиваются",
+            "производится выплата",
+            "производится перечисление",
             "денежных средств",
             "месяца следующего за месяцем принятия решения",
+            "26-го числа",
         ]
         notification_markers = [
             "уведомления",
@@ -1194,12 +1197,19 @@ class RetrievalOrchestrator:
         candidate: RetrievedCandidate,
         deadline_question_kind: Optional[str],
     ) -> bool:
+        """
+        Keep deadline filtering conservative, but never so strict that we lose the
+        whole evidence package. Exact deadline-kind matching must influence ranking,
+        not act as a hard gate for all candidates.
+        """
         if self._is_generic_deadline_noise_candidate(candidate):
             return False
 
         metadata = candidate.metadata_json or {}
         table_type = self._normalize_text(str(metadata.get("table_semantic_type") or ""))
         candidate_kind = self._classify_deadline_candidate_kind(candidate)
+        has_temporal = self._candidate_has_temporal_marker(candidate)
+        has_deadline_value = self._candidate_has_deadline_value(candidate)
 
         if candidate.source_type == "legal_fact":
             return True
@@ -1207,23 +1217,29 @@ class RetrievalOrchestrator:
         if candidate.source_type == "table":
             if table_type in {"deadline", "deadlines"}:
                 return True
-            return self._candidate_has_temporal_marker(candidate) and candidate_kind != "other"
+            return has_temporal or candidate_kind != "other"
 
         if candidate.source_type == "table_row":
-            if self._candidate_has_deadline_value(candidate):
+            if has_deadline_value:
                 return True
-            if table_type in {"deadline", "deadlines"} and self._candidate_has_temporal_marker(candidate):
+            if table_type in {"deadline", "deadlines"} and has_temporal:
                 return True
             if deadline_question_kind in {"decision", "notification", "payment"}:
-                return self._candidate_has_temporal_marker(candidate) and candidate_kind == deadline_question_kind
-            return self._candidate_has_temporal_marker(candidate) and candidate_kind != "other"
+                if candidate_kind == deadline_question_kind and (has_temporal or has_deadline_value):
+                    return True
+                # Fallback: keep temporal rows even if subtype classifier missed the nuance.
+                return has_temporal
+            return has_temporal or candidate_kind != "other"
 
         if candidate.source_type == "block":
-            if not self._candidate_has_temporal_marker(candidate):
+            if not has_temporal:
                 return False
             if deadline_question_kind in {"decision", "notification", "payment"}:
-                return candidate_kind == deadline_question_kind
-            return candidate_kind != "other"
+                if candidate_kind == deadline_question_kind:
+                    return True
+                # Fallback: keep explicit temporal paragraphs and let reranking decide.
+                return True
+            return True
 
         return False
 
