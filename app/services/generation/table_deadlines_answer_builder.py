@@ -8,6 +8,8 @@ from typing import Any, Optional
 class DeadlineAnswerItem:
     deadline_value: str
     scope_text: Optional[str] = None
+    deadline_kind: str = "other"
+    kind_confidence: float = 0.0
     source_row_ids: list[str] = field(default_factory=list)
     source_table_types: list[str] = field(default_factory=list)
     source_scores: list[float] = field(default_factory=list)
@@ -16,6 +18,7 @@ class DeadlineAnswerItem:
 @dataclass(slots=True)
 class DeadlinesAnswerBuildResult:
     can_answer: bool
+    question_deadline_kind: str = "other"
     primary_item: Optional[DeadlineAnswerItem] = None
     alternative_items: list[DeadlineAnswerItem] = field(default_factory=list)
     dropped_rows_debug: list[dict[str, Any]] = field(default_factory=list)
@@ -34,10 +37,13 @@ class DeadlinesAnswerBuildResult:
     def debug_payload(self) -> dict[str, Any]:
         return {
             "can_answer": self.can_answer,
+            "question_deadline_kind": self.question_deadline_kind,
             "primary_item": (
                 {
                     "deadline_value": self.primary_item.deadline_value,
                     "scope_text": self.primary_item.scope_text,
+                    "deadline_kind": self.primary_item.deadline_kind,
+                    "kind_confidence": self.primary_item.kind_confidence,
                     "source_row_ids": self.primary_item.source_row_ids,
                     "source_table_types": self.primary_item.source_table_types,
                     "source_scores": self.primary_item.source_scores,
@@ -50,6 +56,8 @@ class DeadlinesAnswerBuildResult:
                 {
                     "deadline_value": item.deadline_value,
                     "scope_text": item.scope_text,
+                    "deadline_kind": item.deadline_kind,
+                    "kind_confidence": item.kind_confidence,
                     "source_row_ids": item.source_row_ids,
                     "source_table_types": item.source_table_types,
                     "source_scores": item.source_scores,
@@ -71,6 +79,8 @@ class TableDeadlinesAnswerBuilder:
     - works only with retrieval-selected candidates
     - does not query DB directly
     - prefers rows from extractor-classified deadlines tables
+    - distinguishes deadline kinds generically:
+      decision / notification / payment / other
     - stays conservative when multiple different deadlines are found
     """
 
@@ -90,6 +100,55 @@ class TableDeadlinesAnswerBuilder:
         "календарных дней",
     }
 
+    _DEADLINE_KIND_MARKERS: dict[str, tuple[str, ...]] = {
+        "decision": (
+            "принятия решения",
+            "принятие решения",
+            "принять решение",
+            "рассмотрения заявления",
+            "рассмотрение заявления",
+            "рассмотрения документов",
+            "рассмотрение документов",
+            "регистрации заявления",
+            "регистрация заявления",
+            "назначении",
+            "назначение",
+            "предоставления государственной услуги",
+            "предоставления услуги",
+        ),
+        "notification": (
+            "уведомления",
+            "направления уведомления",
+            "направление уведомления",
+            "уведомить",
+            "информирования",
+            "информирование",
+            "сообщения о решении",
+            "сообщение о решении",
+            "извещения",
+            "извещение",
+        ),
+        "payment": (
+            "выплаты",
+            "выплата",
+            "срок выплаты",
+            "перечисления",
+            "перечисление",
+            "зачисления",
+            "зачисление",
+            "доставки выплаты",
+            "осуществления выплаты",
+            "первая выплата",
+        ),
+    }
+
+    _DEADLINE_KIND_LABELS: dict[str, str] = {
+        "decision": "принятия решения",
+        "notification": "уведомления",
+        "payment": "выплаты",
+        "other": "срока",
+    }
+
     def build(
         self,
         *,
@@ -100,6 +159,7 @@ class TableDeadlinesAnswerBuilder:
         dropped_rows_debug: list[dict[str, Any]] = []
 
         normalized_question = self._normalize(question_text)
+        question_deadline_kind = self._detect_question_deadline_kind(normalized_question)
 
         for candidate in candidates:
             if getattr(candidate, "source_type", None) != "table_row":
@@ -163,8 +223,14 @@ class TableDeadlinesAnswerBuilder:
                 continue
 
             scope_text = self._extract_scope_text(cells)
+            deadline_kind, kind_confidence = self._classify_deadline_kind(
+                cells=cells,
+                scope_text=scope_text,
+            )
             question_bonus = self._question_scope_bonus(
                 question_text_normalized=normalized_question,
+                question_deadline_kind=question_deadline_kind,
+                item_deadline_kind=deadline_kind,
                 scope_text=scope_text,
             )
             priority_score = score + question_bonus
@@ -173,6 +239,8 @@ class TableDeadlinesAnswerBuilder:
                 DeadlineAnswerItem(
                     deadline_value=deadline_value,
                     scope_text=scope_text,
+                    deadline_kind=deadline_kind,
+                    kind_confidence=kind_confidence,
                     source_row_ids=[row_id] if row_id else [],
                     source_table_types=[table_semantic_type] if table_semantic_type else [],
                     source_scores=[priority_score],
@@ -182,6 +250,7 @@ class TableDeadlinesAnswerBuilder:
         if not raw_items:
             return DeadlinesAnswerBuildResult(
                 can_answer=False,
+                question_deadline_kind=question_deadline_kind,
                 reason="no_deadline_rows",
                 dropped_rows_debug=dropped_rows_debug,
             )
@@ -191,6 +260,7 @@ class TableDeadlinesAnswerBuilder:
         if not merged_items:
             return DeadlinesAnswerBuildResult(
                 can_answer=False,
+                question_deadline_kind=question_deadline_kind,
                 reason="no_merged_deadline_rows",
                 dropped_rows_debug=dropped_rows_debug,
                 merged_items_debug=merged_items_debug,
@@ -198,6 +268,10 @@ class TableDeadlinesAnswerBuilder:
 
         merged_items.sort(
             key=lambda item: (
+                -self._deadline_kind_alignment_score(
+                    question_deadline_kind=question_deadline_kind,
+                    item_deadline_kind=item.deadline_kind,
+                ),
                 -self._best_score(item),
                 -self._deadline_specificity_score(item.deadline_value),
                 len(item.scope_text or ""),
@@ -216,8 +290,15 @@ class TableDeadlinesAnswerBuilder:
             ):
                 ambiguity_reason = "multiple_distinct_deadlines"
 
+        if (
+            question_deadline_kind != "other"
+            and primary_item.deadline_kind != question_deadline_kind
+        ):
+            ambiguity_reason = ambiguity_reason or "target_deadline_kind_not_confirmed"
+
         return DeadlinesAnswerBuildResult(
             can_answer=True,
+            question_deadline_kind=question_deadline_kind,
             primary_item=primary_item,
             alternative_items=alternative_items,
             dropped_rows_debug=dropped_rows_debug,
@@ -235,37 +316,60 @@ class TableDeadlinesAnswerBuilder:
             return None
 
         primary = result.primary_item
+        target_label = self._deadline_kind_label(result.question_deadline_kind)
+        has_target_match = (
+            result.question_deadline_kind != "other"
+            and primary.deadline_kind == result.question_deadline_kind
+        )
 
         if not result.alternative_items:
+            intro = "Срок по найденным источникам"
+            if has_target_match:
+                intro = f"Срок {target_label} по найденным источникам"
+
             if primary.scope_text:
-                return (
-                    f"Срок по найденным источникам: {primary.deadline_value} "
-                    f"({primary.scope_text})."
+                text = f"{intro}: {primary.deadline_value} ({primary.scope_text})."
+            else:
+                text = f"{intro}: {primary.deadline_value}."
+
+            if result.question_deadline_kind != "other" and not has_target_match:
+                text += (
+                    f" Не удалось однозначно подтвердить, что это именно срок {target_label}."
                 )
-            return f"Срок по найденным источникам: {primary.deadline_value}."
+            return text
 
         lines: list[str] = []
         lines.append("По найденным источникам установлены следующие сроки:")
-
         lines.append(self._render_bulleted_item(primary))
 
         for item in result.alternative_items:
             lines.append(self._render_bulleted_item(item))
 
         lines.append("")
-        lines.append(
-            "Конкретный срок зависит от того, о каком действии или этапе процедуры идёт речь."
-        )
+        if result.question_deadline_kind != "other":
+            if has_target_match:
+                lines.append(
+                    f"Для вопроса о сроке {target_label} ориентируйся прежде всего на соответствующую строку."
+                )
+            else:
+                lines.append(
+                    f"Не удалось однозначно подтвердить, какая из найденных строк относится именно к сроку {target_label}."
+                )
+        else:
+            lines.append(
+                "Конкретный срок зависит от того, о каком действии или этапе процедуры идёт речь."
+            )
         return "\n".join(lines)
 
     def _merge_similar_items(
         self,
         items: list[DeadlineAnswerItem],
     ) -> tuple[list[DeadlineAnswerItem], list[dict[str, Any]]]:
-        groups: dict[tuple[str, str], list[DeadlineAnswerItem]] = {}
+        groups: dict[tuple[str, str, str], list[DeadlineAnswerItem]] = {}
 
         for item in items:
             key = (
+                item.deadline_kind,
                 self._normalize(item.deadline_value),
                 self._normalize(item.scope_text),
             )
@@ -280,6 +384,7 @@ class TableDeadlinesAnswerBuilder:
                 key=lambda item: (
                     -self._best_score(item),
                     -self._deadline_specificity_score(item.deadline_value),
+                    item.deadline_kind != "other",
                     len(item.scope_text or ""),
                     len(item.deadline_value),
                 ),
@@ -288,6 +393,7 @@ class TableDeadlinesAnswerBuilder:
             row_ids: list[str] = []
             table_types: list[str] = []
             scores: list[float] = []
+            confidences: list[float] = []
 
             for item in group_items:
                 for row_id in item.source_row_ids:
@@ -297,10 +403,13 @@ class TableDeadlinesAnswerBuilder:
                     if table_type and table_type not in table_types:
                         table_types.append(table_type)
                 scores.extend(item.source_scores)
+                confidences.append(item.kind_confidence)
 
             merged_item = DeadlineAnswerItem(
                 deadline_value=best_item.deadline_value,
                 scope_text=best_item.scope_text,
+                deadline_kind=best_item.deadline_kind,
+                kind_confidence=max(confidences) if confidences else best_item.kind_confidence,
                 source_row_ids=row_ids,
                 source_table_types=table_types,
                 source_scores=sorted(scores, reverse=True),
@@ -312,6 +421,8 @@ class TableDeadlinesAnswerBuilder:
                     {
                         "merged_deadline_value": merged_item.deadline_value,
                         "merged_scope_text": merged_item.scope_text,
+                        "merged_deadline_kind": merged_item.deadline_kind,
+                        "merged_kind_confidence": merged_item.kind_confidence,
                         "source_row_ids": row_ids,
                         "source_items_count": len(group_items),
                     }
@@ -366,16 +477,33 @@ class TableDeadlinesAnswerBuilder:
         self,
         *,
         question_text_normalized: str,
+        question_deadline_kind: str,
+        item_deadline_kind: str,
         scope_text: Optional[str],
     ) -> float:
-        if not question_text_normalized or not scope_text:
-            return 0.0
+        bonus = 0.0
+
+        if not question_text_normalized:
+            return bonus
+
+        if question_deadline_kind != "other":
+            alignment_score = self._deadline_kind_alignment_score(
+                question_deadline_kind=question_deadline_kind,
+                item_deadline_kind=item_deadline_kind,
+            )
+            if alignment_score >= 3:
+                bonus += 0.35
+            elif alignment_score == 1:
+                bonus -= 0.04
+            else:
+                bonus -= 0.18
+
+        if not scope_text:
+            return bonus
 
         scope_norm = self._normalize(scope_text)
         if not scope_norm:
-            return 0.0
-
-        bonus = 0.0
+            return bonus
 
         strong_markers = [
             "принятия решения",
@@ -383,6 +511,7 @@ class TableDeadlinesAnswerBuilder:
             "предоставления услуги",
             "регистрации заявления",
             "направления уведомления",
+            "уведомления",
             "перечисления",
             "выплаты",
         ]
@@ -401,6 +530,105 @@ class TableDeadlinesAnswerBuilder:
             bonus += min(0.12, matched_terms * 0.04)
 
         return bonus
+
+    def _classify_deadline_kind(
+        self,
+        *,
+        cells: dict[str, Any],
+        scope_text: Optional[str],
+    ) -> tuple[str, float]:
+        scores = {
+            "decision": 0.0,
+            "notification": 0.0,
+            "payment": 0.0,
+        }
+
+        weighted_cell_keys = {
+            "step",
+            "action",
+            "result",
+            "comment",
+            "deadline_subject",
+            "procedure_stage",
+        }
+
+        text_fragments: list[tuple[str, float]] = []
+        if scope_text:
+            text_fragments.append((self._normalize(scope_text), 1.0))
+
+        for key, value in cells.items():
+            if key in self._IGNORED_SCOPE_KEYS:
+                continue
+            cleaned = self._clean(value)
+            if not cleaned:
+                continue
+            weight = 1.35 if str(key).strip().lower() in weighted_cell_keys else 1.0
+            text_fragments.append((self._normalize(cleaned), weight))
+
+        for text, weight in text_fragments:
+            if not text:
+                continue
+            for kind, markers in self._DEADLINE_KIND_MARKERS.items():
+                for marker in markers:
+                    if marker in text:
+                        scores[kind] += weight
+
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        best_kind, best_score = ranked[0]
+        second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+
+        if best_score <= 0.0:
+            return ("other", 0.0)
+
+        if second_score > 0.0 and abs(best_score - second_score) < 0.6:
+            return ("other", round(best_score, 3))
+
+        return (best_kind, round(best_score, 3))
+
+    def _detect_question_deadline_kind(self, question_text_normalized: str) -> str:
+        text = self._normalize(question_text_normalized)
+        if not text:
+            return "other"
+
+        scores = {
+            "decision": 0,
+            "notification": 0,
+            "payment": 0,
+        }
+        for kind, markers in self._DEADLINE_KIND_MARKERS.items():
+            for marker in markers:
+                if marker in text:
+                    scores[kind] += 1
+
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        best_kind, best_score = ranked[0]
+        second_score = ranked[1][1] if len(ranked) > 1 else 0
+
+        if best_score <= 0:
+            return "other"
+        if second_score == best_score and best_score > 0:
+            return "other"
+        return best_kind
+
+    def _deadline_kind_alignment_score(
+        self,
+        *,
+        question_deadline_kind: str,
+        item_deadline_kind: str,
+    ) -> int:
+        if question_deadline_kind == "other":
+            return 1 if item_deadline_kind != "other" else 0
+
+        if item_deadline_kind == question_deadline_kind:
+            return 3
+
+        if item_deadline_kind == "other":
+            return 1
+
+        return 0
+
+    def _deadline_kind_label(self, deadline_kind: str) -> str:
+        return self._DEADLINE_KIND_LABELS.get(deadline_kind, self._DEADLINE_KIND_LABELS["other"])
 
     def _deadline_specificity_score(self, value: str) -> int:
         text = self._normalize(value)
@@ -422,9 +650,13 @@ class TableDeadlinesAnswerBuilder:
         return max(item.source_scores)
 
     def _render_bulleted_item(self, item: DeadlineAnswerItem) -> str:
+        kind_prefix = ""
+        if item.deadline_kind != "other":
+            kind_prefix = f"{self._deadline_kind_label(item.deadline_kind)}: "
+
         if item.scope_text:
-            return f"— {item.deadline_value} ({item.scope_text})"
-        return f"— {item.deadline_value}"
+            return f"— {kind_prefix}{item.deadline_value} ({item.scope_text})"
+        return f"— {kind_prefix}{item.deadline_value}"
 
     def _extract_candidate_score(self, candidate: Any) -> float:
         rerank_score = getattr(candidate, "rerank_score", None)
