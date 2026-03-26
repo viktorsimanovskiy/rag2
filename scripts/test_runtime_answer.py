@@ -52,7 +52,10 @@ def _resolve_question(raw_question: str | None, preset: str | None) -> str:
         "documents": "какие документы нужны для едв",
         "documents_epgu": "какие документы нужны для едв при подаче через епгу",
         "deadline": "срок принятия решения по едв",
+        "deadline_decision": "срок принятия решения по едв",
         "deadline_review": "срок рассмотрения заявления по едв",
+        "deadline_notification": "срок уведомления о решении по едв",
+        "deadline_payment": "срок выплаты едв",
         "procedure": "как назначается едв",
         "refusal": "по каким основаниям могут отказать в едв",
     }
@@ -162,7 +165,7 @@ def main() -> int:
     parser.add_argument(
         "--preset",
         required=False,
-        help="Question preset: documents, documents_epgu, deadline, deadline_review, procedure, refusal",
+        help="Question preset: documents, documents_epgu, deadline, deadline_decision, deadline_review, deadline_notification, deadline_payment, procedure, refusal",
     )
     args = parser.parse_args()
 
