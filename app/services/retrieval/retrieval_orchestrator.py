@@ -24,7 +24,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from uuid import UUID
@@ -276,23 +275,15 @@ class RetrievalOrchestrator:
             QuestionIntentEnum.DEADLINE_QUESTION,
             QuestionIntentEnum.FORM_QUESTION,
         }:
-            if payload.intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
-                deadline_question_kind = query_bundle.get("deadline_question_kind")
-                merged_candidates = [
-                    c
-                    for c in merged_candidates
-                    if self._is_meaningful_deadline_candidate(c, deadline_question_kind)
-                ]
-            else:
-                merged_candidates = [
-                    c
-                    for c in merged_candidates
-                    if c.source_type != "block"
-                    or self._has_meaningful_lexical_match(
-                        c,
-                        query_bundle["query_terms"],
-                    )
-                ]
+            merged_candidates = [
+                c
+                for c in merged_candidates
+                if c.source_type != "block"
+                or self._has_meaningful_lexical_match(
+                    c,
+                    query_bundle["query_terms"],
+                )
+            ]
 
         elif payload.intent_type in {
             QuestionIntentEnum.REJECTION_QUESTION,
@@ -490,14 +481,9 @@ class RetrievalOrchestrator:
             intent_type=payload.intent_type,
         )
         submission_channel = self._detect_submission_channel(normalized_text)
-        deadline_question_kind = self._detect_deadline_question_kind(
-            normalized_text,
-            payload.intent_type,
-        )
         requested_column_hints = self._build_requested_column_hints(
             table_question_profile=table_question_profile,
             submission_channel=submission_channel,
-            deadline_question_kind=deadline_question_kind,
         )
         table_scope_hints = self._infer_table_scope_hints(
             intent_type=payload.intent_type,
@@ -510,7 +496,6 @@ class RetrievalOrchestrator:
             measure_code=payload.measure_code,
             submission_channel=submission_channel,
             requested_column_hints=requested_column_hints,
-            deadline_question_kind=deadline_question_kind,
         )
 
         query_terms = self._deduplicate_preserve_order(
@@ -531,7 +516,6 @@ class RetrievalOrchestrator:
             "submission_channel": submission_channel,
             "requested_column_hints": requested_column_hints,
             "table_scope_hints": table_scope_hints,
-            "deadline_question_kind": deadline_question_kind,
         }
 
 
@@ -543,7 +527,6 @@ class RetrievalOrchestrator:
         measure_code: Optional[str],
         submission_channel: Optional[str] = None,
         requested_column_hints: Optional[list[str]] = None,
-        deadline_question_kind: Optional[str] = None,
     ) -> list[str]:
         terms: list[str] = []
 
@@ -574,41 +557,8 @@ class RetrievalOrchestrator:
                     "рабочих дней",
                     "календарных дней",
                     "дней",
-                    "в течение",
-                    "не позднее",
                 ]
             )
-
-            if deadline_question_kind == "decision":
-                terms.extend(
-                    [
-                        "принятия решения",
-                        "решение о предоставлении",
-                        "решение о назначении",
-                        "рассмотрения заявления",
-                        "рабочих дней",
-                    ]
-                )
-            elif deadline_question_kind == "notification":
-                terms.extend(
-                    [
-                        "уведомления",
-                        "уведомить заявителя",
-                        "направления уведомления",
-                        "информирования заявителя",
-                        "сообщить заявителю",
-                    ]
-                )
-            elif deadline_question_kind == "payment":
-                terms.extend(
-                    [
-                        "выплаты",
-                        "перечисления",
-                        "перечислить",
-                        "перечисление денежных средств",
-                        "месяца следующего за месяцем принятия решения",
-                    ]
-                )
 
         elif intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION:
             terms.extend(
@@ -917,7 +867,6 @@ class RetrievalOrchestrator:
         *,
         table_question_profile: Optional[str],
         submission_channel: Optional[str],
-        deadline_question_kind: Optional[str] = None,
     ) -> list[str]:
         """
         Hints for downstream retrieval / ranking / debug.
@@ -931,7 +880,7 @@ class RetrievalOrchestrator:
             ]
 
         if table_question_profile == "deadline":
-            hints = [
+            return [
                 "deadline_value",
                 "срок",
                 "сроки",
@@ -942,39 +891,7 @@ class RetrievalOrchestrator:
                 "максимальный срок",
                 "рабочих дней",
                 "календарных дней",
-                "в течение",
-                "не позднее",
             ]
-
-            if deadline_question_kind == "decision":
-                hints.extend(
-                    [
-                        "принятия решения",
-                        "рассмотрения заявления",
-                        "решение о предоставлении",
-                        "решение о назначении",
-                    ]
-                )
-            elif deadline_question_kind == "notification":
-                hints.extend(
-                    [
-                        "уведомления",
-                        "уведомить заявителя",
-                        "направления уведомления",
-                        "информирования заявителя",
-                    ]
-                )
-            elif deadline_question_kind == "payment":
-                hints.extend(
-                    [
-                        "выплаты",
-                        "перечисления",
-                        "перечислить",
-                        "месяца следующего за месяцем принятия решения",
-                    ]
-                )
-
-            return self._deduplicate_preserve_order(hints)
 
         if table_question_profile == "documents_by_submission_channel":
             mapping = {
@@ -1023,225 +940,6 @@ class RetrievalOrchestrator:
             return mapping.get(submission_channel or "", ["document_name", "наименование документа"])
 
         return []
-
-    def _detect_deadline_question_kind(
-        self,
-        text: str,
-        intent_type: QuestionIntentEnum,
-    ) -> Optional[str]:
-        if intent_type != QuestionIntentEnum.DEADLINE_QUESTION:
-            return None
-
-        text_norm = self._normalize_text(text)
-
-        payment_markers = [
-            "срок выплаты",
-            "когда выплата",
-            "когда выплатят",
-            "выплаты",
-            "перечисления",
-            "перечислить",
-            "перевода денежных средств",
-            "денежных средств",
-        ]
-        notification_markers = [
-            "срок уведомления",
-            "когда уведомят",
-            "уведомления",
-            "уведомить",
-            "направления уведомления",
-            "информирования заявителя",
-            "сообщить заявителю",
-        ]
-        decision_markers = [
-            "срок принятия решения",
-            "когда примут решение",
-            "принятия решения",
-            "срок рассмотрения",
-            "рассмотрения заявления",
-            "решение о предоставлении",
-            "решение о назначении",
-        ]
-
-        if any(marker in text_norm for marker in payment_markers):
-            return "payment"
-        if any(marker in text_norm for marker in notification_markers):
-            return "notification"
-        if any(marker in text_norm for marker in decision_markers):
-            return "decision"
-        return "other"
-
-    def _extract_candidate_cells(
-        self,
-        candidate: RetrievedCandidate,
-    ) -> dict[str, Any]:
-        metadata = candidate.metadata_json or {}
-        cells = metadata.get("cells_by_semantic_key") or metadata.get("cells_by_header_key") or {}
-        if isinstance(cells, dict):
-            return cells
-        return {}
-
-    def _candidate_has_deadline_value(self, candidate: RetrievedCandidate) -> bool:
-        cells = self._extract_candidate_cells(candidate)
-        return bool(cells.get("deadline_value"))
-
-    def _candidate_has_temporal_marker(self, candidate: RetrievedCandidate) -> bool:
-        text = self._candidate_text_blob(candidate)
-        if self._candidate_has_deadline_value(candidate):
-            return True
-
-        temporal_markers = [
-            "срок",
-            "сроки",
-            "в течение",
-            "не позднее",
-            "не ранее",
-            "не более",
-            "в срок",
-            "в течение ",
-            "рабочих дней",
-            "рабочего дня",
-            "календарных дней",
-            "календарного дня",
-            "дней",
-            "дня",
-            "месяца",
-            "месяц",
-            "числа месяца",
-        ]
-        if any(marker in text for marker in temporal_markers):
-            return True
-
-        return bool(re.search(r"\b\d+\s*(рабоч(их|его)\s+дн(ей|я)|календарн(ых|ого)\s+дн(ей|я)|дн(ей|я)|месяц|месяца)\b", text))
-
-    def _is_generic_deadline_noise_candidate(self, candidate: RetrievedCandidate) -> bool:
-        metadata = candidate.metadata_json or {}
-        table_type = self._normalize_text(str(metadata.get("table_semantic_type") or ""))
-        text = self._candidate_text_blob(candidate)
-
-        if self._is_abbreviation_table_candidate(candidate):
-            return True
-
-        explicit_noise_markers = [
-            "условных обозначений",
-            "сокращений",
-            "терминов и определений",
-            "перечень сокращений",
-            "используемых сокращений",
-        ]
-        if any(marker in text for marker in explicit_noise_markers):
-            return True
-
-        if table_type in {"generic", "glossary", "abbreviations", "aliases"}:
-            if not self._candidate_has_temporal_marker(candidate):
-                return True
-
-        if candidate.source_type in {"table", "table_row"} and not self._candidate_has_temporal_marker(candidate):
-            cells = self._extract_candidate_cells(candidate)
-            cells_text = " ".join(str(value) for value in cells.values() if value)
-            if cells_text and len(cells_text.split()) <= 16:
-                return True
-
-        return False
-
-    def _classify_deadline_candidate_kind(
-        self,
-        candidate: RetrievedCandidate,
-    ) -> str:
-        text = self._candidate_text_blob(candidate)
-        cells = self._extract_candidate_cells(candidate)
-        if cells:
-            text = self._normalize_text(
-                text + " " + " ".join(str(value) for value in cells.values() if value)
-            )
-
-        payment_markers = [
-            "выплаты",
-            "выплата",
-            "перечисления",
-            "перечислить",
-            "перечисление",
-            "выплачивается",
-            "выплачиваются",
-            "производится выплата",
-            "производится перечисление",
-            "денежных средств",
-            "месяца следующего за месяцем принятия решения",
-            "26-го числа",
-        ]
-        notification_markers = [
-            "уведомления",
-            "уведомить",
-            "направления уведомления",
-            "информирования заявителя",
-            "сообщить заявителю",
-        ]
-        decision_markers = [
-            "принятия решения",
-            "рассмотрения заявления",
-            "решение о предоставлении",
-            "решение о назначении",
-            "принятие решения",
-        ]
-
-        if any(marker in text for marker in payment_markers):
-            return "payment"
-        if any(marker in text for marker in notification_markers):
-            return "notification"
-        if any(marker in text for marker in decision_markers):
-            return "decision"
-        return "other"
-
-    def _is_meaningful_deadline_candidate(
-        self,
-        candidate: RetrievedCandidate,
-        deadline_question_kind: Optional[str],
-    ) -> bool:
-        """
-        Keep deadline filtering conservative, but never so strict that we lose the
-        whole evidence package. Exact deadline-kind matching must influence ranking,
-        not act as a hard gate for all candidates.
-        """
-        if self._is_generic_deadline_noise_candidate(candidate):
-            return False
-
-        metadata = candidate.metadata_json or {}
-        table_type = self._normalize_text(str(metadata.get("table_semantic_type") or ""))
-        candidate_kind = self._classify_deadline_candidate_kind(candidate)
-        has_temporal = self._candidate_has_temporal_marker(candidate)
-        has_deadline_value = self._candidate_has_deadline_value(candidate)
-
-        if candidate.source_type == "legal_fact":
-            return True
-
-        if candidate.source_type == "table":
-            if table_type in {"deadline", "deadlines"}:
-                return True
-            return has_temporal or candidate_kind != "other"
-
-        if candidate.source_type == "table_row":
-            if has_deadline_value:
-                return True
-            if table_type in {"deadline", "deadlines"} and has_temporal:
-                return True
-            if deadline_question_kind in {"decision", "notification", "payment"}:
-                if candidate_kind == deadline_question_kind and (has_temporal or has_deadline_value):
-                    return True
-                # Fallback: keep temporal rows even if subtype classifier missed the nuance.
-                return has_temporal
-            return has_temporal or candidate_kind != "other"
-
-        if candidate.source_type == "block":
-            if not has_temporal:
-                return False
-            if deadline_question_kind in {"decision", "notification", "payment"}:
-                if candidate_kind == deadline_question_kind:
-                    return True
-                # Fallback: keep explicit temporal paragraphs and let reranking decide.
-                return True
-            return True
-
-        return False
 
     def _is_required_documents_table_candidate(self, candidate: RetrievedCandidate) -> bool:
         """
@@ -2153,11 +1851,11 @@ class RetrievalOrchestrator:
             """
             Select final balanced evidence set.
 
-            Special rule for DOCUMENTS_QUESTION:
-            - prefer table_row evidence from the priority document
-            - allow a noticeably larger pool of row candidates
-            - suppress noisy blocks/facts because deterministic builder
-              needs rows, not a mixed bag of snippets
+            Специальное правило для DEADLINE_QUESTION:
+            - первыми берём реальные temporal blocks и deadline rows;
+            - режем deadline-noise из таблиц отказов/сокращений;
+            - не заставляем builder жить только на table_row, потому что
+              в текущем документе сроки часто лежат в list_item блоках.
             """
             if not candidates:
                 return []
@@ -2166,8 +1864,6 @@ class RetrievalOrchestrator:
             is_deadline_question = payload.intent_type == QuestionIntentEnum.DEADLINE_QUESTION
 
             if is_documents_question:
-                # Для questions типа "какие документы нужны..."
-                # builder должен получить достаточный пул row-кандидатов.
                 type_caps = {
                     "legal_fact": 1,
                     "table": min(2, payload.final_top_k),
@@ -2176,10 +1872,10 @@ class RetrievalOrchestrator:
                 }
             elif is_deadline_question:
                 type_caps = {
-                    "legal_fact": max(1, min(3, payload.final_top_k)),
-                    "table": max(1, min(2, payload.final_top_k)),
-                    "table_row": max(4, min(8, payload.final_top_k)),
-                    "block": max(1, min(3, payload.final_top_k)),
+                    "legal_fact": 1,
+                    "table": 1,
+                    "table_row": min(4, payload.final_top_k),
+                    "block": min(6, payload.final_top_k),
                 }
             else:
                 type_caps = {
@@ -2196,19 +1892,8 @@ class RetrievalOrchestrator:
                 document_stats=document_stats,
             )
 
-            priority_candidates: list[RetrievedCandidate] = []
-            non_priority_candidates: list[RetrievedCandidate] = []
+            ordered_candidates = list(candidates)
 
-            for candidate in candidates:
-                if candidate.document_id in priority_document_set:
-                    priority_candidates.append(candidate)
-                else:
-                    non_priority_candidates.append(candidate)
-
-            ordered_candidates = [*priority_candidates, *non_priority_candidates]
-
-            # Для documents-question поднимаем наверх table_row из documents-table,
-            # чтобы сначала отбирать именно answer-bearing rows.
             if is_documents_question:
                 ordered_candidates.sort(
                     key=lambda candidate: (
@@ -2216,34 +1901,25 @@ class RetrievalOrchestrator:
                             candidate.document_id in priority_document_set
                             and candidate.source_type == "table_row"
                             and self._has_table_semantic_type(candidate, "documents")
-                        ) else
-                        1 if (
+                        ) else 1 if (
                             candidate.document_id in priority_document_set
                             and candidate.source_type == "table"
                             and self._has_table_semantic_type(candidate, "documents")
-                        ) else
-                        2 if candidate.document_id in priority_document_set else 3,
+                        ) else 2 if candidate.document_id in priority_document_set else 3,
                         -self._candidate_effective_score(candidate),
                     )
                 )
             elif is_deadline_question:
+                question_deadline_kind = self._detect_deadline_question_kind(
+                    payload.question_text_normalized or payload.question_text_raw
+                )
                 ordered_candidates.sort(
                     key=lambda candidate: (
-                        0 if (
-                            candidate.document_id in priority_document_set
-                            and candidate.source_type == "table_row"
-                            and (
-                                self._candidate_has_deadline_value(candidate)
-                                or self._has_table_semantic_type(candidate, "deadline")
-                                or self._has_table_semantic_type(candidate, "deadlines")
-                            )
-                        ) else
-                        1 if (
-                            candidate.document_id in priority_document_set
-                            and candidate.source_type == "block"
-                            and self._candidate_has_temporal_marker(candidate)
-                        ) else
-                        2 if candidate.document_id in priority_document_set else 3,
+                        self._deadline_candidate_priority_bucket(
+                            candidate,
+                            question_deadline_kind=question_deadline_kind,
+                            priority_document_set=priority_document_set,
+                        ),
                         -self._candidate_effective_score(candidate),
                     )
                 )
@@ -2262,6 +1938,9 @@ class RetrievalOrchestrator:
                 if effective_score < min_score_threshold:
                     continue
 
+                if is_deadline_question and self._is_deadline_noise_candidate(candidate):
+                    continue
+
                 current_type_count = type_counts.get(candidate.source_type, 0)
                 if current_type_count >= type_caps.get(candidate.source_type, payload.final_top_k):
                     continue
@@ -2269,6 +1948,8 @@ class RetrievalOrchestrator:
                 current_doc_count = document_counts.get(candidate.document_id, 0)
                 if is_documents_question:
                     max_per_document = 12 if candidate.document_id in priority_document_set else 4
+                elif is_deadline_question:
+                    max_per_document = 8 if candidate.document_id in priority_document_set else 3
                 else:
                     max_per_document = 6 if candidate.document_id in priority_document_set else 3
 
@@ -2283,22 +1964,19 @@ class RetrievalOrchestrator:
                 if len(selected) >= payload.final_top_k:
                     break
 
-            # Fallback: если балансировка оказалась слишком строгой,
-            # добираем ещё кандидатов без type/doc caps, но только до final_top_k.
             if len(selected) < min(3, payload.final_top_k):
                 for candidate in ordered_candidates:
                     if len(selected) >= payload.final_top_k:
                         break
-
                     candidate_key = (candidate.source_type, candidate.source_id)
                     if candidate_key in selected_keys:
                         continue
-
+                    if is_deadline_question and self._is_deadline_noise_candidate(candidate):
+                        continue
                     selected.append(candidate)
                     selected_keys.add(candidate_key)
 
             return selected
-
     def _build_evidence_package(
         self,
         *,
@@ -2639,10 +2317,9 @@ class RetrievalOrchestrator:
         """
         Local intent-aware rerank.
 
-        Goal:
-        - strengthen answer-bearing rows/tables
-        - suppress noisy blocks
-        - especially improve document-table retrieval
+        Для deadline-question здесь важны две вещи:
+        1) выкинуть ложные "сроковые" совпадения из таблиц отказов/сокращений;
+        2) поднять реальные temporal blocks и настоящие deadline rows.
         """
         if not candidates:
             return candidates
@@ -2651,34 +2328,28 @@ class RetrievalOrchestrator:
         table_question_profile = query_bundle.get("table_question_profile")
         submission_channel = query_bundle.get("submission_channel")
         requested_column_hints = query_bundle.get("requested_column_hints") or []
-        deadline_question_kind = query_bundle.get("deadline_question_kind")
+        question_norm = self._normalize_text(payload.question_text_normalized or payload.question_text_raw)
+        question_deadline_kind = self._detect_deadline_question_kind(question_norm)
 
         reranked: list[RetrievedCandidate] = []
 
         for candidate in candidates:
             score = candidate.rerank_score if candidate.rerank_score is not None else candidate.score
             text = self._candidate_text_blob(candidate)
+            text_norm = self._normalize_text(text)
 
-            # -------------------------------
-            # Global source priors
-            # -------------------------------
             if candidate.source_type == "table_row":
                 score += 0.05
             elif candidate.source_type == "table":
                 score += 0.03
 
-            # -------------------------------
-            # Documents questions
-            # -------------------------------
             if intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION:
-                # Strong positive signal: extractor already classified table as documents
                 if self._has_table_semantic_type(candidate, "documents"):
                     if candidate.source_type == "table_row":
                         score += 0.65
                     elif candidate.source_type == "table":
                         score += 0.35
 
-                # Strong negative signal: abbreviations table is not an answer to document list question
                 if self._is_abbreviation_table_candidate(candidate):
                     if candidate.source_type == "table_row":
                         score -= 1.10
@@ -2687,124 +2358,78 @@ class RetrievalOrchestrator:
                     else:
                         score -= 0.40
 
-                # Penalize service/header-like rows inside document tables
                 if self._looks_like_service_documents_row(candidate):
                     if candidate.source_type == "table_row":
                         score -= 0.60
                     elif candidate.source_type == "table":
                         score -= 0.30
 
-                # Existing lexical/table heuristics
                 if self._is_required_documents_table_candidate(candidate):
                     if candidate.source_type == "table_row":
                         score += 0.45
                     elif candidate.source_type == "table":
                         score += 0.25
-                    elif candidate.source_type == "legal_fact":
-                        score += 0.08
-                    elif candidate.source_type == "block":
-                        score -= 0.20
 
-                # Additional boosts if candidate explicitly contains requested column hints
-                for hint in requested_column_hints:
-                    hint_norm = self._normalize_text(hint)
-                    if hint_norm and hint_norm in text:
-                        score += 0.06
+                if self._has_documents_anchor_match(candidate, query_terms=query_bundle.get("query_terms") or []):
+                    score += 0.18
 
-                # Channel-specific questions
-                if table_question_profile == "documents_by_submission_channel":
-                    if self._has_submission_channel_match(candidate, submission_channel):
-                        if candidate.source_type == "table_row":
-                            score += 0.35
-                        elif candidate.source_type == "table":
-                            score += 0.20
-                        else:
-                            score += 0.08
-                    else:
-                        if candidate.source_type == "block":
-                            score -= 0.10
-                            
+                if submission_channel and self._has_submission_channel_match(candidate, submission_channel):
+                    score += 0.16
+
+                if any(hint in text_norm for hint in requested_column_hints if hint):
+                    score += 0.08
+
             elif intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
                 metadata = candidate.metadata_json or {}
-                text_norm = self._normalize_text(text)
                 table_semantic_type = self._normalize_text(metadata.get("table_semantic_type"))
-                has_deadline_value = self._candidate_has_deadline_value(candidate)
-                has_temporal_marker = self._candidate_has_temporal_marker(candidate)
+                cells = metadata.get("cells_by_semantic_key") or metadata.get("cells_by_header_key") or {}
+                has_deadline_value = isinstance(cells, dict) and bool(cells.get("deadline_value"))
+                has_temporal_markers = self._has_temporal_deadline_markers(candidate)
                 candidate_kind = self._classify_deadline_candidate_kind(candidate)
-                kind_matches = (
-                    deadline_question_kind in {"decision", "notification", "payment"}
-                    and candidate_kind == deadline_question_kind
-                )
 
-                if self._is_generic_deadline_noise_candidate(candidate):
-                    if candidate.source_type == "table_row":
-                        score -= 1.60
-                    elif candidate.source_type == "table":
-                        score -= 1.75
-                    else:
-                        score -= 0.60
+                if self._is_deadline_noise_candidate(candidate):
+                    score -= 1.20
 
                 if self._has_table_semantic_type(candidate, "deadlines") or self._has_table_semantic_type(candidate, "deadline"):
                     if candidate.source_type == "table_row":
-                        score += 0.70
+                        score += 0.45
                     elif candidate.source_type == "table":
-                        score += 0.35
+                        score += 0.22
 
                 if has_deadline_value:
-                    score += 0.70
-                elif has_temporal_marker:
-                    score += 0.18 if candidate.source_type == "table_row" else 0.10
-                else:
-                    if candidate.source_type in {"table_row", "table"}:
-                        score -= 0.90
+                    score += 0.30
 
-                if table_semantic_type in {
-                    "identifiers",
-                    "categories",
-                    "applicant_categories",
-                    "glossary",
-                    "abbreviations",
-                    "aliases",
-                    "generic",
-                }:
-                    score -= 0.90 if candidate.source_type == "table_row" else 1.10
+                if has_temporal_markers:
+                    if candidate.source_type == "block":
+                        score += 0.42
+                    elif candidate.source_type == "table_row":
+                        score += 0.22
+                    else:
+                        score += 0.12
+
+                if candidate.source_type == "table_row" and not has_deadline_value and table_semantic_type not in {"deadline", "deadlines"}:
+                    score -= 0.70
 
                 if self._looks_like_service_deadline_row(candidate):
                     if candidate.source_type == "table_row":
-                        score -= 0.80
+                        score -= 0.55
                     elif candidate.source_type == "table":
-                        score -= 0.45
+                        score -= 0.25
                     else:
-                        score -= 0.15
+                        score -= 0.10
 
-                if kind_matches:
-                    if candidate.source_type == "table_row":
-                        score += 0.85
-                    elif candidate.source_type == "block":
-                        score += 0.55
-                    elif candidate.source_type == "table":
-                        score += 0.30
-                elif deadline_question_kind in {"decision", "notification", "payment"} and candidate_kind in {"decision", "notification", "payment"}:
-                    score -= 0.65
+                if question_deadline_kind != "other" and candidate_kind == question_deadline_kind:
+                    score += 0.48
+                elif question_deadline_kind != "other" and candidate_kind != "other":
+                    score -= 0.22
 
-                explicit_deadline_phrases = [
-                    "в течение",
-                    "не позднее",
-                    "рабочих дней",
-                    "рабочего дня",
-                    "календарных дней",
-                    "календарного дня",
-                    "месяца следующего за месяцем принятия решения",
-                ]
-                if any(marker in text_norm for marker in explicit_deadline_phrases):
-                    score += 0.28 if candidate.source_type in {"table_row", "block"} else 0.14
+                if question_deadline_kind == "notification" and "со дня принятия решения" in text_norm and "уведом" in text_norm:
+                    score += 0.12
+                if question_deadline_kind == "payment" and ("26-го числа" in text_norm or "26 числа" in text_norm):
+                    score += 0.18
+                if question_deadline_kind == "decision" and "решение о предоставлении" in text_norm:
+                    score += 0.16
 
-                if candidate.source_type == "table" and table_semantic_type not in {"deadline", "deadlines"}:
-                    score -= 0.40
-
-            # -------------------------------
-            # Rejection
-            # -------------------------------
             elif intent_type == QuestionIntentEnum.REJECTION_QUESTION:
                 if any(marker in text for marker in [
                     "основания отказа",
@@ -2815,9 +2440,6 @@ class RetrievalOrchestrator:
                 ]):
                     score += 0.18
 
-            # -------------------------------
-            # Eligibility
-            # -------------------------------
             elif intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION:
                 if any(marker in text for marker in [
                     "имеет право",
@@ -2834,13 +2456,200 @@ class RetrievalOrchestrator:
             key=lambda item: (
                 item.rerank_score if item.rerank_score is not None else item.score,
                 item.score,
+                1 if item.source_type == "block" else 0,
                 1 if item.source_type == "table_row" else 0,
-                1 if item.source_type == "table" else 0,
             ),
             reverse=True,
         )
         return reranked
-    
+    def _detect_deadline_question_kind(
+        self,
+        question_text: str,
+    ) -> str:
+        text = self._normalize_text(question_text)
+        if not text:
+            return "other"
+
+        notification_markers = [
+            "уведомления",
+            "уведомить",
+            "уведомление",
+            "направления уведомления",
+            "информирования",
+            "сообщения о решении",
+        ]
+        payment_markers = [
+            "выплаты",
+            "выплата",
+            "выплачивается",
+            "перечисления",
+            "перечисление",
+            "зачисления",
+            "зачисление",
+        ]
+        decision_markers = [
+            "принятия решения",
+            "принятие решения",
+            "рассмотрения заявления",
+            "рассмотрение заявления",
+            "регистрации заявления",
+            "назначении",
+            "назначение",
+        ]
+
+        if any(marker in text for marker in notification_markers):
+            return "notification"
+        if any(marker in text for marker in payment_markers):
+            return "payment"
+        if any(marker in text for marker in decision_markers):
+            return "decision"
+        return "other"
+
+
+    def _classify_deadline_candidate_kind(
+        self,
+        candidate: RetrievedCandidate,
+    ) -> str:
+        text = self._normalize_text(self._candidate_text_blob(candidate))
+        if not text:
+            return "other"
+
+        notification_markers = [
+            "уведомления",
+            "уведомление",
+            "направляет уведомление",
+            "направления уведомления",
+            "уведомить",
+            "информирования",
+            "сообщения о решении",
+        ]
+        payment_markers = [
+            "выплаты",
+            "выплата",
+            "выплачивается",
+            "перечисления",
+            "перечисление",
+            "зачисления",
+            "зачисление",
+            "26-го числа",
+            "26 числа",
+        ]
+        decision_markers = [
+            "принятия решения",
+            "принятие решения",
+            "решение о предоставлении",
+            "решение о назначении",
+            "рассмотрения заявления",
+            "рассмотрение заявления",
+            "регистрации заявления",
+            "назначении",
+            "назначение",
+        ]
+
+        scores = {"decision": 0, "notification": 0, "payment": 0}
+        for marker in notification_markers:
+            if marker in text:
+                scores["notification"] += 1
+        for marker in payment_markers:
+            if marker in text:
+                scores["payment"] += 1
+        for marker in decision_markers:
+            if marker in text:
+                scores["decision"] += 1
+
+        winner = max(scores, key=scores.get)
+        if scores[winner] <= 0:
+            return "other"
+        return winner
+
+
+    def _has_temporal_deadline_markers(
+        self,
+        candidate: RetrievedCandidate,
+    ) -> bool:
+        text = self._normalize_text(self._candidate_text_blob(candidate))
+        if not text:
+            return False
+
+        markers = [
+            "в течение",
+            "не позднее",
+            "не более",
+            "рабочих дней",
+            "календарных дней",
+            "26-го числа",
+            "26 числа",
+        ]
+        if any(marker in text for marker in markers):
+            return True
+
+        return any(ch.isdigit() for ch in text) and any(word in text for word in ["дней", "дня", "числа"])
+
+
+    def _is_deadline_noise_candidate(
+        self,
+        candidate: RetrievedCandidate,
+    ) -> bool:
+        metadata = candidate.metadata_json or {}
+        table_semantic_type = self._normalize_text(metadata.get("table_semantic_type"))
+
+        if table_semantic_type in {
+            "refusal_reasons",
+            "rejection_reasons",
+            "documents",
+            "identifiers",
+            "categories",
+            "applicant_categories",
+            "glossary",
+            "abbreviations",
+            "aliases",
+        }:
+            cells = metadata.get("cells_by_semantic_key") or metadata.get("cells_by_header_key") or {}
+            if not (isinstance(cells, dict) and cells.get("deadline_value")):
+                return True
+
+        if self._is_abbreviation_table_candidate(candidate):
+            return True
+
+        text = self._normalize_text(self._candidate_text_blob(candidate))
+        if "отказа в предоставлении" in text or "перечень оснований" in text:
+            return True
+
+        return False
+
+
+    def _deadline_candidate_priority_bucket(
+        self,
+        candidate: RetrievedCandidate,
+        *,
+        question_deadline_kind: str,
+        priority_document_set: set[UUID],
+    ) -> int:
+        kind = self._classify_deadline_candidate_kind(candidate)
+        has_temporal_markers = self._has_temporal_deadline_markers(candidate)
+        in_priority_doc = candidate.document_id in priority_document_set
+
+        if self._is_deadline_noise_candidate(candidate):
+            return 9
+
+        if in_priority_doc and candidate.source_type == "block" and has_temporal_markers and kind == question_deadline_kind and question_deadline_kind != "other":
+            return 0
+        if in_priority_doc and candidate.source_type == "table_row" and self._has_table_semantic_type(candidate, "deadlines") and kind == question_deadline_kind and question_deadline_kind != "other":
+            return 1
+        if in_priority_doc and candidate.source_type == "block" and has_temporal_markers:
+            return 2
+        if in_priority_doc and candidate.source_type == "table_row" and self._has_table_semantic_type(candidate, "deadlines"):
+            return 3
+        if in_priority_doc and has_temporal_markers:
+            return 4
+        if candidate.source_type == "block" and has_temporal_markers:
+            return 5
+        if candidate.source_type == "table_row" and self._has_table_semantic_type(candidate, "deadlines"):
+            return 6
+        if has_temporal_markers:
+            return 7
+        return 8
+
     def _has_min_intent_anchor_match(
         self,
         candidate: RetrievedCandidate,
