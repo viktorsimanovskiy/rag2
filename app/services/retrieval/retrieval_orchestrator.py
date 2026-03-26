@@ -2396,25 +2396,45 @@ class RetrievalOrchestrator:
                 metadata = candidate.metadata_json or {}
                 text_norm = self._normalize_text(text)
 
+                table_semantic_type = self._normalize_text(metadata.get("table_semantic_type"))
+                cells = metadata.get("cells_by_semantic_key") or {}
+                has_deadline_value = isinstance(cells, dict) and bool(cells.get("deadline_value"))
+
                 if self._has_table_semantic_type(candidate, "deadlines") or self._has_table_semantic_type(candidate, "deadline"):
                     if candidate.source_type == "table_row":
                         score += 0.45
                     elif candidate.source_type == "table":
                         score += 0.22
 
-                cells = metadata.get("cells_by_semantic_key") or {}
-                if isinstance(cells, dict) and cells.get("deadline_value"):
+                if has_deadline_value:
                     score += 0.25
 
-                if any(marker in text_norm for marker in [
+                deadline_markers = [
                     "срок",
                     "в течение",
                     "рабочих дней",
                     "календарных дней",
                     "не позднее",
                     "не более",
-                ]):
-                    score += 0.18 if candidate.source_type == "table_row" else 0.08
+                ]
+                if any(marker in text_norm for marker in deadline_markers):
+                    score += 0.18 if candidate.source_type == "table_row" else 0.12
+
+                # Критично: режем ложные table_row, которые говорят про "принятие решения",
+                # но не содержат сам срок и не относятся к deadline-таблицам.
+                if candidate.source_type == "table_row" and not has_deadline_value and table_semantic_type not in {"deadline", "deadlines"}:
+                    score -= 0.60
+
+                # Дополнительный штраф для semantic types, которые явно не про сроки.
+                if candidate.source_type == "table_row" and table_semantic_type in {
+                    "identifiers",
+                    "categories",
+                    "applicant_categories",
+                    "glossary",
+                    "abbreviations",
+                    "aliases",
+                }:
+                    score -= 0.35
 
                 if self._looks_like_service_deadline_row(candidate):
                     if candidate.source_type == "table_row":

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import sys
 from pathlib import Path
 from uuid import uuid4
@@ -12,39 +11,23 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.config.settings import load_settings
-from app.db.models.enums import ChannelTypeEnum, QuestionIntentEnum
-from app.db.session import DatabaseSessionManager
+from app.db.models.enums import QuestionIntentEnum
 from app.runtime.app_runtime import AppRuntime, AppRuntimeConfig
 from app.services.answers.runtime_answer_service import RuntimeAnswerInput
 
 
-QUESTION_PRESETS: dict[str, tuple[str, QuestionIntentEnum]] = {
-    "documents": (
-        "какие документы нужны для едв",
-        QuestionIntentEnum.DOCUMENTS_QUESTION,
-    ),
-    "documents_epgu": (
-        "какие документы нужны для едв при подаче через епгу",
-        QuestionIntentEnum.DOCUMENTS_QUESTION,
-    ),
-}
-
-
-def _parse_intent(value: str):
+def _parse_intent(value: str) -> QuestionIntentEnum:
     normalized = (value or "").strip().lower()
 
     mapping = {
         "documents": QuestionIntentEnum.DOCUMENTS_QUESTION,
         "documents_question": QuestionIntentEnum.DOCUMENTS_QUESTION,
         "docs": QuestionIntentEnum.DOCUMENTS_QUESTION,
-
         "deadline": QuestionIntentEnum.DEADLINE_QUESTION,
         "deadlines": QuestionIntentEnum.DEADLINE_QUESTION,
         "deadline_question": QuestionIntentEnum.DEADLINE_QUESTION,
-
         "procedure": QuestionIntentEnum.PROCEDURE_QUESTION,
         "procedure_question": QuestionIntentEnum.PROCEDURE_QUESTION,
-
         "refusal": QuestionIntentEnum.REJECTION_QUESTION,
         "refusal_reasons": QuestionIntentEnum.REJECTION_QUESTION,
         "refusal_reasons_question": QuestionIntentEnum.REJECTION_QUESTION,
@@ -85,10 +68,32 @@ def _resolve_question(raw_question: str | None, preset: str | None) -> str:
     return "срок принятия решения по едв"
 
 
+def _safe_getattr(obj: object, name: str, default=None):
+    return getattr(obj, name, default)
+
+
+def _result_to_debug_dict(result: object) -> dict:
+    if hasattr(result, "__dict__"):
+        return dict(vars(result))
+
+    fields = {}
+    for name in dir(result):
+        if name.startswith("_"):
+            continue
+        try:
+            value = getattr(result, name)
+        except Exception:
+            continue
+        if callable(value):
+            continue
+        fields[name] = value
+    return fields
+
+
 async def run(
     *,
     question_text: str,
-    intent,
+    intent: QuestionIntentEnum,
 ) -> None:
     settings = load_settings()
     runtime = AppRuntime(
@@ -96,10 +101,12 @@ async def run(
             database=settings.database,
         )
     )
+
     await runtime.startup()
     try:
         async with runtime.session_scope() as session:
-            service = runtime.build_service_factory(session).get_runtime_answer_service()
+            service_factory = runtime.build_service_factory(session)
+            service = service_factory.get_runtime_answer_service()
 
             normalized_question = " ".join(question_text.strip().lower().split())
 
@@ -115,6 +122,8 @@ async def run(
                 )
             )
 
+            debug_result = _result_to_debug_dict(result)
+
             print("=" * 80)
             print("QUESTION:")
             print(question_text)
@@ -122,29 +131,21 @@ async def run(
             print("INTENT:")
             print(getattr(intent, "value", str(intent)))
             print()
-            print("ANSWER:")
-            print(result.answer_text or "<empty>")
+            print("RESULT TYPE:")
+            print(type(result).__name__)
             print()
-            print("ANSWER MODE:")
-            print(getattr(result.answer_mode, "value", str(result.answer_mode)))
+            print("KNOWN RESULT FIELDS:")
+            for key in sorted(debug_result.keys()):
+                print(f"- {key}")
             print()
-            print("CONFIDENCE:")
-            print(result.confidence_score)
-            print()
-            print("CITATIONS:")
-            if not result.citations:
-                print("<none>")
-            else:
-                for index, citation in enumerate(result.citations, start=1):
-                    print(f"{index}. {citation}")
-            print()
-            print("PAYLOAD JSON:")
-            print(result.answer_payload_json)
+            print("RESULT PAYLOAD:")
+            print(debug_result)
             print("=" * 80)
     finally:
         await runtime.shutdown()
 
-def main() -> None:
+
+def main() -> int:
     parser = argparse.ArgumentParser(
         description="Smoke-test for runtime answer path"
     )
@@ -163,7 +164,6 @@ def main() -> None:
         required=False,
         help="Question preset: documents, documents_epgu, deadline, deadline_review, procedure, refusal",
     )
-
     args = parser.parse_args()
 
     intent = _parse_intent(args.intent)
@@ -175,10 +175,7 @@ def main() -> None:
             intent=intent,
         )
     )
-
-
-if __name__ == "__main__":
-    main()
+    return 0
 
 
 if __name__ == "__main__":
