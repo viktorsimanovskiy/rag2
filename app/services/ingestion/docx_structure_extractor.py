@@ -674,6 +674,17 @@ class DocxStructureExtractor:
                 return True
 
         return False
+
+    def _classify_service_section_row(
+        self,
+        *,
+        row_json: dict[str, Any],
+        normalized_row_json: dict[str, Any],
+    ) -> Optional[dict[str, str]]:
+        """
+        Определяет, является ли service-строка разделителем смысловой группы
+        внутри таблицы документов, и если да — возвращает её тип и подпись.
+        """
         
     def _build_cells_by_header(
         self,
