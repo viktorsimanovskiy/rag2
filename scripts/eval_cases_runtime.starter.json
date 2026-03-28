@@ -1,0 +1,45 @@
+[
+  {
+    "case_id": "documents_edv_basic",
+    "intent": "documents",
+    "question": "какие документы нужны для едв",
+    "expected_answer_mode": "direct_structured",
+    "expected_substrings": ["документ", "едв"],
+    "expected_evidence_quality": "strong",
+    "notes": "Базовый вопрос по documents-path. Проверяет, что детерминированная сборка вообще работает."
+  },
+  {
+    "case_id": "documents_edv_epgu",
+    "intent": "documents",
+    "question": "какие документы нужны для едв при подаче через епгу",
+    "expected_answer_mode": "direct_structured",
+    "expected_substrings": ["епгу"],
+    "expected_evidence_quality": "strong",
+    "notes": "Проверяет, что учитывается канал подачи."
+  },
+  {
+    "case_id": "deadline_decision_edv",
+    "intent": "deadline",
+    "question": "срок принятия решения по едв",
+    "expected_substrings": ["2 рабочих дней"],
+    "forbidden_substrings": ["26-го числа", "опечаток"],
+    "expected_evidence_quality": "strong",
+    "notes": "Ключевой рабочий smoke-case по decision deadline."
+  },
+  {
+    "case_id": "deadline_notification_edv",
+    "intent": "deadline",
+    "question": "срок уведомления о решении по едв",
+    "expected_substrings": ["уведом"],
+    "forbidden_substrings": ["опечаток", "проверк", "утвердить"],
+    "notes": "Здесь допустимо пока не указывать точное значение срока, если оно ещё нестабильно."
+  },
+  {
+    "case_id": "deadline_payment_edv",
+    "intent": "deadline",
+    "question": "срок выплаты едв",
+    "expected_substrings": ["26-го числа"],
+    "forbidden_substrings": ["утвердить", "утратившими силу", "административный регламент"],
+    "notes": "Ключевой smoke-case по payment deadline."
+  }
+]

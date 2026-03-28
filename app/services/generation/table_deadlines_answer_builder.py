@@ -79,13 +79,13 @@ class TableDeadlinesAnswerBuilder:
     """
     Deterministic builder for deadline questions.
 
-    Почему builder теперь работает не только с table_row:
-    - в текущем проекте часть реальных сроков лежит в таблицах,
-      но часть лежит в обычных paragraph/list_item блоках;
-    - для deadline-question нам важен не тип источника сам по себе,
-      а наличие явной temporal-formula и понятного procedural scope;
-    - builder по-прежнему не ходит в БД и работает только с уже
-      выбранными retrieval-кандидатами.
+    Что меняем по сравнению с предыдущей версией:
+    - block-кандидаты остаются полноправным источником срока;
+    - классификация kind становится контекстной: payment / notification
+      должны выигрывать у простого упоминания "принятия решения", если
+      это лишь опорная точка для последующего этапа;
+    - render_text по возможности отдаёт один основной срок, а не свалку
+      всех найденных сроков разных этапов.
     """
 
     _IGNORED_SCOPE_KEYS = {
@@ -104,45 +104,6 @@ class TableDeadlinesAnswerBuilder:
         "календарных дней",
     }
 
-    _DEADLINE_KIND_MARKERS: dict[str, tuple[str, ...]] = {
-        "decision": (
-            "принятия решения",
-            "принятие решения",
-            "решение о предоставлении",
-            "решение о назначении",
-            "рассмотрения заявления",
-            "рассмотрение заявления",
-            "рассмотрения документов",
-            "регистрации заявления",
-            "назначении",
-            "назначение",
-        ),
-        "notification": (
-            "уведомления",
-            "направляет уведомление",
-            "направление уведомления",
-            "направляет заявителю",
-            "уведомить",
-            "информирования",
-            "информирование",
-            "сообщения о решении",
-            "извещение",
-        ),
-        "payment": (
-            "выплаты",
-            "выплата",
-            "выплачивается",
-            "перечисления",
-            "перечисление",
-            "зачисления",
-            "зачисление",
-            "осуществления выплаты",
-            "доставки выплаты",
-            "26-го числа",
-            "26 числа",
-        ),
-    }
-
     _DEADLINE_KIND_LABELS: dict[str, str] = {
         "decision": "принятия решения",
         "notification": "уведомления",
@@ -150,12 +111,110 @@ class TableDeadlinesAnswerBuilder:
         "other": "срока",
     }
 
+    # Общие deadline-паттерны. Порядок важен: сначала более длинные и
+    # предметные формулы, затем более короткие.
     _BLOCK_DEADLINE_PATTERNS = [
-        re.compile(r"в течение\s+\d+\s+(?:рабоч(?:их|его)|календарн(?:ых|ого))\s+дн(?:я|ей)", re.IGNORECASE),
+        re.compile(
+            r"не позднее\s+26(?:-го)?\s+числа\s+месяца[^.;]{0,160}",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"в течение\s+\d+\s+(?:рабоч(?:их|его)|календарн(?:ых|ого))\s+дн(?:я|ей)",
+            re.IGNORECASE,
+        ),
         re.compile(r"в течение\s+\d+\s+дн(?:я|ей)", re.IGNORECASE),
-        re.compile(r"не позднее\s+[^.;]{3,120}", re.IGNORECASE),
-        re.compile(r"не более\s+\d+\s+(?:рабоч(?:их|его)|календарн(?:ых|ого))\s+дн(?:я|ей)", re.IGNORECASE),
+        re.compile(
+            r"не более\s+\d+\s+(?:рабоч(?:их|его)|календарн(?:ых|ого))\s+дн(?:я|ей)",
+            re.IGNORECASE,
+        ),
+        re.compile(r"не позднее\s+[^.;]{3,160}", re.IGNORECASE),
     ]
+
+    # Для жёсткого отсечения нерелевантных procedural block-ов, которые
+    # попадали в shortlist, но не отвечали на вопрос о сроке ЕДВ как услуги.
+    _OFFTOPIC_BLOCK_MARKERS = (
+        "исправлении опечаток",
+        "опечаток и ошибок",
+        "новый документ взамен",
+        "проверки подписи",
+        "подлинности простой электронной подписи",
+        "усиленной квалифицированной электронной подписи",
+        "отказе в приеме к рассмотрению документов",
+        "статьи 9",
+        "статьи 11",
+        "федерального закона n 63-фз",
+    )
+
+    # Маркеры kind-а разбиты по силе. Это позволяет не считать любое
+    # упоминание "принятия решения" признаком decision, если основной смысл
+    # блока - уведомление или выплата после уже принятого решения.
+    _PAYMENT_STRONG_MARKERS = (
+        "выплачивает",
+        "выплачивается",
+        "выплата",
+        "выплаты",
+        "ежемесячно",
+        "перечисление",
+        "перечисления",
+        "зачисление",
+        "зачисления",
+        "доставки выплаты",
+        "осуществления выплаты",
+        "через отделение почтовой связи",
+        "российскую кредитную организацию",
+        "не позднее 26-го числа",
+        "не позднее 26 числа",
+        "не позднее 26-го числа месяца",
+        "не позднее 26 числа месяца",
+        "26-го числа текущего месяца",
+        "26 числа текущего месяца",
+    )
+    _PAYMENT_WEAK_MARKERS = (
+        "предоставление едв",
+        "возобновление едв",
+        "получателю",
+        "денежн",
+    )
+
+    _NOTIFICATION_STRONG_MARKERS = (
+        "направляет",
+        "направить",
+        "уведомление",
+        "уведомляет",
+        "уведомить",
+        "извещение",
+        "извещает",
+        "сообщение о решении",
+        "сообщает заявителю",
+        "информирование",
+        "информирует",
+    )
+    _NOTIFICATION_WEAK_MARKERS = (
+        "заявителю",
+        "ветерану труда края уведомление",
+        "направление уведомления",
+    )
+
+    _DECISION_STRONG_MARKERS = (
+        "решение о предоставлении",
+        "решение о назначении",
+        "решение принимается",
+        "принимается уполномоченным учреждением",
+        "принятие решения",
+        "принятия решения",
+        "назначении едв",
+        "назначение едв",
+        "рассмотрения заявления",
+        "рассмотрение заявления",
+        "рассмотрения документов",
+        "регистрации заявления",
+    )
+    _DECISION_WEAK_MARKERS = (
+        "назначении",
+        "назначение",
+        "решение",
+        "рассмотрение",
+    )
 
     def build(
         self,
@@ -246,16 +305,47 @@ class TableDeadlinesAnswerBuilder:
             return None
 
         primary = result.primary_item
-        label = self._DEADLINE_KIND_LABELS.get(primary.deadline_kind, self._DEADLINE_KIND_LABELS["other"])
+        question_kind = result.question_deadline_kind
+        primary_label = self._DEADLINE_KIND_LABELS.get(
+            primary.deadline_kind,
+            self._DEADLINE_KIND_LABELS["other"],
+        )
 
-        if not result.alternative_items:
+        # Главный режим: пользователь спросил про конкретный этап, и у нас
+        # есть сильный primary этого же типа. Тогда отвечаем одним сроком,
+        # не засоряя ответ уведомлением/выплатой из соседних пунктов.
+        if self._should_render_single_primary(
+            primary=primary,
+            alternatives=result.alternative_items,
+            question_deadline_kind=question_kind,
+        ):
             if primary.scope_text:
-                return f"Срок {label} по найденным источникам: {primary.deadline_value} ({primary.scope_text})."
-            return f"Срок {label} по найденным источникам: {primary.deadline_value}."
+                return (
+                    f"Срок {primary_label} по найденным источникам: "
+                    f"{primary.deadline_value} ({primary.scope_text})."
+                )
+            return f"Срок {primary_label} по найденным источникам: {primary.deadline_value}."
+
+        # Осторожный fallback: выводим только близкие альтернативы. При
+        # вопросе про конкретный этап не показываем альтернативы других типов,
+        # чтобы не подменять ответ списком чужих сроков.
+        visible_alternatives = self._select_visible_alternatives(
+            primary=primary,
+            alternatives=result.alternative_items,
+            question_deadline_kind=question_kind,
+        )
+
+        if not visible_alternatives:
+            if primary.scope_text:
+                return (
+                    f"Срок {primary_label} по найденным источникам: "
+                    f"{primary.deadline_value} ({primary.scope_text})."
+                )
+            return f"Срок {primary_label} по найденным источникам: {primary.deadline_value}."
 
         lines: list[str] = ["По найденным источникам установлены следующие сроки:"]
         lines.append(self._render_bulleted_item(primary))
-        for item in result.alternative_items:
+        for item in visible_alternatives:
             lines.append(self._render_bulleted_item(item))
         lines.append("")
         lines.append("Конкретный срок зависит от того, о каком действии или этапе процедуры идёт речь.")
@@ -281,35 +371,43 @@ class TableDeadlinesAnswerBuilder:
 
         deadline_value = self._extract_deadline_value(cells)
         if not deadline_value:
-            dropped_rows_debug.append({
-                "row_id": row_id,
-                "reason": "empty_deadline_value",
-                "table_semantic_type": table_semantic_type,
-            })
+            dropped_rows_debug.append(
+                {
+                    "row_id": row_id,
+                    "reason": "empty_deadline_value",
+                    "table_semantic_type": table_semantic_type,
+                }
+            )
             return None
 
         if self._is_service_value(deadline_value):
-            dropped_rows_debug.append({
-                "row_id": row_id,
-                "reason": "service_header_row",
-                "deadline_value": deadline_value,
-            })
+            dropped_rows_debug.append(
+                {
+                    "row_id": row_id,
+                    "reason": "service_header_row",
+                    "deadline_value": deadline_value,
+                }
+            )
             return None
 
         if not self._looks_like_deadline_value(deadline_value):
-            dropped_rows_debug.append({
-                "row_id": row_id,
-                "reason": "not_deadline_like_value",
-                "deadline_value": deadline_value,
-            })
+            dropped_rows_debug.append(
+                {
+                    "row_id": row_id,
+                    "reason": "not_deadline_like_value",
+                    "deadline_value": deadline_value,
+                }
+            )
             return None
 
         if table_semantic_type and table_semantic_type.lower() not in {"deadlines", "deadline"}:
-            dropped_rows_debug.append({
-                "row_id": row_id,
-                "reason": "not_deadlines_table",
-                "table_semantic_type": table_semantic_type,
-            })
+            dropped_rows_debug.append(
+                {
+                    "row_id": row_id,
+                    "reason": "not_deadlines_table",
+                    "table_semantic_type": table_semantic_type,
+                }
+            )
             return None
 
         scope_text = self._extract_scope_text(cells)
@@ -345,6 +443,10 @@ class TableDeadlinesAnswerBuilder:
         text = self._clean(getattr(candidate, "snippet", None) or getattr(candidate, "title", None) or "")
         if not text:
             dropped_rows_debug.append({"row_id": block_id, "reason": "empty_block_text"})
+            return None
+
+        if self._is_offtopic_deadline_block(text):
+            dropped_rows_debug.append({"row_id": block_id, "reason": "offtopic_deadline_block"})
             return None
 
         if not self._has_block_deadline_marker(text):
@@ -431,14 +533,16 @@ class TableDeadlinesAnswerBuilder:
             merged_items.append(merged_item)
 
             if len(group_items) > 1:
-                merged_items_debug.append({
-                    "merged_deadline_value": merged_item.deadline_value,
-                    "merged_scope_text": merged_item.scope_text,
-                    "deadline_kind": merged_item.deadline_kind,
-                    "source_row_ids": row_ids,
-                    "source_block_ids": block_ids,
-                    "source_items_count": len(group_items),
-                })
+                merged_items_debug.append(
+                    {
+                        "merged_deadline_value": merged_item.deadline_value,
+                        "merged_scope_text": merged_item.scope_text,
+                        "deadline_kind": merged_item.deadline_kind,
+                        "source_row_ids": row_ids,
+                        "source_block_ids": block_ids,
+                        "source_items_count": len(group_items),
+                    }
+                )
 
         return merged_items, merged_items_debug
 
@@ -447,25 +551,23 @@ class TableDeadlinesAnswerBuilder:
         *,
         item: DeadlineAnswerItem,
         question_deadline_kind: str,
-    ) -> tuple[int, int, float, float, int, int]:
-        kind_match_bucket = 1
+    ) -> tuple[int, float, float, float, int, int]:
+        kind_bucket = 1
         if question_deadline_kind == "other":
-            kind_match_bucket = 0
+            kind_bucket = 0
         elif item.deadline_kind == question_deadline_kind:
-            kind_match_bucket = 0
+            kind_bucket = 0
 
-        source_bucket = 1
-        if item.source_row_ids:
-            source_bucket = 0
-        elif item.source_block_ids:
-            source_bucket = 1
+        # table_row оставляем слегка предпочтительным, но не настолько,
+        # чтобы подавлять хороший block по точному kind-совпадению.
+        source_bonus = 0.05 if item.source_row_ids else 0.0
 
         return (
-            kind_match_bucket,
-            source_bucket,
-            -self._best_score(item),
+            kind_bucket,
+            -(self._best_score(item) + source_bonus),
             -item.kind_confidence,
             -self._deadline_specificity_score(item.deadline_value),
+            -self._same_kind_source_count(item),
             len(item.scope_text or ""),
         )
 
@@ -514,12 +616,28 @@ class TableDeadlinesAnswerBuilder:
 
     def _extract_block_scope_text(self, *, text: str, deadline_kind: str) -> Optional[str]:
         text_norm = self._normalize(text)
-        if deadline_kind == "decision":
-            return "принятие решения"
-        if deadline_kind == "notification":
-            return "уведомление о решении"
+
         if deadline_kind == "payment":
+            if "едв" in text_norm:
+                return "выплата ЕДВ"
             return "выплата"
+
+        if deadline_kind == "notification":
+            if "о назначении едв" in text_norm:
+                return "уведомление о назначении ЕДВ"
+            if "о предоставлении едв" in text_norm:
+                return "уведомление о предоставлении ЕДВ"
+            if "уведомление" in text_norm:
+                return "уведомление о решении"
+            return "уведомление"
+
+        if deadline_kind == "decision":
+            if "решение о предоставлении едв" in text_norm:
+                return "принятие решения о предоставлении ЕДВ"
+            if "решение о назначении едв" in text_norm:
+                return "принятие решения о назначении ЕДВ"
+            return "принятие решения"
+
         if "предоставлении услуги" in text_norm:
             return "предоставление услуги"
         return None
@@ -533,18 +651,55 @@ class TableDeadlinesAnswerBuilder:
         if not norm:
             return ("other", 0.0)
 
-        scores: dict[str, float] = {"decision": 0.0, "notification": 0.0, "payment": 0.0}
-        for kind, markers in self._DEADLINE_KIND_MARKERS.items():
-            for marker in markers:
-                if marker in norm:
-                    scores[kind] += 1.0
+        payment_score = self._score_by_markers(norm, self._PAYMENT_STRONG_MARKERS, 2.3)
+        payment_score += self._score_by_markers(norm, self._PAYMENT_WEAK_MARKERS, 0.7)
 
+        notification_score = self._score_by_markers(norm, self._NOTIFICATION_STRONG_MARKERS, 2.1)
+        notification_score += self._score_by_markers(norm, self._NOTIFICATION_WEAK_MARKERS, 0.6)
+
+        decision_score = self._score_by_markers(norm, self._DECISION_STRONG_MARKERS, 1.6)
+        decision_score += self._score_by_markers(norm, self._DECISION_WEAK_MARKERS, 0.35)
+
+        # Контекстные поправки.
+        # Для payment/question block-а фраза "со дня принятия решения" не делает
+        # срок decision, если в тексте есть явная выплата/перечисление.
+        if payment_score > 0 and "принятия решения" in norm:
+            decision_score *= 0.45
+
+        # Аналогично для уведомления: наличие "принятия решения" - лишь опорная
+        # точка после которой отправляют уведомление.
+        if notification_score > 0 and "принятия решения" in norm:
+            decision_score *= 0.55
+
+        # Если вопрос/текст напрямую содержит "срок выплаты" или "срок уведомления",
+        # усиливаем соответствующий kind.
+        if "срок выплаты" in norm or "срок выплаты едв" in norm:
+            payment_score += 1.5
+        if "срок уведомления" in norm or "срок уведомления о решении" in norm:
+            notification_score += 1.5
+        if "срок принятия решения" in norm:
+            decision_score += 1.5
+
+        scores = {
+            "decision": decision_score,
+            "notification": notification_score,
+            "payment": payment_score,
+        }
         winner = max(scores, key=scores.get)
         best_score = scores[winner]
         if best_score <= 0:
             return ("other", 0.0)
+
         total = sum(scores.values()) or 1.0
-        return (winner, round(best_score / total, 3))
+        confidence = round(best_score / total, 3)
+
+        # Если различие между лучшим и вторым кандидатом минимально,
+        # не притворяемся уверенными и снижаем confidence.
+        ordered_scores = sorted(scores.values(), reverse=True)
+        if len(ordered_scores) >= 2 and ordered_scores[0] - ordered_scores[1] < 0.35:
+            confidence = round(min(confidence, 0.58), 3)
+
+        return (winner, confidence)
 
     def _question_scope_bonus(
         self,
@@ -556,9 +711,9 @@ class TableDeadlinesAnswerBuilder:
     ) -> float:
         bonus = 0.0
         if question_deadline_kind != "other" and item_deadline_kind == question_deadline_kind:
-            bonus += 0.40
+            bonus += 0.45
         elif question_deadline_kind != "other" and item_deadline_kind != "other":
-            bonus -= 0.18
+            bonus -= 0.22
 
         if not question_text_normalized or not scope_text:
             return bonus
@@ -588,6 +743,8 @@ class TableDeadlinesAnswerBuilder:
             score += 2
         if "не более" in text or "не позднее" in text:
             score += 1
+        if "26" in text:
+            score += 1
         return score
 
     def _best_score(self, item: DeadlineAnswerItem) -> float:
@@ -595,11 +752,77 @@ class TableDeadlinesAnswerBuilder:
             return 0.0
         return max(item.source_scores)
 
+    def _same_kind_source_count(self, item: DeadlineAnswerItem) -> int:
+        return len(item.source_row_ids) + len(item.source_block_ids)
+
     def _render_bulleted_item(self, item: DeadlineAnswerItem) -> str:
         label = self._DEADLINE_KIND_LABELS.get(item.deadline_kind, self._DEADLINE_KIND_LABELS["other"])
         if item.scope_text:
             return f"— {item.deadline_value} ({label}; {item.scope_text})"
         return f"— {item.deadline_value} ({label})"
+
+    def _select_visible_alternatives(
+        self,
+        *,
+        primary: DeadlineAnswerItem,
+        alternatives: list[DeadlineAnswerItem],
+        question_deadline_kind: str,
+    ) -> list[DeadlineAnswerItem]:
+        visible: list[DeadlineAnswerItem] = []
+        primary_score = self._best_score(primary)
+
+        for item in alternatives:
+            # При конкретном вопросе показываем только альтернативы того же kind.
+            if question_deadline_kind != "other" and item.deadline_kind != question_deadline_kind:
+                continue
+
+            # Даже для same-kind альтернатив показываем только действительно
+            # близкие варианты, а не весь хвост.
+            if primary_score - self._best_score(item) > 0.18:
+                continue
+
+            # Не плодим почти одинаковые строки с тем же сроком и тем же типом.
+            if (
+                self._normalize(item.deadline_value) == self._normalize(primary.deadline_value)
+                and item.deadline_kind == primary.deadline_kind
+            ):
+                continue
+
+            visible.append(item)
+            if len(visible) >= 2:
+                break
+
+        return visible
+
+    def _should_render_single_primary(
+        self,
+        *,
+        primary: DeadlineAnswerItem,
+        alternatives: list[DeadlineAnswerItem],
+        question_deadline_kind: str,
+    ) -> bool:
+        if question_deadline_kind == "other":
+            return not alternatives
+
+        if primary.deadline_kind != question_deadline_kind:
+            return False
+
+        # Если следующая same-kind альтернатива сильно слабее, не раздуваем ответ.
+        same_kind_alternatives = [
+            item for item in alternatives if item.deadline_kind == question_deadline_kind
+        ]
+        if not same_kind_alternatives:
+            return True
+
+        next_item = same_kind_alternatives[0]
+        if self._best_score(primary) - self._best_score(next_item) >= 0.18:
+            return True
+
+        # Высокая уверенность в kind + нормальный отрыв по score.
+        if primary.kind_confidence >= 0.62 and self._best_score(primary) - self._best_score(next_item) >= 0.10:
+            return True
+
+        return False
 
     def _extract_candidate_score(self, candidate: Any) -> float:
         rerank_score = getattr(candidate, "rerank_score", None)
@@ -616,13 +839,16 @@ class TableDeadlinesAnswerBuilder:
             return False
         if any(pattern.search(text) for pattern in self._BLOCK_DEADLINE_PATTERNS):
             return True
-        return any(marker in norm for marker in (
-            "рабочих дней",
-            "календарных дней",
-            "в течение",
-            "не позднее",
-            "не более",
-        ))
+        return any(
+            marker in norm
+            for marker in (
+                "рабочих дней",
+                "календарных дней",
+                "в течение",
+                "не позднее",
+                "не более",
+            )
+        )
 
     def _looks_like_deadline_value(self, text: str) -> bool:
         text_norm = self._normalize(text)
@@ -642,6 +868,19 @@ class TableDeadlinesAnswerBuilder:
 
     def _is_service_value(self, text: str) -> bool:
         return self._normalize(text) in {self._normalize(x) for x in self._SERVICE_VALUES}
+
+    def _is_offtopic_deadline_block(self, text: str) -> bool:
+        norm = self._normalize(text)
+        if not norm:
+            return False
+        return any(marker in norm for marker in self._OFFTOPIC_BLOCK_MARKERS)
+
+    def _score_by_markers(self, norm: str, markers: tuple[str, ...], weight: float) -> float:
+        score = 0.0
+        for marker in markers:
+            if marker in norm:
+                score += weight
+        return score
 
     def _pretty_label(self, key: Any) -> Optional[str]:
         if key is None:

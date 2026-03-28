@@ -481,9 +481,14 @@ class RetrievalOrchestrator:
             intent_type=payload.intent_type,
         )
         submission_channel = self._detect_submission_channel(normalized_text)
+        question_deadline_kind = None
+        if payload.intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
+            question_deadline_kind = self._detect_deadline_question_kind(normalized_text)
+
         requested_column_hints = self._build_requested_column_hints(
             table_question_profile=table_question_profile,
             submission_channel=submission_channel,
+            question_deadline_kind=question_deadline_kind,
         )
         table_scope_hints = self._infer_table_scope_hints(
             intent_type=payload.intent_type,
@@ -496,6 +501,7 @@ class RetrievalOrchestrator:
             measure_code=payload.measure_code,
             submission_channel=submission_channel,
             requested_column_hints=requested_column_hints,
+            question_deadline_kind=question_deadline_kind,
         )
 
         query_terms = self._deduplicate_preserve_order(
@@ -516,6 +522,7 @@ class RetrievalOrchestrator:
             "submission_channel": submission_channel,
             "requested_column_hints": requested_column_hints,
             "table_scope_hints": table_scope_hints,
+            "question_deadline_kind": question_deadline_kind,
         }
 
 
@@ -527,6 +534,7 @@ class RetrievalOrchestrator:
         measure_code: Optional[str],
         submission_channel: Optional[str] = None,
         requested_column_hints: Optional[list[str]] = None,
+        question_deadline_kind: Optional[str] = None,
     ) -> list[str]:
         terms: list[str] = []
 
@@ -547,18 +555,64 @@ class RetrievalOrchestrator:
             )
 
         if intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
+            # Важное правило: не загрязняем payment/notification запросы
+            # терминами decision по умолчанию. Иначе retrieval снова начинает
+            # тянуть "принятие решения" и front-matter вместо нужного этапа.
             terms.extend(
                 [
                     "срок",
-                    "срок принятия решения",
-                    "срок рассмотрения",
-                    "рассмотрения заявления",
-                    "принятия решения",
+                    "сроки",
                     "рабочих дней",
                     "календарных дней",
+                    "в течение",
+                    "не позднее",
                     "дней",
                 ]
             )
+
+            if question_deadline_kind == "decision":
+                terms.extend(
+                    [
+                        "срок принятия решения",
+                        "срок рассмотрения",
+                        "рассмотрения заявления",
+                        "принятия решения",
+                        "решение о предоставлении",
+                        "решение принимается",
+                    ]
+                )
+            elif question_deadline_kind == "notification":
+                terms.extend(
+                    [
+                        "срок уведомления",
+                        "уведомление",
+                        "уведомления о решении",
+                        "направляет уведомление",
+                        "направления уведомления",
+                        "уведомляет",
+                        "сообщение о решении",
+                    ]
+                )
+            elif question_deadline_kind == "payment":
+                terms.extend(
+                    [
+                        "срок выплаты",
+                        "выплата",
+                        "выплачивает",
+                        "ежемесячно",
+                        "не позднее 26-го числа",
+                        "26-го числа",
+                        "26 числа",
+                    ]
+                )
+            else:
+                terms.extend(
+                    [
+                        "срок предоставления",
+                        "срок предоставления государственной услуги",
+                        "максимальный срок",
+                    ]
+                )
 
         elif intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION:
             terms.extend(
@@ -867,6 +921,7 @@ class RetrievalOrchestrator:
         *,
         table_question_profile: Optional[str],
         submission_channel: Optional[str],
+        question_deadline_kind: Optional[str] = None,
     ) -> list[str]:
         """
         Hints for downstream retrieval / ranking / debug.
@@ -880,18 +935,46 @@ class RetrievalOrchestrator:
             ]
 
         if table_question_profile == "deadline":
-            return [
+            hints = [
                 "deadline_value",
                 "срок",
                 "сроки",
-                "срок предоставления",
-                "срок предоставления государственной услуги",
-                "срок принятия решения",
-                "срок рассмотрения",
-                "максимальный срок",
                 "рабочих дней",
                 "календарных дней",
             ]
+            if question_deadline_kind == "decision":
+                hints.extend(
+                    [
+                        "срок принятия решения",
+                        "срок рассмотрения",
+                        "решение о предоставлении",
+                    ]
+                )
+            elif question_deadline_kind == "notification":
+                hints.extend(
+                    [
+                        "срок уведомления",
+                        "уведомление",
+                        "направления уведомления",
+                    ]
+                )
+            elif question_deadline_kind == "payment":
+                hints.extend(
+                    [
+                        "срок выплаты",
+                        "выплата",
+                        "не позднее 26-го числа",
+                    ]
+                )
+            else:
+                hints.extend(
+                    [
+                        "срок предоставления",
+                        "срок предоставления государственной услуги",
+                        "максимальный срок",
+                    ]
+                )
+            return hints
 
         if table_question_profile == "documents_by_submission_channel":
             mapping = {
@@ -1941,6 +2024,16 @@ class RetrievalOrchestrator:
                 if is_deadline_question and self._is_deadline_noise_candidate(candidate):
                     continue
 
+                if is_deadline_question:
+                    has_temporal_markers = self._has_temporal_deadline_markers(candidate)
+                    is_deadline_table = self._has_table_semantic_type(candidate, "deadline") or self._has_table_semantic_type(candidate, "deadlines")
+                    if candidate.source_type == "block" and not has_temporal_markers:
+                        continue
+                    if candidate.source_type == "table_row" and not has_temporal_markers:
+                        continue
+                    if candidate.source_type == "table" and not is_deadline_table:
+                        continue
+
                 current_type_count = type_counts.get(candidate.source_type, 0)
                 if current_type_count >= type_caps.get(candidate.source_type, payload.final_top_k):
                     continue
@@ -1973,6 +2066,15 @@ class RetrievalOrchestrator:
                         continue
                     if is_deadline_question and self._is_deadline_noise_candidate(candidate):
                         continue
+                    if is_deadline_question:
+                        has_temporal_markers = self._has_temporal_deadline_markers(candidate)
+                        is_deadline_table = self._has_table_semantic_type(candidate, "deadline") or self._has_table_semantic_type(candidate, "deadlines")
+                        if candidate.source_type == "block" and not has_temporal_markers:
+                            continue
+                        if candidate.source_type == "table_row" and not has_temporal_markers:
+                            continue
+                        if candidate.source_type == "table" and not is_deadline_table:
+                            continue
                     selected.append(candidate)
                     selected_keys.add(candidate_key)
 
@@ -2406,6 +2508,15 @@ class RetrievalOrchestrator:
                         score += 0.22
                     else:
                         score += 0.12
+                else:
+                    # Для deadline path нет смысла держать block-и без явного
+                    # срока: builder потом всё равно их выкинет.
+                    if candidate.source_type == "block":
+                        score -= 0.90
+                    elif candidate.source_type == "table_row" and not has_deadline_value:
+                        score -= 0.60
+                    elif candidate.source_type == "table" and table_semantic_type not in {"deadline", "deadlines"}:
+                        score -= 0.60
 
                 if candidate.source_type == "table_row" and not has_deadline_value and table_semantic_type not in {"deadline", "deadlines"}:
                     score -= 0.70
@@ -2419,14 +2530,20 @@ class RetrievalOrchestrator:
                         score -= 0.10
 
                 if question_deadline_kind != "other" and candidate_kind == question_deadline_kind:
-                    score += 0.48
+                    score += 0.55
                 elif question_deadline_kind != "other" and candidate_kind != "other":
-                    score -= 0.22
+                    score -= 0.30
 
-                if question_deadline_kind == "notification" and "со дня принятия решения" in text_norm and "уведом" in text_norm:
-                    score += 0.12
-                if question_deadline_kind == "payment" and ("26-го числа" in text_norm or "26 числа" in text_norm):
-                    score += 0.18
+                if question_deadline_kind == "notification":
+                    if "уведом" in text_norm:
+                        score += 0.16
+                    if candidate_kind == "decision" and "уведом" not in text_norm:
+                        score -= 0.25
+                if question_deadline_kind == "payment":
+                    if "26-го числа" in text_norm or "26 числа" in text_norm or "ежемесячно" in text_norm:
+                        score += 0.24
+                    if candidate_kind == "decision" and not has_temporal_markers:
+                        score -= 0.30
                 if question_deadline_kind == "decision" and "решение о предоставлении" in text_norm:
                     score += 0.16
 
