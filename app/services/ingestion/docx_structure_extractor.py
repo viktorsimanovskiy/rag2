@@ -420,6 +420,11 @@ class DocxStructureExtractor:
         raw_rows = self._extract_raw_rows(table, header_keys)
         row_payloads: list[dict[str, Any]] = []
 
+        # Контекст текущего смыслового раздела таблицы.
+        # По умолчанию он неизвестен.
+        current_requirement_group = "unknown"
+        current_requirement_group_label: Optional[str] = None
+
         # Pre-build a light preview payload so we can infer semantic table type.
         preview_rows: list[dict[str, Any]] = []
         for idx, row_json in enumerate(raw_rows, start=1):
@@ -440,6 +445,15 @@ class DocxStructureExtractor:
                 row_json=row_json,
                 normalized_row_json=normalized_row_json,
             ):
+                # Сама service-строка не должна стать retrieval unit,
+                # но она может менять контекст для следующих обычных строк.
+                service_section = self._classify_service_section_row(
+                    row_json=row_json,
+                    normalized_row_json=normalized_row_json,
+                )
+                if service_section is not None:
+                    current_requirement_group = service_section["section_kind"]
+                    current_requirement_group_label = service_section["section_label"]
                 continue
 
             row_summary = self._build_row_summary(
@@ -455,6 +469,10 @@ class DocxStructureExtractor:
                     "row_json": row_json,
                     "normalized_row_json": normalized_row_json,
                     "row_summary": row_summary,
+                    "row_context": {
+                        "requirement_group": current_requirement_group,
+                        "requirement_group_label": current_requirement_group_label,
+                    },
                 }
             )
 
@@ -510,6 +528,17 @@ class DocxStructureExtractor:
                         "table_title": table_title,
                         "appendix_number": appendix_number,
                         "table_semantic_type": table_type,
+
+                        # Новые поля контекста строки.
+                        # Они не меняют схему БД, потому что уже живут внутри metadata_json.
+                        "row_kind": "data_row",
+                        "requirement_group": row.get("row_context", {}).get("requirement_group", "unknown"),
+                        "requirement_group_label": row.get("row_context", {}).get("requirement_group_label"),
+                        "table_section_context": {
+                            "requirement_group": row.get("row_context", {}).get("requirement_group", "unknown"),
+                            "requirement_group_label": row.get("row_context", {}).get("requirement_group_label"),
+                        },
+
                         "column_headers": headers,
                         "header_keys": header_keys,
                         "cells_text": [v for v in row_json.values() if self._clean_text(v)],
@@ -682,9 +711,69 @@ class DocxStructureExtractor:
         normalized_row_json: dict[str, Any],
     ) -> Optional[dict[str, str]]:
         """
-        Определяет, является ли service-строка разделителем смысловой группы
-        внутри таблицы документов, и если да — возвращает её тип и подпись.
+        Пытается понять, какую именно смысловую группу задаёт service-строка.
+
+        Важно:
+        - сама service-строка не должна становиться retrievable row;
+        - но её смысл должен быть протащен в metadata следующих data rows.
+
+        На первом этапе нам достаточно различать только две группы:
+        - required  -> документы / сведения, которые заявитель представляет сам
+        - optional  -> документы / сведения, которые заявитель вправе представить
+                       по собственной инициативе
+
+        Возвращает:
+        - None, если строка не похожа на полезный разделитель
+        - словарь с section_kind и section_label, если разделитель распознан
         """
+        values = [
+            self._clean_text(str(v))
+            for v in row_json.values()
+            if self._clean_text(str(v))
+        ]
+        if not values:
+            return None
+
+        joined = " ".join(values).lower()
+        compact = " ".join(joined.split())
+
+        # Нормализованная "человекочитаемая" подпись раздела,
+        # чтобы потом можно было положить её в metadata_json.
+        section_label = self._clean_text(" ".join(values))
+
+        required_markers = (
+            "документы, представляемые заявителем самостоятельно",
+            "документы, представляемые заявителем или представителем самостоятельно",
+            "документы и информация, которые заявитель должен представить самостоятельно",
+            "документы, которые заявитель должен представить самостоятельно",
+            "заявитель должен представить самостоятельно",
+            "представить самостоятельно",
+        )
+
+        optional_markers = (
+            "документы, которые заявитель вправе представить по собственной инициативе",
+            "документы и информация, которые заявитель вправе представить по собственной инициативе",
+            "документы, представляемые по собственной инициативе",
+            "представить по собственной инициативе",
+            "вправе представить по собственной инициативе",
+            "по собственной инициативе",
+        )
+
+        if any(marker in compact for marker in required_markers):
+            return {
+                "section_kind": "required",
+                "section_label": section_label,
+            }
+
+        if any(marker in compact for marker in optional_markers):
+            return {
+                "section_kind": "optional",
+                "section_label": section_label,
+            }
+
+        # Иногда service-строка есть, но она не про required/optional.
+        # На этом этапе её лучше не использовать как контекст.
+        return None
         
     def _build_cells_by_header(
         self,
