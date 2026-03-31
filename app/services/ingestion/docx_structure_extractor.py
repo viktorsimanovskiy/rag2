@@ -420,6 +420,11 @@ class DocxStructureExtractor:
         raw_rows = self._extract_raw_rows(table, header_keys)
         row_payloads: list[dict[str, Any]] = []
 
+        # Контекст текущего смыслового раздела таблицы.
+        # По умолчанию он неизвестен.
+        current_requirement_group = "unknown"
+        current_requirement_group_label: Optional[str] = None
+
         # Pre-build a light preview payload so we can infer semantic table type.
         preview_rows: list[dict[str, Any]] = []
         for idx, row_json in enumerate(raw_rows, start=1):
@@ -440,6 +445,15 @@ class DocxStructureExtractor:
                 row_json=row_json,
                 normalized_row_json=normalized_row_json,
             ):
+                # Сама service-строка не должна стать retrieval unit,
+                # но она может менять контекст для следующих обычных строк.
+                service_section = self._classify_service_section_row(
+                    row_json=row_json,
+                    normalized_row_json=normalized_row_json,
+                )
+                if service_section is not None:
+                    current_requirement_group = service_section["section_kind"]
+                    current_requirement_group_label = service_section["section_label"]
                 continue
 
             row_summary = self._build_row_summary(
@@ -455,6 +469,10 @@ class DocxStructureExtractor:
                     "row_json": row_json,
                     "normalized_row_json": normalized_row_json,
                     "row_summary": row_summary,
+                    "row_context": {
+                        "requirement_group": current_requirement_group,
+                        "requirement_group_label": current_requirement_group_label,
+                    },
                 }
             )
 
@@ -510,6 +528,17 @@ class DocxStructureExtractor:
                         "table_title": table_title,
                         "appendix_number": appendix_number,
                         "table_semantic_type": table_type,
+
+                        # Новые поля контекста строки.
+                        # Они не меняют схему БД, потому что уже живут внутри metadata_json.
+                        "row_kind": "data_row",
+                        "requirement_group": row.get("row_context", {}).get("requirement_group", "unknown"),
+                        "requirement_group_label": row.get("row_context", {}).get("requirement_group_label"),
+                        "table_section_context": {
+                            "requirement_group": row.get("row_context", {}).get("requirement_group", "unknown"),
+                            "requirement_group_label": row.get("row_context", {}).get("requirement_group_label"),
+                        },
+
                         "column_headers": headers,
                         "header_keys": header_keys,
                         "cells_text": [v for v in row_json.values() if self._clean_text(v)],
@@ -674,6 +703,104 @@ class DocxStructureExtractor:
                 return True
 
         return False
+
+    def _classify_service_section_row(
+        self,
+        *,
+        row_json: dict[str, Any],
+        normalized_row_json: dict[str, Any],
+    ) -> Optional[dict[str, str]]:
+        """
+        Пытается определить, какую именно смысловую группу открывает
+        service-строка внутри таблицы.
+
+        На текущем этапе нам нужны две основные группы:
+        - required: документы / сведения, которые заявитель или представитель
+          должен представить самостоятельно;
+        - optional: документы / сведения, которые заявитель или представитель
+          вправе представить по собственной инициативе.
+
+        Важно:
+        - сама service-строка не становится retrievable row;
+        - но её смысл должен быть перенесён в metadata следующих обычных строк.
+        """
+        raw_values = [
+            self._clean_text(str(v))
+            for v in row_json.values()
+            if self._clean_text(str(v))
+        ]
+        if not raw_values:
+            return None
+
+        # Убираем дубли одинаковых фрагментов, которые часто появляются
+        # из-за merged cells / повторяющихся ячеек таблицы.
+        unique_values: list[str] = []
+        seen: set[str] = set()
+        for value in raw_values:
+            normalized_value = " ".join(value.lower().split())
+            if normalized_value in seen:
+                continue
+            seen.add(normalized_value)
+            unique_values.append(value)
+
+        if not unique_values:
+            return None
+
+        section_label = self._clean_text(" ".join(unique_values))
+
+        compact = section_label.lower()
+        compact = compact.replace("ё", "е")
+        compact = compact.replace("(", " ").replace(")", " ")
+        compact = compact.replace(":", " ").replace(";", " ")
+        compact = " ".join(compact.split())
+
+        # Сначала ловим optional, потому что это самый явный маркер
+        # и он не должен случайно пересечься с "самостоятельно".
+        optional_markers = (
+            "по собственной инициативе",
+            "вправе представить по собственной инициативе",
+            "вправе представить самостоятельно по собственной инициативе",
+            "документы, представляемые по собственной инициативе",
+            "документы и информация, которые заявитель вправе представить по собственной инициативе",
+            "документы и информация, которые заявитель или представитель вправе представить по собственной инициативе",
+        )
+        if any(marker in compact for marker in optional_markers):
+            return {
+                "section_kind": "optional",
+                "section_label": section_label,
+            }
+
+        # Для required делаем более широкое распознавание.
+        required_markers = (
+            "должен представить самостоятельно",
+            "должны представить самостоятельно",
+            "заявитель должен представить самостоятельно",
+            "заявитель или представитель должен представить самостоятельно",
+            "заявителем самостоятельно",
+            "заявителем или представителем самостоятельно",
+            "представляемые заявителем самостоятельно",
+            "представляемые заявителем или представителем самостоятельно",
+            "документы, представляемые заявителем самостоятельно",
+            "документы, представляемые заявителем или представителем самостоятельно",
+            "документы и информация, которые заявитель должен представить самостоятельно",
+            "документы и информация, которые заявитель или представитель должен представить самостоятельно",
+        )
+        if any(marker in compact for marker in required_markers):
+            return {
+                "section_kind": "required",
+                "section_label": section_label,
+            }
+
+        # Дополнительный fallback:
+        # если это service-строка про "самостоятельно" и при этом в ней нет
+        # маркеров "по собственной инициативе", то почти наверняка это required.
+        if "самостоятельно" in compact and "по собственной инициативе" not in compact:
+            return {
+                "section_kind": "required",
+                "section_label": section_label,
+            }
+
+        return None
         
     def _build_cells_by_header(
         self,

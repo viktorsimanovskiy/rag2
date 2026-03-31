@@ -8,9 +8,22 @@ from typing import Any, Optional
 class DocumentsAnswerItem:
     document_name: str
     role: str
+    applicability: str
+    document_family: str
     submission_note: Optional[str] = None
-    source_row_id: Optional[str] = None
-    applicant_category_id: Optional[str] = None
+    source_row_ids: list[str] = field(default_factory=list)
+    applicant_category_ids: list[str] = field(default_factory=list)
+    
+    row_order: Optional[int] = None
+    table_number: Optional[str] = None
+    requirement_group: str = "unknown"
+    requirement_group_label: Optional[str] = None
+
+    requested_channel_key: Optional[str] = None
+    requested_channel_label: Optional[str] = None
+    requested_channel_value: Optional[str] = None
+
+    is_exact_row: bool = False
 
 
 @dataclass(slots=True)
@@ -21,7 +34,9 @@ class DocumentsAnswerBuildResult:
     representative_items: list[DocumentsAnswerItem] = field(default_factory=list)
     category_specific_items: list[DocumentsAnswerItem] = field(default_factory=list)
     dropped_rows_debug: list[dict[str, Any]] = field(default_factory=list)
+    merged_items_debug: list[dict[str, Any]] = field(default_factory=list)
     reason: Optional[str] = None
+    full_list_mode: bool = False
 
     @property
     def all_items(self) -> list[DocumentsAnswerItem]:
@@ -40,12 +55,26 @@ class DocumentsAnswerBuildResult:
             "representative_items_count": len(self.representative_items),
             "category_specific_items_count": len(self.category_specific_items),
             "input_row_ids": [
-                item.source_row_id
+                row_id
                 for item in self.all_items
-                if item.source_row_id
+                for row_id in item.source_row_ids
             ],
+            "items": [
+                {
+                    "document_name": item.document_name,
+                    "role": item.role,
+                    "applicability": item.applicability,
+                    "document_family": item.document_family,
+                    "submission_note": item.submission_note,
+                    "source_row_ids": item.source_row_ids,
+                    "applicant_category_ids": item.applicant_category_ids,
+                }
+                for item in self.all_items
+            ],
+            "merged_items": self.merged_items_debug,
             "dropped_rows": self.dropped_rows_debug,
             "reason": self.reason,
+            "full_list_mode": self.full_list_mode,
         }
 
 
@@ -56,8 +85,8 @@ class TableDocumentsAnswerBuilder:
     Principles:
     - works only with retrieval-selected candidates
     - does not query DB directly
-    - classifies rows into answer roles
-    - keeps channel-specific submission notes outside retrieval logic
+    - separates document role from applicability
+    - merges semantically close rows by generic document families
     """
 
     def build(
@@ -65,14 +94,10 @@ class TableDocumentsAnswerBuilder:
         *,
         candidates: list[Any],
         submission_channel: Optional[str],
+        full_list_mode: bool = False,
     ) -> DocumentsAnswerBuildResult:
-        base_items: list[DocumentsAnswerItem] = []
-        conditional_items: list[DocumentsAnswerItem] = []
-        representative_items: list[DocumentsAnswerItem] = []
-        category_specific_items: list[DocumentsAnswerItem] = []
+        raw_items: list[DocumentsAnswerItem] = []
         dropped_rows_debug: list[dict[str, Any]] = []
-
-        seen_by_key: dict[str, DocumentsAnswerItem] = {}
 
         for candidate in candidates:
             if getattr(candidate, "source_type", None) != "table_row":
@@ -97,6 +122,27 @@ class TableDocumentsAnswerBuilder:
                         "reason": "cells_not_dict",
                     }
                 )
+                continue
+                
+            row_order = getattr(candidate, "row_order", None)
+
+            if full_list_mode:
+                exact_item = self._build_exact_row_item(
+                    row_id=row_id,
+                    row_order=row_order,
+                    metadata=metadata,
+                    cells=cells,
+                    submission_channel=submission_channel,
+                )
+                if exact_item is None:
+                    dropped_rows_debug.append(
+                        {
+                            "row_id": row_id,
+                            "reason": "not_exact_documents_row",
+                        }
+                    )
+                    continue
+                raw_items.append(exact_item)
                 continue
 
             document_name = self._clean(cells.get("document_name"))
@@ -124,47 +170,70 @@ class TableDocumentsAnswerBuilder:
                 cells=cells,
                 submission_channel=submission_channel,
             )
-
-            role = self._classify_item_role(
+            document_family = self._infer_document_family(document_name)
+            role = self._classify_document_role(
                 document_name=document_name,
-                cells=cells,
+                document_family=document_family,
+            )
+            applicability = self._infer_applicability(
+                document_name=document_name,
                 applicant_category_id=applicant_category_id,
+                document_family=document_family,
             )
 
-            canonical_key = self._canonical_document_key(document_name)
-
-            if canonical_key in seen_by_key:
-                existing = seen_by_key[canonical_key]
-                if not existing.submission_note and submission_note:
-                    existing.submission_note = submission_note
-                if not existing.applicant_category_id and applicant_category_id:
-                    existing.applicant_category_id = applicant_category_id
-                continue
-
-            item = DocumentsAnswerItem(
-                document_name=document_name,
-                role=role,
-                submission_note=submission_note,
-                source_row_id=row_id or None,
-                applicant_category_id=applicant_category_id,
+            raw_items.append(
+                DocumentsAnswerItem(
+                    document_name=document_name,
+                    role=role,
+                    applicability=applicability,
+                    document_family=document_family,
+                    submission_note=submission_note,
+                    source_row_ids=[row_id] if row_id else [],
+                    applicant_category_ids=[applicant_category_id] if applicant_category_id else [],
+                )
             )
-            seen_by_key[canonical_key] = item
 
-            if role == "base_required":
-                base_items.append(item)
-            elif role == "representative_only":
-                representative_items.append(item)
-            elif role == "category_specific":
-                category_specific_items.append(item)
-            else:
-                conditional_items.append(item)
-
-        if not (base_items or conditional_items or representative_items or category_specific_items):
+        if not raw_items:
             return DocumentsAnswerBuildResult(
                 can_answer=False,
                 reason="no_documents_rows",
                 dropped_rows_debug=dropped_rows_debug,
+                full_list_mode=full_list_mode,
             )
+
+        if full_list_mode:
+            merged_items = sorted(
+                raw_items,
+                key=lambda item: (
+                    0 if item.requirement_group == "required"
+                    else 1 if item.requirement_group == "optional"
+                    else 2,
+                    item.row_order or 10**9,
+                    item.document_name.lower(),
+                ),
+            )
+            merged_items_debug = []
+        else:
+            merged_items, merged_items_debug = self._merge_similar_items(raw_items)
+
+        base_items: list[DocumentsAnswerItem] = []
+        conditional_items: list[DocumentsAnswerItem] = []
+        representative_items: list[DocumentsAnswerItem] = []
+        category_specific_items: list[DocumentsAnswerItem] = []
+
+        for item in merged_items:
+            if item.role == "representative_only":
+                representative_items.append(item)
+                continue
+
+            if item.applicability == "category_specific":
+                category_specific_items.append(item)
+                continue
+
+            if item.applicability == "always":
+                base_items.append(item)
+            else:
+                conditional_items.append(item)
 
         return DocumentsAnswerBuildResult(
             can_answer=True,
@@ -173,7 +242,9 @@ class TableDocumentsAnswerBuilder:
             representative_items=representative_items,
             category_specific_items=category_specific_items,
             dropped_rows_debug=dropped_rows_debug,
+            merged_items_debug=merged_items_debug,
             reason=None,
+            full_list_mode=full_list_mode,
         )
 
     def render_text(
@@ -184,6 +255,12 @@ class TableDocumentsAnswerBuilder:
     ) -> Optional[str]:
         if not result.can_answer:
             return None
+            
+        if result.full_list_mode:
+            return self._render_full_list_text(
+                result=result,
+                submission_channel=submission_channel,
+            )
 
         has_channel = bool(submission_channel)
         channel_label = self._channel_label(submission_channel) if submission_channel else None
@@ -221,9 +298,398 @@ class TableDocumentsAnswerBuilder:
                 lines.append(self._render_bulleted_item(item, has_channel=has_channel))
 
         lines.append("")
-        lines.append("Итоговый перечень зависит от конкретной жизненной ситуации заявителя и оснований обращения.")
+        lines.append("Итоговый перечень зависит от конкретной жизненной ситуации, основания обращения и категории заявителя.")
 
         return "\n".join(lines)
+        
+    def _normalize_display_name(
+        self,
+        *,
+        document_name: str,
+        document_family: str,
+    ) -> str:
+        text = self._clean(document_name) or ""
+
+        # Универсальная нормализация identity-документов
+        if document_family == "identity_document":
+            return "Паспорт или иной документ, удостоверяющий личность"
+
+        # Убираем служебные хвосты в скобках (представителя и т.п.)
+        if "(" in text and ")" in text:
+            # аккуратно убираем только последние скобки
+            base = text.split("(")[0].strip()
+            if base:
+                return base
+
+        return text
+        
+    def _resolve_requested_channel_key(
+        self,
+        submission_channel: Optional[str],
+    ) -> Optional[str]:
+        mapping = {
+            "epgu": "epgu_submission",
+            "regional_portal": "regional_portal_submission",
+            "in_person": "in_person_submission",
+            "post": "post_submission",
+            "mfc": "mfc_submission",
+        }
+        return mapping.get(submission_channel or "")
+        
+    def _build_exact_row_item(
+        self,
+        *,
+        row_id: str,
+        row_order: Optional[int],
+        metadata: dict[str, Any],
+        cells: dict[str, Any],
+        submission_channel: Optional[str],
+    ) -> Optional[DocumentsAnswerItem]:
+        document_name = self._clean(cells.get("document_name"))
+        if not document_name:
+            return None
+        if self._is_service_value(document_name):
+            return None
+
+        applicant_category_id = self._clean(cells.get("applicant_category_id"))
+        document_family = self._infer_document_family(document_name)
+        role = self._classify_document_role(
+            document_name=document_name,
+            document_family=document_family,
+        )
+        applicability = self._infer_applicability(
+            document_name=document_name,
+            applicant_category_id=applicant_category_id,
+            document_family=document_family,
+        )
+
+        requested_channel_key = self._resolve_requested_channel_key(submission_channel)
+        requested_channel_value = self._extract_submission_note(
+            cells=cells,
+            submission_channel=submission_channel,
+        )
+        requested_channel_label = (
+            self._channel_label(submission_channel) if submission_channel else None
+        )
+
+        return DocumentsAnswerItem(
+            document_name=document_name,
+            role=role,
+            applicability=applicability,
+            document_family=document_family,
+            submission_note=requested_channel_value,
+            source_row_ids=[row_id] if row_id else [],
+            applicant_category_ids=[applicant_category_id] if applicant_category_id else [],
+            row_order=row_order,
+            table_number=self._clean(metadata.get("table_number")),
+            requirement_group=self._clean(metadata.get("requirement_group")) or "unknown",
+            requirement_group_label=self._clean(metadata.get("requirement_group_label")),
+            requested_channel_key=requested_channel_key,
+            requested_channel_label=requested_channel_label,
+            requested_channel_value=requested_channel_value,
+            is_exact_row=True,
+        )
+        
+    def _render_full_list_text(
+        self,
+        *,
+        result: DocumentsAnswerBuildResult,
+        submission_channel: Optional[str],
+    ) -> str:
+        items = result.all_items
+        channel_label = self._channel_label(submission_channel) if submission_channel else None
+
+        required_items = [item for item in items if item.requirement_group == "required"]
+        optional_items = [item for item in items if item.requirement_group == "optional"]
+        other_items = [item for item in items if item.requirement_group not in {"required", "optional"}]
+
+        lines: list[str] = []
+        if channel_label:
+            lines.append(
+                f"Ниже приведён полный перечень документов. "
+                f"Для каждой позиции указано требование при подаче {channel_label}."
+            )
+        else:
+            lines.append("Ниже приведён полный перечень документов по строкам таблицы.")
+
+        def append_group(title: str, group_items: list[DocumentsAnswerItem]) -> None:
+            if not group_items:
+                return
+            lines.append("")
+            lines.append(title)
+            for idx, item in enumerate(group_items, start=1):
+                text = f"{idx}. {item.document_name}"
+                if channel_label:
+                    channel_value = item.requested_channel_value or "в таблице не указано отдельно"
+                    text += f" — {channel_label}: {channel_value}"
+                lines.append(text)
+
+        append_group("Обязательные документы:", required_items)
+        append_group("Документы, которые можно представить по собственной инициативе:", optional_items)
+
+        if other_items:
+            append_group("Прочие связанные позиции:", other_items)
+
+        total = len(required_items) + len(optional_items)
+        if total:
+            lines.append("")
+            lines.append(
+                f"Итого по основному перечню: {total} позиций "
+                f"({len(required_items)} обязательных и {len(optional_items)} по собственной инициативе)."
+            )
+
+        return "\n".join(lines).strip()
+
+    def _merge_similar_items(
+        self,
+        items: list[DocumentsAnswerItem],
+    ) -> tuple[list[DocumentsAnswerItem], list[dict[str, Any]]]:
+        groups: dict[tuple[str, str, str], list[DocumentsAnswerItem]] = {}
+
+        for item in items:
+            key = (item.document_family, item.role, item.applicability)
+            groups.setdefault(key, []).append(item)
+
+        merged_items: list[DocumentsAnswerItem] = []
+        merged_items_debug: list[dict[str, Any]] = []
+
+        for (document_family, role, applicability), group_items in groups.items():
+            merged_name = self._choose_merged_display_name(
+                document_family=document_family,
+                group_items=group_items,
+            )
+            merged_name = self._normalize_display_name(
+                document_name=merged_name,
+                document_family=document_family,
+            )
+            merged_submission_note = self._merge_submission_notes(group_items)
+
+            row_ids: list[str] = []
+            category_ids: list[str] = []
+            for item in group_items:
+                for row_id in item.source_row_ids:
+                    if row_id and row_id not in row_ids:
+                        row_ids.append(row_id)
+                for category_id in item.applicant_category_ids:
+                    if category_id and category_id not in category_ids:
+                        category_ids.append(category_id)
+
+            merged_items.append(
+                DocumentsAnswerItem(
+                    document_name=merged_name,
+                    role=role,
+                    applicability=applicability,
+                    document_family=document_family,
+                    submission_note=merged_submission_note,
+                    source_row_ids=row_ids,
+                    applicant_category_ids=category_ids,
+                )
+            )
+
+            if len(group_items) > 1:
+                merged_items_debug.append(
+                    {
+                        "document_family": document_family,
+                        "role": role,
+                        "applicability": applicability,
+                        "source_document_names": [item.document_name for item in group_items],
+                        "merged_document_name": merged_name,
+                        "source_row_ids": row_ids,
+                    }
+                )
+
+        merged_items.sort(
+            key=lambda item: (
+                self._role_order(item.role),
+                self._applicability_order(item.applicability),
+                item.document_name.lower(),
+            )
+        )
+
+        return merged_items, merged_items_debug
+
+    def _choose_merged_display_name(
+        self,
+        *,
+        document_family: str,
+        group_items: list[DocumentsAnswerItem],
+    ) -> str:
+        if document_family == "application_request":
+            has_multiple_variants = len(group_items) > 1
+            if has_multiple_variants:
+                return "Заявление (в зависимости от основания обращения)"
+            return group_items[0].document_name
+
+        priority_names = sorted(
+            (item.document_name for item in group_items),
+            key=lambda value: (len(value), value.lower()),
+        )
+        return priority_names[0]
+
+    def _merge_submission_notes(
+        self,
+        items: list[DocumentsAnswerItem],
+    ) -> Optional[str]:
+        notes: list[str] = []
+        for item in items:
+            note = self._clean(item.submission_note)
+            if note and note not in notes:
+                notes.append(note)
+
+        if not notes:
+            return None
+        if len(notes) == 1:
+            return notes[0]
+        return "; ".join(notes)
+
+    def _classify_document_role(
+        self,
+        *,
+        document_name: str,
+        document_family: str,
+    ) -> str:
+        text = self._normalize(document_name)
+
+        # Сначала решаем по семейству документа, а не по случайным словам в тексте.
+        if document_family == "authority_document":
+            return "representative_only"
+
+        if document_family in {
+            "identity_document",
+            "application_request",
+            "residency_proof",
+            "status_certificate",
+            "court_decision",
+            "employment_proof",
+            "other",
+        }:
+            return "general_document"
+
+        # Страховка на случай, если family не распознался, но текст явно про представителя.
+        if any(marker in text for marker in [
+            "полномоч",
+            "доверенн",
+            "представител",
+        ]):
+            return "representative_only"
+
+        return "general_document"
+
+    def _infer_applicability(
+        self,
+        *,
+        document_name: str,
+        applicant_category_id: Optional[str],
+        document_family: str,
+    ) -> str:
+        text = self._normalize(document_name)
+
+        # Явные условные маркеры всегда сильнее всего остального.
+        if any(marker in text for marker in [
+            "в случае",
+            "при отсутствии",
+            "при наличии",
+            "при обращении",
+            "подтверждающ",
+            "решение суда",
+            "регистрац",
+            "проживани",
+            "смен",
+            "перемен",
+            "смерт",
+            "усынов",
+            "опек",
+            "попеч",
+            "брак",
+            "развод",
+            "рождени",
+        ]):
+            return "conditional"
+
+        # Базовые семейства не должны автоматически улетать в category_specific
+        # только из-за applicant_category_id.
+        if document_family in {
+            "identity_document",
+            "application_request",
+        }:
+            return "always"
+
+        if applicant_category_id:
+            return "category_specific"
+
+        return "always"
+
+    def _infer_document_family(self, document_name: str) -> str:
+        text = self._normalize(document_name)
+
+        if any(marker in text for marker in [
+            "заявление",
+            "запрос",
+            "ходатайств",
+        ]):
+            return "application_request"
+
+        if any(marker in text for marker in [
+            "паспорт",
+            "удостоверяющ личность",
+            "иной документ удостоверяющий личность",
+        ]):
+            return "identity_document"
+
+        if any(marker in text for marker in [
+            "полномоч",
+            "доверенн",
+            "представител",
+        ]):
+            return "authority_document"
+
+        if any(marker in text for marker in [
+            "регистрац",
+            "проживани",
+            "место жительства",
+            "место пребывания",
+        ]):
+            return "residency_proof"
+
+        if any(marker in text for marker in [
+            "решение суда",
+        ]):
+            return "court_decision"
+
+        if any(marker in text for marker in [
+            "справк",
+            "удостоверени",
+            "свидетельств",
+            "подтверждающ статус",
+            "категори",
+        ]):
+            return "status_certificate"
+
+        if any(marker in text for marker in [
+            "трудов",
+            "работ",
+            "служб",
+            "занятост",
+            "доход",
+        ]):
+            return "employment_proof"
+
+        return "other"
+
+    def _role_order(self, role: str) -> int:
+        order = {
+            "general_document": 0,
+            "representative_only": 1,
+        }
+        return order.get(role, 99)
+
+    def _applicability_order(self, applicability: str) -> int:
+        order = {
+            "always": 0,
+            "conditional": 1,
+            "category_specific": 2,
+        }
+        return order.get(applicability, 99)
 
     def _render_numbered_item(
         self,
@@ -245,56 +711,6 @@ class TableDocumentsAnswerBuilder:
         if has_channel and item.submission_note:
             return f"— {item.document_name} — {item.submission_note}"
         return f"— {item.document_name}"
-
-    def _classify_item_role(
-        self,
-        *,
-        document_name: str,
-        cells: dict[str, Any],
-        applicant_category_id: Optional[str],
-    ) -> str:
-        text = self._normalize(document_name)
-
-        if any(marker in text for marker in [
-            "представител",
-            "доверенн",
-            "полномоч",
-            "удостоверяющ полномоч",
-        ]):
-            return "representative_only"
-
-        if applicant_category_id:
-            return "category_specific"
-
-        if any(marker in text for marker in [
-            "в случае",
-            "при отсутствии",
-            "подтверждающ",
-            "решение суда",
-            "регистрац",
-            "проживани",
-            "перемен",
-            "смен",
-            "смерт",
-            "усынов",
-            "опек",
-            "попеч",
-            "брак",
-            "развод",
-            "рождени",
-        ]):
-            return "conditional_required"
-
-        if any(marker in text for marker in [
-            "заявление",
-            "паспорт",
-            "документ, удостоверяющий личность",
-            "иной документ, удостоверяющий личность",
-        ]):
-            return "base_required"
-
-        # По умолчанию документ лучше считать условным, чем базовым.
-        return "conditional_required"
 
     def _extract_submission_note(
         self,
@@ -318,23 +734,15 @@ class TableDocumentsAnswerBuilder:
 
     def _is_service_value(self, value: str) -> bool:
         text = self._normalize(value)
-        markers = [
+        service_values = {
+            "наименование документа",
+            "наименование документов",
+            "документы",
             "документы информация необходимые",
             "исчерпывающий перечень документов",
             "способ подачи в уполномоченное учреждение",
-            "наименование документа",
-            "наименование документов",
-        ]
-        return any(marker in text for marker in markers)
-
-    def _canonical_document_key(self, value: str) -> str:
-        text = self._normalize(value)
-        replacements = {
-            "документ удостоверяющий личность": "удостоверение личности",
-            "иной документ удостоверяющий личность": "удостоверение личности",
-            "документ удостоверяющий личность заявителя": "удостоверение личности",
         }
-        return replacements.get(text, text)
+        return text in service_values
 
     def _channel_label(self, submission_channel: Optional[str]) -> str:
         mapping = {

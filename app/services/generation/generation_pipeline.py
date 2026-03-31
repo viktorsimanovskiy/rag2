@@ -41,6 +41,10 @@ from app.db.models.enums import AnswerModeEnum, QuestionIntentEnum, ValidationSt
 from app.services.feedback.feedback_service import EvidenceItemInput
 from app.services.retrieval.retrieval_orchestrator import EvidencePackage, RetrievedCandidate
 from app.services.generation.table_documents_answer_builder import TableDocumentsAnswerBuilder
+from app.services.generation.table_deadlines_answer_builder import TableDeadlinesAnswerBuilder
+from app.services.generation.table_rejection_reasons_answer_builder import (
+    TableRejectionReasonsAnswerBuilder,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +205,8 @@ class GenerationPipeline:
         self.deterministic_validator = deterministic_validator
         self.semantic_validator = semantic_validator
         self.table_documents_answer_builder = TableDocumentsAnswerBuilder()
+        self.table_deadlines_answer_builder = TableDeadlinesAnswerBuilder()
+        self.table_rejection_reasons_answer_builder = TableRejectionReasonsAnswerBuilder()
 
     # --------------------------------------------------------
     # Public API
@@ -268,12 +274,24 @@ class GenerationPipeline:
             evidence_package=evidence_package,
         )
 
+        deadlines_answer_payload = self._prepare_deadlines_table_answer(
+            payload=payload,
+            evidence_package=evidence_package,
+        )
+        
+        rejection_answer_payload = self._prepare_rejection_table_answer(
+            payload=payload,
+            evidence_package=evidence_package,
+        )
+
         answer_text = self._compose_answer_text(
             payload=payload,
             plan=plan,
             evidence_package=evidence_package,
             hydrated_objects=hydrated_objects,
             documents_answer_payload=documents_answer_payload,
+            deadlines_answer_payload=deadlines_answer_payload,
+            rejection_answer_payload=rejection_answer_payload,
         )
 
         answer_text_short = self._build_short_answer(
@@ -352,6 +370,8 @@ class GenerationPipeline:
                 "evidence_quality": evidence_quality or None,
                 "guard_reason": guard_reason or None,
                 "documents_builder_debug": documents_answer_payload.get("debug"),
+                "deadlines_builder_debug": deadlines_answer_payload.get("debug"),
+                "rejection_builder_debug": rejection_answer_payload.get("debug"),
             },
             reuse_decision_payload_json={
                 "reuse_allowed": reuse_allowed,
@@ -382,6 +402,48 @@ class GenerationPipeline:
             if isinstance(submission_channel, str) and submission_channel.strip():
                 return submission_channel.strip().lower()
 
+        # Новый fallback: пытаемся понять канал прямо из текста вопроса.
+        question_text = payload.question_text_normalized or payload.question_text_raw
+        inferred_channel = self._infer_submission_channel_from_question(question_text)
+        if inferred_channel:
+            return inferred_channel
+
+        return None
+
+    def _wants_full_documents_list(self, question_text: str) -> bool:
+        normalized = " ".join(str(question_text or "").lower().split())
+        markers = (
+            "полный перечень",
+            "исчерпывающий перечень",
+            "весь перечень",
+            "все документы",
+            "полный список",
+            "по строкам таблицы",
+        )
+        return any(marker in normalized for marker in markers)
+
+    def _infer_submission_channel_from_question(
+        self,
+        question_text: str,
+    ) -> Optional[str]:
+        normalized = " ".join(str(question_text or "").lower().split())
+        normalized = normalized.replace("ё", "е")
+
+        if "епгу" in normalized or "единый портал" in normalized:
+            return "epgu"
+
+        if "краевой портал" in normalized or "региональный портал" in normalized:
+            return "regional_portal"
+
+        if "лично" in normalized or "личный прием" in normalized or "на личном приеме" in normalized:
+            return "in_person"
+
+        if "почт" in normalized:
+            return "post"
+
+        if "мфц" in normalized:
+            return "mfc"
+
         return None
 
     def _prepare_documents_table_answer(
@@ -407,6 +469,9 @@ class GenerationPipeline:
             result = self.table_documents_answer_builder.build(
                 candidates=evidence_package.selected_candidates or [],
                 submission_channel=submission_channel,
+                full_list_mode=self._wants_full_documents_list(
+                    payload.question_text_normalized or payload.question_text_raw
+                ),
             )
 
             answer_text = None
@@ -425,6 +490,74 @@ class GenerationPipeline:
                 "answer_text": answer_text,
                 "debug": debug_payload,
             }
+
+    def _prepare_deadlines_table_answer(
+        self,
+        *,
+        payload: GenerationRequest,
+        evidence_package: EvidencePackage,
+    ) -> dict[str, Any]:
+        if payload.intent_type != QuestionIntentEnum.DEADLINE_QUESTION:
+            return {
+                "answer_text": None,
+                "debug": {
+                    "skipped": True,
+                    "reason": "not_deadline_question",
+                },
+            }
+
+        result = self.table_deadlines_answer_builder.build(
+            candidates=evidence_package.selected_candidates or [],
+            question_text=payload.question_text_normalized or payload.question_text_raw,
+        )
+
+        answer_text = None
+        if result.can_answer:
+            answer_text = self.table_deadlines_answer_builder.render_text(
+                result=result,
+            )
+
+        debug_payload = result.debug_payload()
+        debug_payload["can_answer"] = result.can_answer
+
+        return {
+            "answer_text": answer_text,
+            "debug": debug_payload,
+        }
+        
+    def _prepare_rejection_table_answer(
+        self,
+        *,
+        payload: GenerationRequest,
+        evidence_package: EvidencePackage,
+    ) -> dict[str, Any]:
+        if payload.intent_type != QuestionIntentEnum.REJECTION_QUESTION:
+            return {
+                "answer_text": None,
+                "debug": {
+                    "skipped": True,
+                    "reason": "not_rejection_question",
+                },
+            }
+
+        result = self.table_rejection_reasons_answer_builder.build(
+            candidates=evidence_package.selected_candidates or [],
+            question_text=payload.question_text_normalized or payload.question_text_raw,
+        )
+
+        answer_text = None
+        if result.can_answer:
+            answer_text = self.table_rejection_reasons_answer_builder.render_text(
+                result=result,
+            )
+
+        debug_payload = result.debug_payload()
+        debug_payload["can_answer"] = result.can_answer
+
+        return {
+            "answer_text": answer_text,
+            "debug": debug_payload,
+        }
 
     # --------------------------------------------------------
     # Evidence hydration
@@ -687,39 +820,59 @@ class GenerationPipeline:
     # --------------------------------------------------------
 
     def _compose_answer_text(
-            self,
-            *,
-            payload: GenerationRequest,
-            plan: AnswerPlan,
-            evidence_package: EvidencePackage,
-            hydrated_objects: dict[str, dict[UUID, Any]],
-            documents_answer_payload: Optional[dict[str, Any]] = None,
-        ) -> str:
-            # Для documents-question сначала всегда пробуем deterministic path.
-            if payload.intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION:
-                deterministic_text = None
-                if isinstance(documents_answer_payload, dict):
-                    deterministic_text = documents_answer_payload.get("answer_text")
+        self,
+        *,
+        payload: GenerationRequest,
+        plan: AnswerPlan,
+        evidence_package: EvidencePackage,
+        hydrated_objects: dict[str, dict[UUID, Any]],
+        documents_answer_payload: Optional[dict[str, Any]] = None,
+        deadlines_answer_payload: Optional[dict[str, Any]] = None,
+        rejection_answer_payload: Optional[dict[str, Any]] = None,
+    ) -> str:
+        # Для documents-question сначала всегда пробуем deterministic path.
+        if payload.intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION:
+            deterministic_text = None
+            if isinstance(documents_answer_payload, dict):
+                deterministic_text = documents_answer_payload.get("answer_text")
 
-                if deterministic_text:
-                    return deterministic_text
+            if deterministic_text:
+                return deterministic_text
 
-            if plan.answer_mode == AnswerModeEnum.SAFE_NO_ANSWER:
-                return self._compose_safe_no_answer_text(
-                    payload=payload,
-                    plan=plan,
-                )
+        # Для deadline-question сначала всегда пробуем deterministic path.
+        if payload.intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
+            deterministic_text = None
+            if isinstance(deadlines_answer_payload, dict):
+                deterministic_text = deadlines_answer_payload.get("answer_text")
 
-            if plan.answer_mode == AnswerModeEnum.DIRECT_STRUCTURED:
-                return self._compose_direct_structured_answer(
-                    payload=payload,
-                    plan=plan,
-                )
+            if deterministic_text:
+                return deterministic_text
+                
+        # Для rejection-question сначала всегда пробуем deterministic path.
+        if payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION:
+            deterministic_text = None
+            if isinstance(rejection_answer_payload, dict):
+                deterministic_text = rejection_answer_payload.get("answer_text")
 
-            return self._compose_grounded_narrative_answer(
+            if deterministic_text:
+                return deterministic_text                
+
+        if plan.answer_mode == AnswerModeEnum.SAFE_NO_ANSWER:
+            return self._compose_safe_no_answer_text(
                 payload=payload,
                 plan=plan,
             )
+
+        if plan.answer_mode == AnswerModeEnum.DIRECT_STRUCTURED:
+            return self._compose_direct_structured_answer(
+                payload=payload,
+                plan=plan,
+            )
+
+        return self._compose_grounded_narrative_answer(
+            payload=payload,
+            plan=plan,
+        )
 
     def _compose_direct_structured_answer(
         self,
@@ -812,6 +965,109 @@ class GenerationPipeline:
         }:
             return "Для точного ответа обычно нужны уточняющие условия или категория получателя."
         return None
+        
+    def _build_table_row_citation_parts(
+        self,
+        *,
+        row: Any,
+        document: Any | None,
+        tables_by_id: dict[UUID, Any],
+    ) -> tuple[str, str, Optional[str], dict[str, Any]]:
+        metadata = getattr(row, "metadata_json", {}) or {}
+        cells = (
+            metadata.get("cells_by_semantic_key")
+            or metadata.get("cells_by_header_key")
+            or {}
+        )
+        if not isinstance(cells, dict):
+            cells = {}
+
+        raw_document_name = cells.get("document_name")
+        short_document_name = self._normalize_citation_document_name(raw_document_name)
+
+        table_id = getattr(row, "table_id", None)
+        table = tables_by_id.get(table_id) if table_id else None
+
+        table_title = ""
+        table_number = None
+        if table is not None:
+            table_title = str(getattr(table, "table_title", "") or "").strip()
+            table_number = getattr(table, "table_number", None)
+
+        row_order = getattr(row, "row_order", None)
+
+        table_label = self._build_table_label(
+            table_title=table_title,
+            table_number=table_number,
+        )
+
+        if row_order is not None:
+            location_part = f"{table_label}, строка {row_order}"
+        else:
+            location_part = table_label
+
+        if short_document_name:
+            display_label = f"{short_document_name} — {location_part}"
+        else:
+            display_label = location_part
+
+        citation_text_parts: list[str] = []
+        if document is not None:
+            document_name = str(getattr(document, "document_name", "") or "").strip()
+            if document_name:
+                citation_text_parts.append(document_name)
+        citation_text_parts.append(location_part)
+        if short_document_name:
+            citation_text_parts.append(short_document_name)
+
+        citation_text = " | ".join(part for part in citation_text_parts if part)
+
+        return (
+            display_label,
+            citation_text,
+            short_document_name,
+            {
+                "table_title": table_title or None,
+                "table_number": table_number,
+                "row_order": row_order,
+                "document_name_short": short_document_name,
+            },
+        )
+        
+    def _build_table_label(
+        self,
+        *,
+        table_title: str,
+        table_number: Any,
+    ) -> str:
+        normalized_title = " ".join(str(table_title).split()).strip()
+
+        if normalized_title:
+            return normalized_title
+
+        if table_number not in (None, ""):
+            return f"Таблица {table_number}"
+
+        return "Таблица документов"
+
+
+    def _normalize_citation_document_name(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+
+        text = " ".join(str(value).strip().split())
+        if not text:
+            return None
+
+        lowered = text.lower()
+
+        if "удостоверяющ" in lowered and "личност" in lowered:
+            return "Паспорт или иной документ, удостоверяющий личность"
+
+        if lowered.startswith("заявление"):
+            return "Заявление"
+
+        return text
 
     # --------------------------------------------------------
     # Citations
@@ -824,17 +1080,43 @@ class GenerationPipeline:
         hydrated_objects: dict[str, dict[UUID, Any]],
     ) -> list[dict[str, Any]]:
         citations: list[dict[str, Any]] = []
-        seen_keys: set[tuple[str, UUID]] = set()
 
-        for candidate in plan.primary_candidates[:6]:
-            key = (candidate.source_type, candidate.source_id)
-            if key in seen_keys:
+        # 1. защита от точных дублей одного и того же источника
+        seen_source_keys: set[tuple[str, UUID]] = set()
+
+        # 2. защита от смысловых дублей table_row citations
+        #    ключ: (source_type, normalized document_name)
+        seen_semantic_row_keys: set[tuple[str, str]] = set()
+
+        for candidate in plan.primary_candidates[:10]:
+            source_key = (candidate.source_type, candidate.source_id)
+            if source_key in seen_source_keys:
                 continue
-            seen_keys.add(key)
+            seen_source_keys.add(source_key)
 
             citation = self._candidate_to_citation(candidate, hydrated_objects)
-            if citation:
-                citations.append(citation)
+            if not citation:
+                continue
+
+            if citation.get("source_type") == "table_row":
+                normalized_doc_name = " ".join(
+                    str(citation.get("document_name") or "").strip().lower().split()
+                )
+                semantic_key = ("table_row", normalized_doc_name)
+
+                # если document_name уже нормализован и такой citation уже был,
+                # пропускаем повтор
+                if normalized_doc_name and semantic_key in seen_semantic_row_keys:
+                    continue
+
+                if normalized_doc_name:
+                    seen_semantic_row_keys.add(semantic_key)
+
+            citations.append(citation)
+
+            # мягкий лимит на итоговое число citations
+            if len(citations) >= 5:
+                break
 
         return citations
 
@@ -845,25 +1127,68 @@ class GenerationPipeline:
     ) -> Optional[dict[str, Any]]:
         document = hydrated_objects["documents"].get(candidate.document_id)
         document_name = getattr(document, "document_name", None) if document else candidate.document_name
+
         download_url = None
         if document is not None:
             publication_payload = getattr(document, "publication_payload_json", {}) or {}
             download_url = publication_payload.get("download_url")
 
+        display_label = self._build_display_label(
+            candidate,
+            hydrated_objects,
+            document_name,
+        )
         citation_text = self._build_citation_text(candidate, hydrated_objects)
+
+        metadata_json = {
+            "source_score": getattr(candidate, "final_score", None),
+            "rerank_score": getattr(candidate, "rerank_score", None),
+        }
+
+        citation_document_name = document_name
+
+        if candidate.source_type == "table_row":
+            row = hydrated_objects["rows"].get(candidate.source_id)
+            if row is not None:
+                metadata = getattr(row, "metadata_json", {}) or {}
+                cells = (
+                    metadata.get("cells_by_semantic_key")
+                    or metadata.get("cells_by_header_key")
+                    or {}
+                )
+                if not isinstance(cells, dict):
+                    cells = {}
+
+                short_name = self._normalize_citation_document_name(cells.get("document_name"))
+                if short_name:
+                    citation_document_name = short_name
+
+                table = None
+                table_id = getattr(row, "table_id", None)
+                if table_id:
+                    table = hydrated_objects["tables"].get(table_id)
+
+                table_title = str(getattr(table, "table_title", "") or "").strip() if table else ""
+                table_number = getattr(table, "table_number", None) if table else None
+                row_order = getattr(row, "row_order", None)
+
+                metadata_json.update(
+                    {
+                        "table_title": table_title or None,
+                        "table_number": table_number,
+                        "row_order": row_order,
+                    }
+                )
 
         return {
             "source_type": candidate.source_type,
-            "source_id": str(candidate.source_id),
             "document_id": str(candidate.document_id),
-            "document_name": document_name,
-            "display_label": self._build_display_label(candidate, hydrated_objects, document_name),
+            "source_id": str(candidate.source_id),
+            "display_label": display_label,
             "citation_text": citation_text,
+            "document_name": citation_document_name,
             "download_url": download_url,
-            "metadata_json": {
-                "score": candidate.score,
-                "rerank_score": candidate.rerank_score,
-            },
+            "metadata_json": metadata_json,
         }
 
     def _build_display_label(
@@ -887,7 +1212,44 @@ class GenerationPipeline:
                 return f"{base} — таблица: {table_title}"
 
         if candidate.source_type == "table_row":
-            return f"{base} — строка таблицы"
+            row = hydrated_objects["rows"].get(candidate.source_id)
+            if row is None:
+                return f"{base} — строка таблицы"
+
+            metadata = getattr(row, "metadata_json", {}) or {}
+            cells = (
+                metadata.get("cells_by_semantic_key")
+                or metadata.get("cells_by_header_key")
+                or {}
+            )
+            if not isinstance(cells, dict):
+                cells = {}
+
+            short_name = self._normalize_citation_document_name(cells.get("document_name"))
+
+            table = None
+            table_id = getattr(row, "table_id", None)
+            if table_id:
+                table = hydrated_objects["tables"].get(table_id)
+
+            table_title = str(getattr(table, "table_title", "") or "").strip() if table else ""
+            table_number = getattr(table, "table_number", None) if table else None
+            row_order = getattr(row, "row_order", None)
+
+            table_label = self._build_table_label(
+                table_title=table_title,
+                table_number=table_number,
+            )
+
+            if row_order not in (None, ""):
+                location = f"{table_label}, строка {row_order}"
+            else:
+                location = table_label
+
+            if short_name:
+                return f"{short_name} — {location}"
+
+            return f"{base} — {location}"
 
         if candidate.source_type == "block":
             block = hydrated_objects["blocks"].get(candidate.source_id)
@@ -923,9 +1285,45 @@ class GenerationPipeline:
         if candidate.source_type == "table_row":
             row = hydrated_objects["rows"].get(candidate.source_id)
             if row is not None:
+                metadata = getattr(row, "metadata_json", {}) or {}
+                cells = (
+                    metadata.get("cells_by_semantic_key")
+                    or metadata.get("cells_by_header_key")
+                    or {}
+                )
+                if not isinstance(cells, dict):
+                    cells = {}
+
+                short_name = self._normalize_citation_document_name(cells.get("document_name"))
+
+                table = None
+                table_id = getattr(row, "table_id", None)
+                if table_id:
+                    table = hydrated_objects["tables"].get(table_id)
+
+                table_title = str(getattr(table, "table_title", "") or "").strip() if table else ""
+                table_number = getattr(table, "table_number", None) if table else None
+                row_order = getattr(row, "row_order", None)
+
+                table_label = self._build_table_label(
+                    table_title=table_title,
+                    table_number=table_number,
+                )
+
+                if row_order not in (None, ""):
+                    location = f"{table_label}, строка {row_order}"
+                else:
+                    location = table_label
+
                 row_summary = str(getattr(row, "row_summary", "") or "").strip()
-                if row_summary:
-                    return self._shorten_text(row_summary, limit=220) or "Строка таблицы"
+
+                parts: list[str] = [location]
+                if short_name:
+                    parts.append(short_name)
+                elif row_summary:
+                    parts.append(self._shorten_text(row_summary, limit=180) or "Строка таблицы")
+
+                return " | ".join(parts)
 
         if candidate.source_type == "block":
             block = hydrated_objects["blocks"].get(candidate.source_id)
