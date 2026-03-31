@@ -321,6 +321,7 @@ class RetrievalOrchestrator:
         selected_candidates = self._select_final_candidates(
             payload=payload,
             strategy=strategy,
+            query_bundle=query_bundle,
             candidates=reranked_candidates,
             document_stats=document_stats,
             priority_document_ids=priority_document_ids,
@@ -481,6 +482,10 @@ class RetrievalOrchestrator:
             intent_type=payload.intent_type,
         )
         submission_channel = self._detect_submission_channel(normalized_text)
+        wants_full_documents_list = self._wants_full_documents_list(
+            question_text=normalized_text,
+            intent_type=payload.intent_type,
+        )
         question_deadline_kind = None
         if payload.intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
             question_deadline_kind = self._detect_deadline_question_kind(normalized_text)
@@ -489,6 +494,7 @@ class RetrievalOrchestrator:
             table_question_profile=table_question_profile,
             submission_channel=submission_channel,
             question_deadline_kind=question_deadline_kind,
+            wants_full_documents_list=wants_full_documents_list,
         )
         table_scope_hints = self._infer_table_scope_hints(
             intent_type=payload.intent_type,
@@ -523,6 +529,7 @@ class RetrievalOrchestrator:
             "requested_column_hints": requested_column_hints,
             "table_scope_hints": table_scope_hints,
             "question_deadline_kind": question_deadline_kind,
+            "wants_full_documents_list": wants_full_documents_list,
         }
 
 
@@ -744,9 +751,17 @@ class RetrievalOrchestrator:
         if requested_column_hints:
             terms.extend(requested_column_hints)
 
-        return self._deduplicate_preserve_order(
+        terms = self._deduplicate_preserve_order(
             [self._normalize_text(x) for x in terms if self._normalize_text(x)]
-        )[:24]
+        )
+
+        if intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
+            terms = self._prioritize_deadline_query_terms(
+                terms=terms,
+                question_deadline_kind=question_deadline_kind,
+            )
+
+        return terms[:24]
 
 
     def _extract_meaningful_terms(self, text: str) -> list[str]:
@@ -787,6 +802,71 @@ class RetrievalOrchestrator:
             result.append(item)
 
         return result
+        
+    def _prioritize_deadline_query_terms(
+        self,
+        *,
+        terms: list[str],
+        question_deadline_kind: Optional[str],
+    ) -> list[str]:
+        if not terms:
+            return terms
+
+        common_priority = [
+            "едв",
+            "срок",
+            "в течение",
+            "не позднее",
+            "рабочих дней",
+            "календарных дней",
+        ]
+
+        kind_priority_map = {
+            "decision": [
+                "срок принятия решения",
+                "решение о предоставлении",
+                "решение о назначении",
+                "принятия решения",
+                "рассмотрения заявления",
+            ],
+            "notification": [
+                "срок уведомления",
+                "уведомление",
+                "уведомления о решении",
+                "направляет уведомление",
+                "уведомляет",
+                "сообщение о решении",
+            ],
+            "payment": [
+                "срок выплаты",
+                "выплата",
+                "выплачивает",
+                "ежемесячно",
+                "не позднее 26-го числа",
+                "26-го числа",
+                "26 числа",
+                "перечисление",
+                "зачисление",
+            ],
+        }
+
+        priority = kind_priority_map.get(question_deadline_kind or "other", []) + common_priority
+
+        front: list[str] = []
+        tail: list[str] = []
+        seen: set[str] = set()
+
+        for term in priority:
+            if term in terms and term not in seen:
+                front.append(term)
+                seen.add(term)
+
+        for term in terms:
+            if term not in seen:
+                tail.append(term)
+                seen.add(term)
+
+        return front + tail
 
     def _candidate_text_blob(self, candidate: RetrievedCandidate) -> str:
         """
@@ -915,6 +995,31 @@ class RetrievalOrchestrator:
             return "documents_by_submission_channel"
 
         return "documents_base"
+        
+    def _wants_full_documents_list(
+        self,
+        *,
+        question_text: str,
+        intent_type: QuestionIntentEnum,
+    ) -> bool:
+        """
+        Определяет, просит ли пользователь полный / исчерпывающий /
+        построчный перечень документов, а не обычный summary.
+        """
+        if intent_type != QuestionIntentEnum.DOCUMENTS_QUESTION:
+            return False
+
+        text = self._normalize_text(question_text)
+        markers = (
+            "полный перечень",
+            "исчерпывающий перечень",
+            "весь перечень",
+            "все документы",
+            "полный список",
+            "по строкам таблицы",
+            "в полном объеме",
+        )
+        return any(marker in text for marker in markers)
 
     def _build_requested_column_hints(
         self,
@@ -922,6 +1027,7 @@ class RetrievalOrchestrator:
         table_question_profile: Optional[str],
         submission_channel: Optional[str],
         question_deadline_kind: Optional[str] = None,
+        wants_full_documents_list: bool = False,
     ) -> list[str]:
         """
         Hints for downstream retrieval / ranking / debug.
@@ -929,10 +1035,23 @@ class RetrievalOrchestrator:
         These are normalized semantic hints.
         """
         if table_question_profile == "documents_base":
-            return [
+            hints = [
                 "document_name",
                 "наименование документа",
             ]
+
+            if wants_full_documents_list:
+                hints.extend(
+                    [
+                        "представляемые заявителем самостоятельно",
+                        "по собственной инициативе",
+                        "документы и информация",
+                        "required",
+                        "optional",
+                    ]
+                )
+
+            return hints
 
         if table_question_profile == "deadline":
             hints = [
@@ -1021,6 +1140,21 @@ class RetrievalOrchestrator:
                 ],
             }
             return mapping.get(submission_channel or "", ["document_name", "наименование документа"])
+            
+            hints = mapping.get(submission_channel or "", ["document_name", "наименование документа"])
+
+            if wants_full_documents_list:
+                hints.extend(
+                    [
+                        "представляемые заявителем самостоятельно",
+                        "по собственной инициативе",
+                        "документы и информация",
+                        "required",
+                        "optional",
+                    ]
+                )
+
+            return hints
 
         return []
 
@@ -1370,6 +1504,9 @@ class RetrievalOrchestrator:
         where exact row selection often matters.
         """
         text_terms = query_bundle["query_terms"]
+        
+        wants_full_documents_list = bool(query_bundle.get("wants_full_documents_list"))
+        is_documents_question = payload.intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION
 
         stmt = (
             select(
@@ -1400,7 +1537,14 @@ class RetrievalOrchestrator:
                 )
             )
 
-        stmt = stmt.order_by(desc("score")).limit(payload.top_k_rows)
+        rows_limit = payload.top_k_rows
+
+        if is_documents_question and wants_full_documents_list:
+            # Для полного перечня нельзя жить на обычном row-limit,
+            # иначе до generation физически не дойдут все строки таблицы.
+            rows_limit = max(payload.top_k_rows, 48)
+
+        stmt = stmt.order_by(desc("score")).limit(rows_limit)
 
         result = await self.db.execute(stmt)
         rows = result.mappings().all()
@@ -1628,7 +1772,9 @@ class RetrievalOrchestrator:
     ):
         score = literal(0.0)
 
-        for term in text_terms[:6]:
+        term_window = text_terms[:10] if intent_type == QuestionIntentEnum.DEADLINE_QUESTION else text_terms[:6]
+
+        for term in term_window:
             like_term = f"%{term}%"
             score = score + case(
                 (
@@ -1637,6 +1783,45 @@ class RetrievalOrchestrator:
                 ),
                 else_=0.0,
             )
+
+        if intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
+            score = score + case(
+                (
+                    or_(
+                        DocumentBlock.content_clean.ilike("%в течение%"),
+                        DocumentBlock.content_clean.ilike("%не позднее%"),
+                        DocumentBlock.content_clean.ilike("%не более%"),
+                        DocumentBlock.content_clean.ilike("%рабочих дней%"),
+                        DocumentBlock.content_clean.ilike("%календарных дней%"),
+                        DocumentBlock.content_clean.ilike("%26-го числа%"),
+                        DocumentBlock.content_clean.ilike("%26 числа%"),
+                    ),
+                    0.45,
+                ),
+                else_=0.0,
+            )
+
+            score = score + case(
+                (
+                    or_(
+                        DocumentBlock.content_clean.ilike("%уведом%"),
+                        DocumentBlock.content_clean.ilike("%сообщение о решении%"),
+                        DocumentBlock.content_clean.ilike("%выплат%"),
+                        DocumentBlock.content_clean.ilike("%перечисл%"),
+                        DocumentBlock.content_clean.ilike("%зачисл%"),
+                        DocumentBlock.content_clean.ilike("%решение о предоставлении%"),
+                        DocumentBlock.content_clean.ilike("%решение о назначении%"),
+                    ),
+                    0.25,
+                ),
+                else_=0.0,
+            )
+
+            score = score + case(
+                (DocumentBlock.block_type.in_(["paragraph", "list"]), 0.18),
+                else_=0.0,
+            )
+            return score
 
         if intent_type in {
             QuestionIntentEnum.PROCEDURE_QUESTION,
@@ -1923,14 +2108,15 @@ class RetrievalOrchestrator:
         return selected_document_ids
 
     def _select_final_candidates(
-            self,
-            *,
-            payload: RetrievalInput,
-            strategy: RetrievalStrategy,
-            candidates: list[RetrievedCandidate],
-            document_stats: dict[UUID, dict[str, Any]],
-            priority_document_ids: list[UUID],
-        ) -> list[RetrievedCandidate]:
+        self,
+        *,
+        payload: RetrievalInput,
+        strategy: RetrievalStrategy,
+        query_bundle: dict[str, Any],
+        candidates: list[RetrievedCandidate],
+        document_stats: dict[UUID, dict[str, Any]],
+        priority_document_ids: list[UUID],
+    ) -> list[RetrievedCandidate]:
             """
             Select final balanced evidence set.
 
@@ -1945,20 +2131,29 @@ class RetrievalOrchestrator:
 
             is_documents_question = payload.intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION
             is_deadline_question = payload.intent_type == QuestionIntentEnum.DEADLINE_QUESTION
+            wants_full_documents_list = bool(query_bundle.get("wants_full_documents_list"))
 
             if is_documents_question:
-                type_caps = {
-                    "legal_fact": 1,
-                    "table": min(2, payload.final_top_k),
-                    "table_row": min(max(10, payload.final_top_k), 14),
-                    "block": 1,
-                }
+                if wants_full_documents_list:
+                    type_caps = {
+                        "legal_fact": 0,
+                        "table": 1,
+                        "table_row": max(30, payload.final_top_k),
+                        "block": 0,
+                    }
+                else:
+                    type_caps = {
+                        "legal_fact": 1,
+                        "table": min(2, payload.final_top_k),
+                        "table_row": min(max(10, payload.final_top_k), 14),
+                        "block": 1,
+                    }
             elif is_deadline_question:
                 type_caps = {
                     "legal_fact": 1,
                     "table": 1,
-                    "table_row": min(4, payload.final_top_k),
-                    "block": min(6, payload.final_top_k),
+                    "table_row": min(5, payload.final_top_k),
+                    "block": min(8, payload.final_top_k),
                 }
             else:
                 type_caps = {
@@ -1977,24 +2172,9 @@ class RetrievalOrchestrator:
 
             ordered_candidates = list(candidates)
 
-            if is_documents_question:
-                ordered_candidates.sort(
-                    key=lambda candidate: (
-                        0 if (
-                            candidate.document_id in priority_document_set
-                            and candidate.source_type == "table_row"
-                            and self._has_table_semantic_type(candidate, "documents")
-                        ) else 1 if (
-                            candidate.document_id in priority_document_set
-                            and candidate.source_type == "table"
-                            and self._has_table_semantic_type(candidate, "documents")
-                        ) else 2 if candidate.document_id in priority_document_set else 3,
-                        -self._candidate_effective_score(candidate),
-                    )
-                )
-            elif is_deadline_question:
-                question_deadline_kind = self._detect_deadline_question_kind(
-                    payload.question_text_normalized or payload.question_text_raw
+            if is_deadline_question:
+                question_deadline_kind = str(
+                    query_bundle.get("question_deadline_kind") or "other"
                 )
                 ordered_candidates.sort(
                     key=lambda candidate: (
@@ -2006,6 +2186,42 @@ class RetrievalOrchestrator:
                         -self._candidate_effective_score(candidate),
                     )
                 )
+
+            if is_documents_question:
+                if wants_full_documents_list:
+                    ordered_candidates.sort(
+                        key=lambda candidate: (
+                            0 if (
+                                candidate.document_id in priority_document_set
+                                and candidate.source_type == "table_row"
+                                and self._has_table_semantic_type(candidate, "documents")
+                            ) else 1 if (
+                                candidate.document_id in priority_document_set
+                                and candidate.source_type == "table"
+                                and self._has_table_semantic_type(candidate, "documents")
+                            ) else 2,
+                            0 if str((candidate.metadata_json or {}).get("requirement_group") or "").strip().lower() == "required"
+                            else 1 if str((candidate.metadata_json or {}).get("requirement_group") or "").strip().lower() == "optional"
+                            else 2,
+                            int((candidate.metadata_json or {}).get("row_order") or 10**9),
+                            -self._candidate_effective_score(candidate),
+                        )
+                    )
+                else:
+                    ordered_candidates.sort(
+                        key=lambda candidate: (
+                            0 if (
+                                candidate.document_id in priority_document_set
+                                and candidate.source_type == "table_row"
+                                and self._has_table_semantic_type(candidate, "documents")
+                            ) else 1 if (
+                                candidate.document_id in priority_document_set
+                                and candidate.source_type == "table"
+                                and self._has_table_semantic_type(candidate, "documents")
+                            ) else 2 if candidate.document_id in priority_document_set else 3,
+                            -self._candidate_effective_score(candidate),
+                        )
+                    )
 
             selected: list[RetrievedCandidate] = []
             selected_keys: set[tuple[str, UUID]] = set()
@@ -2040,7 +2256,10 @@ class RetrievalOrchestrator:
 
                 current_doc_count = document_counts.get(candidate.document_id, 0)
                 if is_documents_question:
-                    max_per_document = 12 if candidate.document_id in priority_document_set else 4
+                    if wants_full_documents_list:
+                        max_per_document = 40 if candidate.document_id in priority_document_set else 12
+                    else:
+                        max_per_document = 12 if candidate.document_id in priority_document_set else 4
                 elif is_deadline_question:
                     max_per_document = 8 if candidate.document_id in priority_document_set else 3
                 else:
@@ -2054,12 +2273,16 @@ class RetrievalOrchestrator:
                 type_counts[candidate.source_type] = current_type_count + 1
                 document_counts[candidate.document_id] = current_doc_count + 1
 
-                if len(selected) >= payload.final_top_k:
+                target_final_top_k = payload.final_top_k
+                if is_documents_question and wants_full_documents_list:
+                    target_final_top_k = max(payload.final_top_k, 32)
+
+                if len(selected) >= target_final_top_k:
                     break
 
-            if len(selected) < min(3, payload.final_top_k):
+            if len(selected) < min(3, target_final_top_k):
                 for candidate in ordered_candidates:
-                    if len(selected) >= payload.final_top_k:
+                    if len(selected) >= target_final_top_k:
                         break
                     candidate_key = (candidate.source_type, candidate.source_id)
                     if candidate_key in selected_keys:

@@ -13,6 +13,17 @@ class DocumentsAnswerItem:
     submission_note: Optional[str] = None
     source_row_ids: list[str] = field(default_factory=list)
     applicant_category_ids: list[str] = field(default_factory=list)
+    
+    row_order: Optional[int] = None
+    table_number: Optional[str] = None
+    requirement_group: str = "unknown"
+    requirement_group_label: Optional[str] = None
+
+    requested_channel_key: Optional[str] = None
+    requested_channel_label: Optional[str] = None
+    requested_channel_value: Optional[str] = None
+
+    is_exact_row: bool = False
 
 
 @dataclass(slots=True)
@@ -25,6 +36,7 @@ class DocumentsAnswerBuildResult:
     dropped_rows_debug: list[dict[str, Any]] = field(default_factory=list)
     merged_items_debug: list[dict[str, Any]] = field(default_factory=list)
     reason: Optional[str] = None
+    full_list_mode: bool = False
 
     @property
     def all_items(self) -> list[DocumentsAnswerItem]:
@@ -62,6 +74,7 @@ class DocumentsAnswerBuildResult:
             "merged_items": self.merged_items_debug,
             "dropped_rows": self.dropped_rows_debug,
             "reason": self.reason,
+            "full_list_mode": self.full_list_mode,
         }
 
 
@@ -81,6 +94,7 @@ class TableDocumentsAnswerBuilder:
         *,
         candidates: list[Any],
         submission_channel: Optional[str],
+        full_list_mode: bool = False,
     ) -> DocumentsAnswerBuildResult:
         raw_items: list[DocumentsAnswerItem] = []
         dropped_rows_debug: list[dict[str, Any]] = []
@@ -108,6 +122,27 @@ class TableDocumentsAnswerBuilder:
                         "reason": "cells_not_dict",
                     }
                 )
+                continue
+                
+            row_order = getattr(candidate, "row_order", None)
+
+            if full_list_mode:
+                exact_item = self._build_exact_row_item(
+                    row_id=row_id,
+                    row_order=row_order,
+                    metadata=metadata,
+                    cells=cells,
+                    submission_channel=submission_channel,
+                )
+                if exact_item is None:
+                    dropped_rows_debug.append(
+                        {
+                            "row_id": row_id,
+                            "reason": "not_exact_documents_row",
+                        }
+                    )
+                    continue
+                raw_items.append(exact_item)
                 continue
 
             document_name = self._clean(cells.get("document_name"))
@@ -163,9 +198,23 @@ class TableDocumentsAnswerBuilder:
                 can_answer=False,
                 reason="no_documents_rows",
                 dropped_rows_debug=dropped_rows_debug,
+                full_list_mode=full_list_mode,
             )
 
-        merged_items, merged_items_debug = self._merge_similar_items(raw_items)
+        if full_list_mode:
+            merged_items = sorted(
+                raw_items,
+                key=lambda item: (
+                    0 if item.requirement_group == "required"
+                    else 1 if item.requirement_group == "optional"
+                    else 2,
+                    item.row_order or 10**9,
+                    item.document_name.lower(),
+                ),
+            )
+            merged_items_debug = []
+        else:
+            merged_items, merged_items_debug = self._merge_similar_items(raw_items)
 
         base_items: list[DocumentsAnswerItem] = []
         conditional_items: list[DocumentsAnswerItem] = []
@@ -195,6 +244,7 @@ class TableDocumentsAnswerBuilder:
             dropped_rows_debug=dropped_rows_debug,
             merged_items_debug=merged_items_debug,
             reason=None,
+            full_list_mode=full_list_mode,
         )
 
     def render_text(
@@ -205,6 +255,12 @@ class TableDocumentsAnswerBuilder:
     ) -> Optional[str]:
         if not result.can_answer:
             return None
+            
+        if result.full_list_mode:
+            return self._render_full_list_text(
+                result=result,
+                submission_channel=submission_channel,
+            )
 
         has_channel = bool(submission_channel)
         channel_label = self._channel_label(submission_channel) if submission_channel else None
@@ -266,6 +322,123 @@ class TableDocumentsAnswerBuilder:
                 return base
 
         return text
+        
+    def _resolve_requested_channel_key(
+        self,
+        submission_channel: Optional[str],
+    ) -> Optional[str]:
+        mapping = {
+            "epgu": "epgu_submission",
+            "regional_portal": "regional_portal_submission",
+            "in_person": "in_person_submission",
+            "post": "post_submission",
+            "mfc": "mfc_submission",
+        }
+        return mapping.get(submission_channel or "")
+        
+    def _build_exact_row_item(
+        self,
+        *,
+        row_id: str,
+        row_order: Optional[int],
+        metadata: dict[str, Any],
+        cells: dict[str, Any],
+        submission_channel: Optional[str],
+    ) -> Optional[DocumentsAnswerItem]:
+        document_name = self._clean(cells.get("document_name"))
+        if not document_name:
+            return None
+        if self._is_service_value(document_name):
+            return None
+
+        applicant_category_id = self._clean(cells.get("applicant_category_id"))
+        document_family = self._infer_document_family(document_name)
+        role = self._classify_document_role(
+            document_name=document_name,
+            document_family=document_family,
+        )
+        applicability = self._infer_applicability(
+            document_name=document_name,
+            applicant_category_id=applicant_category_id,
+            document_family=document_family,
+        )
+
+        requested_channel_key = self._resolve_requested_channel_key(submission_channel)
+        requested_channel_value = self._extract_submission_note(
+            cells=cells,
+            submission_channel=submission_channel,
+        )
+        requested_channel_label = (
+            self._channel_label(submission_channel) if submission_channel else None
+        )
+
+        return DocumentsAnswerItem(
+            document_name=document_name,
+            role=role,
+            applicability=applicability,
+            document_family=document_family,
+            submission_note=requested_channel_value,
+            source_row_ids=[row_id] if row_id else [],
+            applicant_category_ids=[applicant_category_id] if applicant_category_id else [],
+            row_order=row_order,
+            table_number=self._clean(metadata.get("table_number")),
+            requirement_group=self._clean(metadata.get("requirement_group")) or "unknown",
+            requirement_group_label=self._clean(metadata.get("requirement_group_label")),
+            requested_channel_key=requested_channel_key,
+            requested_channel_label=requested_channel_label,
+            requested_channel_value=requested_channel_value,
+            is_exact_row=True,
+        )
+        
+    def _render_full_list_text(
+        self,
+        *,
+        result: DocumentsAnswerBuildResult,
+        submission_channel: Optional[str],
+    ) -> str:
+        items = result.all_items
+        channel_label = self._channel_label(submission_channel) if submission_channel else None
+
+        required_items = [item for item in items if item.requirement_group == "required"]
+        optional_items = [item for item in items if item.requirement_group == "optional"]
+        other_items = [item for item in items if item.requirement_group not in {"required", "optional"}]
+
+        lines: list[str] = []
+        if channel_label:
+            lines.append(
+                f"Ниже приведён полный перечень документов. "
+                f"Для каждой позиции указано требование при подаче {channel_label}."
+            )
+        else:
+            lines.append("Ниже приведён полный перечень документов по строкам таблицы.")
+
+        def append_group(title: str, group_items: list[DocumentsAnswerItem]) -> None:
+            if not group_items:
+                return
+            lines.append("")
+            lines.append(title)
+            for idx, item in enumerate(group_items, start=1):
+                text = f"{idx}. {item.document_name}"
+                if channel_label:
+                    channel_value = item.requested_channel_value or "в таблице не указано отдельно"
+                    text += f" — {channel_label}: {channel_value}"
+                lines.append(text)
+
+        append_group("Обязательные документы:", required_items)
+        append_group("Документы, которые можно представить по собственной инициативе:", optional_items)
+
+        if other_items:
+            append_group("Прочие связанные позиции:", other_items)
+
+        total = len(required_items) + len(optional_items)
+        if total:
+            lines.append("")
+            lines.append(
+                f"Итого по основному перечню: {total} позиций "
+                f"({len(required_items)} обязательных и {len(optional_items)} по собственной инициативе)."
+            )
+
+        return "\n".join(lines).strip()
 
     def _merge_similar_items(
         self,

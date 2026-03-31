@@ -42,6 +42,9 @@ from app.services.feedback.feedback_service import EvidenceItemInput
 from app.services.retrieval.retrieval_orchestrator import EvidencePackage, RetrievedCandidate
 from app.services.generation.table_documents_answer_builder import TableDocumentsAnswerBuilder
 from app.services.generation.table_deadlines_answer_builder import TableDeadlinesAnswerBuilder
+from app.services.generation.table_rejection_reasons_answer_builder import (
+    TableRejectionReasonsAnswerBuilder,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +206,7 @@ class GenerationPipeline:
         self.semantic_validator = semantic_validator
         self.table_documents_answer_builder = TableDocumentsAnswerBuilder()
         self.table_deadlines_answer_builder = TableDeadlinesAnswerBuilder()
+        self.table_rejection_reasons_answer_builder = TableRejectionReasonsAnswerBuilder()
 
     # --------------------------------------------------------
     # Public API
@@ -274,6 +278,11 @@ class GenerationPipeline:
             payload=payload,
             evidence_package=evidence_package,
         )
+        
+        rejection_answer_payload = self._prepare_rejection_table_answer(
+            payload=payload,
+            evidence_package=evidence_package,
+        )
 
         answer_text = self._compose_answer_text(
             payload=payload,
@@ -282,6 +291,7 @@ class GenerationPipeline:
             hydrated_objects=hydrated_objects,
             documents_answer_payload=documents_answer_payload,
             deadlines_answer_payload=deadlines_answer_payload,
+            rejection_answer_payload=rejection_answer_payload,
         )
 
         answer_text_short = self._build_short_answer(
@@ -361,6 +371,7 @@ class GenerationPipeline:
                 "guard_reason": guard_reason or None,
                 "documents_builder_debug": documents_answer_payload.get("debug"),
                 "deadlines_builder_debug": deadlines_answer_payload.get("debug"),
+                "rejection_builder_debug": rejection_answer_payload.get("debug"),
             },
             reuse_decision_payload_json={
                 "reuse_allowed": reuse_allowed,
@@ -391,6 +402,48 @@ class GenerationPipeline:
             if isinstance(submission_channel, str) and submission_channel.strip():
                 return submission_channel.strip().lower()
 
+        # Новый fallback: пытаемся понять канал прямо из текста вопроса.
+        question_text = payload.question_text_normalized or payload.question_text_raw
+        inferred_channel = self._infer_submission_channel_from_question(question_text)
+        if inferred_channel:
+            return inferred_channel
+
+        return None
+
+    def _wants_full_documents_list(self, question_text: str) -> bool:
+        normalized = " ".join(str(question_text or "").lower().split())
+        markers = (
+            "полный перечень",
+            "исчерпывающий перечень",
+            "весь перечень",
+            "все документы",
+            "полный список",
+            "по строкам таблицы",
+        )
+        return any(marker in normalized for marker in markers)
+
+    def _infer_submission_channel_from_question(
+        self,
+        question_text: str,
+    ) -> Optional[str]:
+        normalized = " ".join(str(question_text or "").lower().split())
+        normalized = normalized.replace("ё", "е")
+
+        if "епгу" in normalized or "единый портал" in normalized:
+            return "epgu"
+
+        if "краевой портал" in normalized or "региональный портал" in normalized:
+            return "regional_portal"
+
+        if "лично" in normalized or "личный прием" in normalized or "на личном приеме" in normalized:
+            return "in_person"
+
+        if "почт" in normalized:
+            return "post"
+
+        if "мфц" in normalized:
+            return "mfc"
+
         return None
 
     def _prepare_documents_table_answer(
@@ -416,6 +469,9 @@ class GenerationPipeline:
             result = self.table_documents_answer_builder.build(
                 candidates=evidence_package.selected_candidates or [],
                 submission_channel=submission_channel,
+                full_list_mode=self._wants_full_documents_list(
+                    payload.question_text_normalized or payload.question_text_raw
+                ),
             )
 
             answer_text = None
@@ -458,6 +514,40 @@ class GenerationPipeline:
         answer_text = None
         if result.can_answer:
             answer_text = self.table_deadlines_answer_builder.render_text(
+                result=result,
+            )
+
+        debug_payload = result.debug_payload()
+        debug_payload["can_answer"] = result.can_answer
+
+        return {
+            "answer_text": answer_text,
+            "debug": debug_payload,
+        }
+        
+    def _prepare_rejection_table_answer(
+        self,
+        *,
+        payload: GenerationRequest,
+        evidence_package: EvidencePackage,
+    ) -> dict[str, Any]:
+        if payload.intent_type != QuestionIntentEnum.REJECTION_QUESTION:
+            return {
+                "answer_text": None,
+                "debug": {
+                    "skipped": True,
+                    "reason": "not_rejection_question",
+                },
+            }
+
+        result = self.table_rejection_reasons_answer_builder.build(
+            candidates=evidence_package.selected_candidates or [],
+            question_text=payload.question_text_normalized or payload.question_text_raw,
+        )
+
+        answer_text = None
+        if result.can_answer:
+            answer_text = self.table_rejection_reasons_answer_builder.render_text(
                 result=result,
             )
 
@@ -738,6 +828,7 @@ class GenerationPipeline:
         hydrated_objects: dict[str, dict[UUID, Any]],
         documents_answer_payload: Optional[dict[str, Any]] = None,
         deadlines_answer_payload: Optional[dict[str, Any]] = None,
+        rejection_answer_payload: Optional[dict[str, Any]] = None,
     ) -> str:
         # Для documents-question сначала всегда пробуем deterministic path.
         if payload.intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION:
@@ -756,6 +847,15 @@ class GenerationPipeline:
 
             if deterministic_text:
                 return deterministic_text
+                
+        # Для rejection-question сначала всегда пробуем deterministic path.
+        if payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION:
+            deterministic_text = None
+            if isinstance(rejection_answer_payload, dict):
+                deterministic_text = rejection_answer_payload.get("answer_text")
+
+            if deterministic_text:
+                return deterministic_text                
 
         if plan.answer_mode == AnswerModeEnum.SAFE_NO_ANSWER:
             return self._compose_safe_no_answer_text(
