@@ -92,6 +92,45 @@ class DocxStructureExtractor:
         re.compile(r"^\s*дата выдачи", flags=re.IGNORECASE),
         re.compile(r"^\s*срок действия полномочий", flags=re.IGNORECASE),
     )
+    
+    _TEXTUAL_DATE_RE = re.compile(
+        r"(?P<day>\d{1,2})\s+"
+        r"(?P<month>января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)"
+        r"\s+(?P<year>\d{4})\s*г?\.?",
+        flags=re.IGNORECASE,
+    )
+
+    _RUS_MONTHS = {
+        "января": 1,
+        "февраля": 2,
+        "марта": 3,
+        "апреля": 4,
+        "мая": 5,
+        "июня": 6,
+        "июля": 7,
+        "августа": 8,
+        "сентября": 9,
+        "октября": 10,
+        "ноября": 11,
+        "декабря": 12,
+    }
+
+    _TITLE_STOP_MARKERS = (
+        "в соответствии с",
+        "i. общие положения",
+        "i. предмет",
+        "предмет регулирования",
+        "круг заявителей",
+        "список изменяющих документов",
+    )
+
+    _TITLE_SKIP_EXACT = {
+        "министерство социальной политики",
+        "министерство социальной политики красноярского края",
+        "красноярского края",
+        "приказ",
+        "приложение",
+    }
 
     def __init__(
         self,
@@ -398,6 +437,7 @@ class DocxStructureExtractor:
             },
             "metadata_json": {
                 "docx_table_index": int(table_number),
+                "table_semantic_type": table_type,
                 "preceding_paragraphs": [
                     x.get("content_clean")
                     for x in paragraph_context
@@ -861,7 +901,11 @@ class DocxStructureExtractor:
         result: dict[str, str] = {}
 
         for idx, header in enumerate(headers):
-            header_key = header_keys[idx] if idx < len(header_keys) else self._normalize_column_key(header)
+            header_key = (
+                header_keys[idx]
+                if idx < len(header_keys)
+                else self._normalize_column_key(header)
+            )
             value = self._clean_text(str(row_json.get(header_key, "")))
             if not value:
                 continue
@@ -872,6 +916,35 @@ class DocxStructureExtractor:
                 table_type=table_type,
             )
             result[semantic_key] = value
+
+        if table_type == "deadlines":
+            if "deadline_value" not in result:
+                for raw_value in row_json.values():
+                    clean_value = self._clean_text(str(raw_value))
+                    if not clean_value:
+                        continue
+                    if self._looks_like_deadline_value(clean_value):
+                        result["deadline_value"] = clean_value
+                        break
+
+            if "deadline_scope" not in result:
+                scope_candidates: list[str] = []
+                deadline_value = result.get("deadline_value")
+
+                for raw_value in row_json.values():
+                    clean_value = self._clean_text(str(raw_value))
+                    if not clean_value:
+                        continue
+                    if deadline_value and clean_value == deadline_value:
+                        continue
+                    if self._looks_like_deadline_value(clean_value):
+                        continue
+                    if len(clean_value) < 3:
+                        continue
+                    scope_candidates.append(clean_value)
+
+                if scope_candidates:
+                    result["deadline_scope"] = max(scope_candidates, key=len)
 
         return result
 
@@ -910,7 +983,6 @@ class DocxStructureExtractor:
             if header_text in {"n п/п", "№ п/п", "n", "№"}:
                 return "row_number"
 
-            # Fallback for repeated generic channel headers after unique key generation.
             if normalized_key.endswith("_2"):
                 return "epgu_submission"
             if normalized_key.endswith("_3"):
@@ -933,8 +1005,29 @@ class DocxStructureExtractor:
                 return "applicant_category_id"
 
         if table_type == "deadlines":
-            if "срок" in header_text or "рабочих дней" in header_text:
+            if (
+                "срок" in header_text
+                or "рабочих дней" in header_text
+                or "календарных дней" in header_text
+                or "не позднее" in header_text
+            ):
                 return "deadline_value"
+
+            if any(
+                marker in header_text
+                for marker in (
+                    "административная процедура",
+                    "процедура",
+                    "действие",
+                    "этап",
+                    "операция",
+                    "наименование",
+                    "результат",
+                    "основание",
+                    "событие",
+                )
+            ):
+                return "deadline_scope"
 
         return norm or normalized_key or "column"
 
@@ -1023,12 +1116,10 @@ class DocxStructureExtractor:
         haystack = f"{table_title} {' '.join(headers)}".lower()
         row_text = " ".join(
             (row.get("row_summary") or "").lower()
-            for row in row_payloads[:8]
+            for row in row_payloads[:12]
         )
-
         combined = f"{haystack} {row_text}"
 
-        # 1. Documents tables must have top priority.
         document_markers = [
             "документов, необходимых",
             "документы, необходимые",
@@ -1044,7 +1135,6 @@ class DocxStructureExtractor:
         if sum(1 for marker in document_markers if marker in combined) >= 2:
             return "documents"
 
-        # 2. Refusal / suspension reasons
         refusal_markers = [
             "основания для отказа",
             "отказа в приеме",
@@ -1055,17 +1145,6 @@ class DocxStructureExtractor:
         if any(marker in combined for marker in refusal_markers):
             return "refusal_reasons"
 
-        # 3. Deadlines
-        deadline_markers = [
-            "срок",
-            "рабочих дней",
-            "календарных дней",
-            "срок предоставления",
-        ]
-        if any(marker in combined for marker in deadline_markers):
-            return "deadlines"
-
-        # 4. Applicant categories / identifiers
         identifier_markers = [
             "идентификатор категорий",
             "идентификаторы категорий",
@@ -1075,13 +1154,42 @@ class DocxStructureExtractor:
         if any(marker in combined for marker in identifier_markers):
             return "identifiers"
 
-        # 5. Forms / field-like tables
+        # Важно: form_fields проверяем раньше deadlines.
         if self._looks_like_form_table(
             table_title=table_title,
             headers=headers,
             row_payloads=row_payloads,
         ):
             return "form_fields"
+
+        deadline_title_markers = [
+            "срок предоставления",
+            "максимальный срок",
+            "срок регистрации",
+            "срок исправления",
+            "срок ожидания",
+            "срок принятия решения",
+            "срок направления",
+            "срок выполнения",
+        ]
+        deadline_title_score = sum(
+            1 for marker in deadline_title_markers if marker in haystack
+        )
+
+        deadline_row_like_count = sum(
+            1
+            for row in row_payloads[:12]
+            if self._row_looks_like_deadline_payload(row)
+        )
+
+        if deadline_title_score >= 1 and deadline_row_like_count >= 1:
+            return "deadlines"
+
+        if deadline_title_score >= 2:
+            return "deadlines"
+
+        if deadline_row_like_count >= 2:
+            return "deadlines"
 
         return "generic"
 
@@ -1124,6 +1232,73 @@ class DocxStructureExtractor:
                 short_value_rows += 1
 
         return total_rows > 0 and short_value_rows >= max(2, total_rows // 2)
+        
+    def _row_looks_like_deadline_payload(
+        self,
+        row: dict[str, Any],
+    ) -> bool:
+        row_json = row.get("row_json") or {}
+        values = [
+            self._clean_text(str(v))
+            for v in row_json.values()
+            if self._clean_text(str(v))
+        ]
+        if not values:
+            return False
+
+        deadline_values = [v for v in values if self._looks_like_deadline_value(v)]
+        if not deadline_values:
+            return False
+
+        non_deadline_values = [
+            v.lower()
+            for v in values
+            if v not in deadline_values
+        ]
+
+        scope_markers = (
+            "решени",
+            "предоставлен",
+            "уведом",
+            "выплат",
+            "регистрац",
+            "рассмотрен",
+            "исправлен",
+            "ожидани",
+            "приостанов",
+            "направлен",
+            "подписани",
+        )
+
+        if any(
+            any(marker in value for marker in scope_markers)
+            for value in non_deadline_values
+        ):
+            return True
+
+        return len(values) <= 3
+
+    def _looks_like_deadline_value(
+        self,
+        text: str,
+    ) -> bool:
+        normalized = self._clean_text(text).lower().replace("ё", "е")
+        if not normalized:
+            return False
+
+        patterns = (
+            r"\b\d+\s+(?:рабоч(?:их|его)?|календарн(?:ых|ого)?)\s+дн",
+            r"\b\d+\s+дн",
+            r"в течение\s+\d+\s+(?:рабоч(?:их|его)?|календарн(?:ых|ого)?)\s+дн",
+            r"не более\s+\d+\s+(?:рабоч(?:их|его)?|календарн(?:ых|ого)?)\s+дн",
+            r"не позднее\s+\d{1,2}(?:-го)?\s+числа",
+            r"в день регистрации",
+            r"в день поступления",
+            r"в день принятия решения",
+            r"ежемесячно",
+        )
+
+        return any(re.search(pattern, normalized) for pattern in patterns)
 
     def _build_table_summary(
         self,
@@ -1209,21 +1384,63 @@ class DocxStructureExtractor:
         original_filename: str,
         blocks: list[dict[str, Any]],
     ) -> str:
-        for block in blocks[:20]:
-            text = self._clean_text(str(block.get("content_clean") or ""))
-            if not text:
+        texts = [
+            self._clean_text(str(block.get("content_clean") or ""))
+            for block in blocks[:60]
+            if self._is_meaningful_text(block.get("content_clean"))
+        ]
+
+        if not texts:
+            return Path(original_filename).stem
+
+        start_idx = 0
+        for idx, text in enumerate(texts[:15]):
+            if text.lower() == "приказ":
+                start_idx = idx + 1
+                break
+
+        title_lines: list[str] = []
+
+        for text in texts[start_idx : start_idx + 15]:
+            lowered = text.lower()
+
+            if any(marker in lowered for marker in self._TITLE_STOP_MARKERS):
+                if title_lines:
+                    break
+                continue
+
+            if self._is_noise_document_title_line(text):
+                if title_lines:
+                    break
+                continue
+
+            if not title_lines:
+                if self._looks_like_document_title_line(text):
+                    title_lines.append(text)
+                continue
+
+            if self._looks_like_document_title_line(text):
+                title_lines.append(text)
+                continue
+
+            break
+
+        if title_lines:
+            return self._normalize_title(" ".join(title_lines))
+
+        for text in texts[:25]:
+            lowered = text.lower()
+            if (
+                "административный регламент предоставления" in lowered
+                and not self._is_noise_document_title_line(text)
+            ):
+                return self._normalize_title(text)
+
+        for text in texts[:25]:
+            if self._is_noise_document_title_line(text):
                 continue
             if len(text) < 4:
                 continue
-
-            lowered = text.lower()
-            # Skip authority cap headers if the next meaningful title is likely better.
-            if lowered in {
-                "министерство социальной политики",
-                "министерство социальной политики красноярского края",
-            }:
-                continue
-
             return text
 
         return Path(original_filename).stem
@@ -1235,22 +1452,157 @@ class DocxStructureExtractor:
         blocks: list[dict[str, Any]],
         normalized_text: str,
     ) -> Optional[datetime]:
-        candidates: list[str] = [original_filename, normalized_text]
-        candidates.extend(
-            str(block.get("content_clean") or "") for block in blocks[:20]
-        )
+        filename_dates = self._extract_candidate_dates(original_filename)
+        if filename_dates:
+            return filename_dates[0]
 
-        for candidate in candidates:
-            match = self._REVISION_DATE_RE.search(candidate)
-            if not match:
+        texts = [
+            self._clean_text(str(block.get("content_clean") or ""))
+            for block in blocks[:40]
+            if self._is_meaningful_text(block.get("content_clean"))
+        ]
+
+        for idx, text in enumerate(texts[:12]):
+            if text.lower() == "приказ":
+                for nearby in texts[idx + 1 : idx + 4]:
+                    nearby_dates = self._extract_candidate_dates(nearby)
+                    if nearby_dates:
+                        return nearby_dates[0]
+
+        for text in texts[:8]:
+            if self._looks_like_order_date_line(text):
+                text_dates = self._extract_candidate_dates(text)
+                if text_dates:
+                    return text_dates[0]
+
+        for text in texts[:8]:
+            text_dates = self._extract_candidate_dates(text)
+            if text_dates:
+                return text_dates[0]
+
+        prefix_dates = self._extract_candidate_dates(self._clean_text(normalized_text[:1500]))
+        if prefix_dates:
+            return prefix_dates[0]
+
+        return None
+        
+    def _extract_candidate_dates(
+        self,
+        text: str,
+    ) -> list[datetime]:
+        clean_text = self._clean_text(text)
+        if not clean_text:
+            return []
+
+        matches: list[tuple[int, datetime]] = []
+
+        for match in self._TEXTUAL_DATE_RE.finditer(clean_text):
+            day = int(match.group("day"))
+            month_name = match.group("month").lower()
+            year = int(match.group("year"))
+            month = self._RUS_MONTHS.get(month_name)
+            if month is None:
                 continue
             try:
-                parsed = datetime.strptime(match.group("date"), "%d.%m.%Y")
-                return parsed.replace(tzinfo=timezone.utc)
+                parsed = datetime(year, month, day, tzinfo=timezone.utc)
+                matches.append((match.start(), parsed))
             except ValueError:
                 continue
 
-        return None
+        for match in self._REVISION_DATE_RE.finditer(clean_text):
+            try:
+                parsed = datetime.strptime(match.group("date"), "%d.%m.%Y")
+                matches.append((match.start(), parsed.replace(tzinfo=timezone.utc)))
+            except ValueError:
+                continue
+
+        matches.sort(key=lambda item: item[0])
+
+        result: list[datetime] = []
+        seen: set[str] = set()
+
+        for _, parsed in matches:
+            key = parsed.strftime("%Y-%m-%d")
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(parsed)
+
+        return result
+
+    def _looks_like_order_date_line(
+        self,
+        text: str,
+    ) -> bool:
+        clean_text = self._clean_text(text)
+        lowered = clean_text.lower()
+
+        if not self._extract_candidate_dates(clean_text):
+            return False
+
+        if lowered.startswith("от ") and ("№" in clean_text or re.search(r"\bN\b", clean_text)):
+            return True
+
+        if "приказ" in lowered and self._extract_candidate_dates(clean_text):
+            return True
+
+        return False
+
+    def _looks_like_document_title_line(
+        self,
+        text: str,
+    ) -> bool:
+        clean_text = self._clean_text(text)
+        if len(clean_text) < 5 or len(clean_text) > 250:
+            return False
+
+        lowered = clean_text.lower()
+
+        strong_markers = (
+            "об утверждении",
+            "о внесении изменения",
+            "о внесении изменений",
+            "административного регламента предоставления",
+            "государственной услуги",
+            "предоставлению",
+            "назначению",
+        )
+        if any(marker in lowered for marker in strong_markers):
+            return True
+
+        letters = [ch for ch in clean_text if ch.isalpha()]
+        if not letters:
+            return False
+
+        upper_ratio = sum(1 for ch in letters if ch == ch.upper()) / len(letters)
+        return upper_ratio >= 0.75 and len(clean_text) >= 12
+
+    def _is_noise_document_title_line(
+        self,
+        text: str,
+    ) -> bool:
+        clean_text = self._clean_text(text)
+        lowered = clean_text.lower()
+
+        if lowered in self._TITLE_SKIP_EXACT:
+            return True
+
+        if lowered.startswith("документ предоставлен"):
+            return True
+        if lowered.startswith("дата сохранения"):
+            return True
+        if lowered.startswith("www."):
+            return True
+        if lowered.startswith("к приказу"):
+            return True
+
+        if lowered.startswith("от ") and self._extract_candidate_dates(clean_text):
+            return True
+
+        if self._extract_candidate_dates(clean_text) and ("№" in clean_text or re.search(r"\bN\b", clean_text)):
+            return True
+
+        return False
 
     def _detect_doc_uid_base(
         self,
