@@ -369,6 +369,7 @@ class DocxStructureExtractor:
                     current_heading_text=current_heading_text,
                     heading_path=heading_path,
                 ),
+            },
         }
 
     def _detect_block_type(
