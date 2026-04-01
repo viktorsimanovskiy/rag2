@@ -163,17 +163,32 @@ class DocxStructureExtractor:
         meaningful_paragraph_count = 0
         skipped_blank_tables_count = 0
 
+        current_heading_text: Optional[str] = None
+        heading_path: list[str] = []
+
         for item in self._iter_block_items(doc):
             if isinstance(item, Paragraph):
                 block = self._build_block_from_paragraph(
                     paragraph=item,
                     block_order=block_order + 1,
+                    current_heading_text=current_heading_text,
+                    heading_path=heading_path,
                 )
                 if block is None:
                     continue
 
                 block_order += 1
                 blocks.append(block)
+
+                if block.get("block_type") == "heading":
+                    heading_text = self._clean_text(block.get("content_clean") or "")
+                    if heading_text:
+                        current_heading_text = heading_text
+                        heading_path = self._update_heading_path(
+                            heading_path=heading_path,
+                            heading_text=heading_text,
+                            section_number=block.get("section_number"),
+                        )
 
                 if self._is_meaningful_text(block.get("content_clean")):
                     meaningful_paragraph_count += 1
@@ -303,6 +318,8 @@ class DocxStructureExtractor:
         *,
         paragraph: Paragraph,
         block_order: int,
+        current_heading_text: Optional[str],
+        heading_path: list[str],
     ) -> Optional[dict[str, Any]]:
         raw_text = self._clean_text(paragraph.text)
         if not raw_text:
@@ -345,7 +362,13 @@ class DocxStructureExtractor:
                 "style_name": style_name,
                 "is_heading_style": self._is_heading_style(style_name),
                 "is_list_like": self._looks_like_list_item(raw_text),
-            },
+                "current_heading_text": current_heading_text,
+                "heading_path": list(heading_path),
+                "block_semantic_hints": self._infer_block_semantic_hints(
+                    text=raw_text,
+                    current_heading_text=current_heading_text,
+                    heading_path=heading_path,
+                ),
         }
 
     def _detect_block_type(
@@ -1817,3 +1840,68 @@ class DocxStructureExtractor:
         if normalized in {"column", "column_1", "column_2", "column_3", "column_4", "column_5"}:
             return True
         return False
+        
+    def _update_heading_path(
+        self,
+        *,
+        heading_path: list[str],
+        heading_text: str,
+        section_number: Optional[str],
+    ) -> list[str]:
+        clean_heading = self._clean_text(heading_text)
+        if not clean_heading:
+            return list(heading_path)
+
+        if section_number and re.fullmatch(r"[IVXLCM]+\.?", section_number, flags=re.IGNORECASE):
+            return [clean_heading]
+
+        new_path = list(heading_path)
+        if not new_path or new_path[-1] != clean_heading:
+            new_path.append(clean_heading)
+        return new_path[-4:]
+
+    def _infer_block_semantic_hints(
+        self,
+        *,
+        text: str,
+        current_heading_text: Optional[str],
+        heading_path: list[str],
+    ) -> dict[str, Any]:
+        haystack_parts = [self._clean_text(text)]
+        if current_heading_text:
+            haystack_parts.append(self._clean_text(current_heading_text))
+        haystack_parts.extend(self._clean_text(x) for x in heading_path if self._clean_text(x))
+
+        haystack = " ".join(haystack_parts).lower()
+
+        hints = {
+            "is_deadline_related": False,
+            "deadline_kind_hint": None,
+        }
+
+        if any(
+            marker in haystack
+            for marker in (
+                "срок предоставления государственной услуги",
+                "срок предоставления",
+                "срок регистрации",
+                "срок исправления",
+                "в течение 2 рабочих дней",
+                "не позднее 26-го числа",
+                "не позднее 26 числа",
+                "уведомляется",
+                "направляется заявителю",
+                "выплачивается",
+                "решение принимается",
+            )
+        ):
+            hints["is_deadline_related"] = True
+
+        if any(marker in haystack for marker in ("решение принимается", "принятия решения", "срок предоставления")):
+            hints["deadline_kind_hint"] = "decision"
+        elif any(marker in haystack for marker in ("уведомляется", "уведомление", "направляется заявителю")):
+            hints["deadline_kind_hint"] = "notification"
+        elif any(marker in haystack for marker in ("выплачивается", "выплата", "не позднее 26-го числа", "не позднее 26 числа")):
+            hints["deadline_kind_hint"] = "payment"
+
+        return hints
