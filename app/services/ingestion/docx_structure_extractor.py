@@ -1386,13 +1386,22 @@ class DocxStructureExtractor:
     ) -> str:
         texts = [
             self._clean_text(str(block.get("content_clean") or ""))
-            for block in blocks[:60]
+            for block in blocks[:80]
             if self._is_meaningful_text(block.get("content_clean"))
         ]
 
         if not texts:
             return Path(original_filename).stem
 
+        # 1. Самый надёжный случай:
+        # если в приложении явно найден заголовок самого административного регламента,
+        # берём именно его, а не wrapper-title приказа.
+        appendix_regulation_title = self._extract_regulation_title_from_appendix(texts)
+        if appendix_regulation_title:
+            return appendix_regulation_title
+
+        # 2. Иначе пробуем собрать title из верхней части приказа,
+        # но уже без шума, даты, подписи и служебных строк.
         start_idx = 0
         for idx, text in enumerate(texts[:15]):
             if text.lower() == "приказ":
@@ -1401,8 +1410,13 @@ class DocxStructureExtractor:
 
         title_lines: list[str] = []
 
-        for text in texts[start_idx : start_idx + 15]:
+        for text in texts[start_idx : start_idx + 18]:
             lowered = text.lower()
+
+            if self._looks_like_signature_line(text):
+                if title_lines:
+                    break
+                continue
 
             if any(marker in lowered for marker in self._TITLE_STOP_MARKERS):
                 if title_lines:
@@ -1428,22 +1442,94 @@ class DocxStructureExtractor:
         if title_lines:
             return self._normalize_title(" ".join(title_lines))
 
-        for text in texts[:25]:
-            lowered = text.lower()
-            if (
-                "административный регламент предоставления" in lowered
-                and not self._is_noise_document_title_line(text)
-            ):
-                return self._normalize_title(text)
-
-        for text in texts[:25]:
+        # 3. Осторожный fallback: первый содержательный block,
+        # который не шум, не дата, не подпись.
+        for text in texts[:30]:
             if self._is_noise_document_title_line(text):
                 continue
-            if len(text) < 4:
+            if self._looks_like_signature_line(text):
+                continue
+            if len(text) < 5:
                 continue
             return text
 
         return Path(original_filename).stem
+        
+    def _extract_regulation_title_from_appendix(
+        self,
+        texts: list[str],
+    ) -> Optional[str]:
+        appendix_seen = False
+        collecting = False
+        collected: list[str] = []
+
+        for text in texts[:80]:
+            lowered = text.lower()
+
+            if lowered == "приложение" or lowered.startswith("приложение"):
+                appendix_seen = True
+                if collected:
+                    break
+                continue
+
+            if not appendix_seen:
+                continue
+
+            if self._looks_like_signature_line(text):
+                if collected:
+                    break
+                continue
+
+            if self._is_noise_document_title_line(text):
+                if collected:
+                    continue
+                continue
+
+            if "административный регламент" in lowered:
+                collecting = True
+                collected.append(text)
+                continue
+
+            if not collecting:
+                continue
+
+            if any(marker in lowered for marker in self._TITLE_STOP_MARKERS):
+                break
+
+            if self._looks_like_document_title_line(text):
+                collected.append(text)
+                continue
+
+            break
+
+        if not collected:
+            return None
+
+        return self._normalize_title(" ".join(collected))
+        
+    def _looks_like_signature_line(
+        self,
+        text: str,
+    ) -> bool:
+        clean_text = self._clean_text(text)
+        lowered = clean_text.lower()
+
+        if lowered in {
+            "министр",
+            "первый заместитель министра",
+            "заместитель министра",
+        }:
+            return True
+
+        # И.Л.ПАСТУХОВА / О.Н.ЧЕРНЫШЕВА / Д.В. БОГДАНОВ и т.п.
+        if re.fullmatch(r"[А-ЯЁ]\.[А-ЯЁ]\.[А-ЯЁ\-]+", clean_text):
+            return True
+
+        # Иногда после OCR/нормализации бывают пробелы: И. Л. ПАСТУХОВА
+        if re.fullmatch(r"[А-ЯЁ]\.\s*[А-ЯЁ]\.\s*[А-ЯЁ\-]+", clean_text):
+            return True
+
+        return False
 
     def _detect_revision_date(
         self,
@@ -1587,6 +1673,9 @@ class DocxStructureExtractor:
         if lowered in self._TITLE_SKIP_EXACT:
             return True
 
+        if self._looks_like_signature_line(clean_text):
+            return True
+
         if lowered.startswith("документ предоставлен"):
             return True
         if lowered.startswith("дата сохранения"):
@@ -1595,11 +1684,17 @@ class DocxStructureExtractor:
             return True
         if lowered.startswith("к приказу"):
             return True
+        if lowered.startswith("министерство социальной политики"):
+            return True
+        if lowered == "красноярского края":
+            return True
 
         if lowered.startswith("от ") and self._extract_candidate_dates(clean_text):
             return True
 
-        if self._extract_candidate_dates(clean_text) and ("№" in clean_text or re.search(r"\bN\b", clean_text)):
+        if self._extract_candidate_dates(clean_text) and (
+            "№" in clean_text or re.search(r"\bN\b", clean_text)
+        ):
             return True
 
         return False
