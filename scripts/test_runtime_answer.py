@@ -17,6 +17,36 @@ from app.runtime.app_runtime import AppRuntime, AppRuntimeConfig
 from app.services.answers.runtime_answer_service import RuntimeAnswerInput
 
 
+_MEASURE_ALIAS_MAP: dict[str, tuple[str, ...]] = {
+    "edv": (
+        " едв ",
+        "ежемесячной денежной выплаты",
+        "ежемесячная денежная выплата",
+    ),
+    "subsidy": (
+        "субсид",
+        "оплату жилого помещения",
+        "коммунальных услуг",
+    ),
+    "social_contract": (
+        "соцконтракт",
+        "социального контракта",
+        "социальный контракт",
+    ),
+    "hardship": (
+        " тжс ",
+        "трудной жизненной ситуации",
+        "адресной материальной помощи",
+    ),
+    "sanatorium": (
+        "санкур",
+        "санаторно-курорт",
+        "бесплатных путевок",
+        "путевок на санаторно-курортное лечение",
+    ),
+}
+
+
 def _parse_intent(value: str) -> QuestionIntentEnum:
     normalized = (value or "").strip().lower()
 
@@ -114,6 +144,29 @@ def _collect_questions(
     return result
 
 
+def _infer_measure_code(question_text: str) -> str | None:
+    normalized = " ".join((question_text or "").strip().lower().split())
+    if not normalized:
+        return None
+
+    padded = f" {normalized} "
+    for measure_code, aliases in _MEASURE_ALIAS_MAP.items():
+        if any(alias in padded or alias in normalized for alias in aliases):
+            return measure_code
+
+    return None
+
+
+def _resolve_measure_code_for_question(
+    *,
+    question_text: str,
+    explicit_measure_code: str | None,
+) -> str | None:
+    if explicit_measure_code:
+        return explicit_measure_code.strip().lower() or None
+    return _infer_measure_code(question_text)
+
+
 def _result_to_debug_dict(result: object) -> dict:
     if hasattr(result, "__dict__"):
         return dict(vars(result))
@@ -139,6 +192,7 @@ async def _run_one_question(
     intent: QuestionIntentEnum,
     question_index: int,
     total_questions: int,
+    explicit_measure_code: str | None,
 ) -> None:
     started_at = time.perf_counter()
 
@@ -147,6 +201,10 @@ async def _run_one_question(
         service = service_factory.get_runtime_answer_service()
 
         normalized_question = " ".join(question_text.strip().lower().split())
+        measure_code = _resolve_measure_code_for_question(
+            question_text=normalized_question,
+            explicit_measure_code=explicit_measure_code,
+        )
 
         result = await service.build_answer(
             RuntimeAnswerInput(
@@ -157,6 +215,7 @@ async def _run_one_question(
                 question_text_normalized=normalized_question,
                 language_code="ru",
                 intent_type=intent,
+                measure_code=measure_code,
             )
         )
 
@@ -170,6 +229,9 @@ async def _run_one_question(
     print()
     print("INTENT:")
     print(getattr(intent, "value", str(intent)))
+    print()
+    print("MEASURE CODE:")
+    print(measure_code)
     print()
     print("ELAPSED SECONDS:")
     print(f"{elapsed:.2f}")
@@ -191,6 +253,7 @@ async def run(
     *,
     question_texts: list[str],
     intent: QuestionIntentEnum,
+    explicit_measure_code: str | None,
 ) -> None:
     settings = load_settings()
     runtime = AppRuntime(
@@ -211,6 +274,7 @@ async def run(
                 intent=intent,
                 question_index=idx,
                 total_questions=total,
+                explicit_measure_code=explicit_measure_code,
             )
     finally:
         await runtime.shutdown()
@@ -253,6 +317,14 @@ def main() -> int:
             "deadline_registration, procedure, refusal"
         ),
     )
+    parser.add_argument(
+        "--measure-code",
+        required=False,
+        help=(
+            "Explicit measure code override for all questions in the batch. "
+            "If omitted, the script will try to infer it from question text."
+        ),
+    )
     args = parser.parse_args()
 
     intent = _parse_intent(args.intent)
@@ -266,6 +338,7 @@ def main() -> int:
         run(
             question_texts=question_texts,
             intent=intent,
+            explicit_measure_code=args.measure_code,
         )
     )
     return 0

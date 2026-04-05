@@ -490,6 +490,8 @@ class RetrievalOrchestrator:
         if payload.intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
             question_deadline_kind = self._detect_deadline_question_kind(normalized_text)
 
+        question_measure_family = self._detect_measure_family(normalized_text)
+
         requested_column_hints = self._build_requested_column_hints(
             table_question_profile=table_question_profile,
             submission_channel=submission_channel,
@@ -529,6 +531,7 @@ class RetrievalOrchestrator:
             "requested_column_hints": requested_column_hints,
             "table_scope_hints": table_scope_hints,
             "question_deadline_kind": question_deadline_kind,
+            "question_measure_family": question_measure_family,
             "wants_full_documents_list": wants_full_documents_list,
         }
 
@@ -966,6 +969,80 @@ class RetrievalOrchestrator:
                         parts.extend(str(x) for x in cell_value if x)
 
         return self._normalize_text(" ".join(parts))
+
+    def _detect_measure_family(
+        self,
+        text: str,
+    ) -> Optional[str]:
+        text = self._normalize_text(text)
+        if not text:
+            return None
+
+        families: list[tuple[str, tuple[str, ...]]] = [
+            (
+                "edv",
+                (
+                    " едв ",
+                    "ежемесячной денежной выплаты",
+                    "ежемесячная денежная выплата",
+                ),
+            ),
+            (
+                "subsidy",
+                (
+                    "субсид",
+                    "оплату жилого помещения",
+                    "коммунальных услуг",
+                ),
+            ),
+            (
+                "social_contract",
+                (
+                    "соцконтракт",
+                    "социального контракта",
+                    "социальный контракт",
+                ),
+            ),
+            (
+                "hardship",
+                (
+                    "тжс",
+                    "трудной жизненной ситуации",
+                    "адресной материальной помощи",
+                ),
+            ),
+            (
+                "sanatorium",
+                (
+                    "санкур",
+                    "санаторно-курорт",
+                    "бесплатных путевок",
+                    "путевок на санаторно-курортное лечение",
+                ),
+            ),
+        ]
+
+        padded = f" {text} "
+        for family, markers in families:
+            if any(marker in padded or marker in text for marker in markers):
+                return family
+        return None
+
+
+    def _candidate_measure_family(
+        self,
+        candidate: RetrievedCandidate,
+    ) -> Optional[str]:
+        metadata = candidate.metadata_json or {}
+        explicit_measure_code = self._normalize_text(
+            candidate.measure_code
+            or metadata.get("measure_code")
+            or ""
+        )
+        if explicit_measure_code == "edv":
+            return "edv"
+
+        return self._detect_measure_family(self._candidate_text_blob(candidate))
 
     def _detect_submission_channel(self, text: str) -> Optional[str]:
         """
@@ -2327,11 +2404,19 @@ class RetrievalOrchestrator:
                     else:
                         max_per_document = 12 if candidate.document_id in priority_document_set else 4
                 elif is_deadline_question:
-                    max_per_document = 8 if candidate.document_id in priority_document_set else 3
+                    max_per_document = 8 if candidate.document_id in priority_document_set else 1
                 else:
                     max_per_document = 6 if candidate.document_id in priority_document_set else 3
 
                 if current_doc_count >= max_per_document:
+                    continue
+
+                if (
+                    is_deadline_question
+                    and priority_document_set
+                    and candidate.document_id not in priority_document_set
+                    and len(selected) >= 4
+                ):
                     continue
 
                 selected.append(candidate)
@@ -2363,6 +2448,8 @@ class RetrievalOrchestrator:
                         if candidate.source_type == "table_row" and not has_temporal_markers:
                             continue
                         if candidate.source_type == "table" and not is_deadline_table:
+                            continue
+                        if priority_document_set and candidate.document_id not in priority_document_set and len(selected) >= 4:
                             continue
                     selected.append(candidate)
                     selected_keys.add(candidate_key)
@@ -2721,6 +2808,7 @@ class RetrievalOrchestrator:
         requested_column_hints = query_bundle.get("requested_column_hints") or []
         question_norm = self._normalize_text(payload.question_text_normalized or payload.question_text_raw)
         question_deadline_kind = self._detect_deadline_question_kind(question_norm)
+        question_measure_family = query_bundle.get("question_measure_family") or self._detect_measure_family(question_norm)
 
         reranked: list[RetrievedCandidate] = []
 
@@ -2728,6 +2816,20 @@ class RetrievalOrchestrator:
             score = candidate.rerank_score if candidate.rerank_score is not None else candidate.score
             text = self._candidate_text_blob(candidate)
             text_norm = self._normalize_text(text)
+            metadata = candidate.metadata_json or {}
+            candidate_measure_family = self._candidate_measure_family(candidate)
+            candidate_measure_code = self._normalize_text(candidate.measure_code or metadata.get("measure_code") or "")
+
+            if question_measure_family and candidate_measure_family == question_measure_family:
+                score += 0.58 if intent_type == QuestionIntentEnum.DEADLINE_QUESTION else 0.30
+            elif question_measure_family and candidate_measure_family and candidate_measure_family != question_measure_family:
+                score -= 1.05 if intent_type == QuestionIntentEnum.DEADLINE_QUESTION else 0.55
+
+            if payload.measure_code and candidate_measure_code:
+                if candidate_measure_code == self._normalize_text(payload.measure_code):
+                    score += 0.30
+                else:
+                    score -= 0.90
 
             if candidate.source_type == "table_row":
                 score += 0.05
@@ -2771,7 +2873,6 @@ class RetrievalOrchestrator:
                     score += 0.08
 
             elif intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
-                metadata = candidate.metadata_json or {}
                 table_semantic_type = self._normalize_text(metadata.get("table_semantic_type"))
                 cells = metadata.get("cells_by_semantic_key") or metadata.get("cells_by_header_key") or {}
                 has_deadline_value = isinstance(cells, dict) and bool(cells.get("deadline_value"))
