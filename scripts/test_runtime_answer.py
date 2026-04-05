@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -31,6 +32,8 @@ def _parse_intent(value: str) -> QuestionIntentEnum:
         "refusal": QuestionIntentEnum.REJECTION_QUESTION,
         "refusal_reasons": QuestionIntentEnum.REJECTION_QUESTION,
         "refusal_reasons_question": QuestionIntentEnum.REJECTION_QUESTION,
+        "rejection": QuestionIntentEnum.REJECTION_QUESTION,
+        "rejection_question": QuestionIntentEnum.REJECTION_QUESTION,
     }
 
     if normalized not in mapping:
@@ -55,7 +58,8 @@ def _resolve_question(raw_question: str | None, preset: str | None) -> str:
         "deadline_decision": "срок принятия решения по едв",
         "deadline_review": "срок рассмотрения заявления по едв",
         "deadline_notification": "срок уведомления о решении по едв",
-        "deadline_payment": "срок выплаты едв",
+        "deadline_payment": "когда выплатят едв",
+        "deadline_registration": "срок регистрации заявления на субсидию",
         "procedure": "как назначается едв",
         "refusal": "по каким основаниям могут отказать в едв",
     }
@@ -71,8 +75,43 @@ def _resolve_question(raw_question: str | None, preset: str | None) -> str:
     return "срок принятия решения по едв"
 
 
-def _safe_getattr(obj: object, name: str, default=None):
-    return getattr(obj, name, default)
+def _load_questions_from_file(path: str) -> list[str]:
+    file_path = Path(path).expanduser().resolve()
+    if not file_path.exists():
+        raise FileNotFoundError(f"Questions file not found: {file_path}")
+
+    questions: list[str] = []
+    for line in file_path.read_text(encoding="utf-8").splitlines():
+        clean = line.strip()
+        if not clean:
+            continue
+        if clean.startswith("#"):
+            continue
+        questions.append(clean)
+    return questions
+
+
+def _collect_questions(
+    *,
+    questions: list[str] | None,
+    questions_file: str | None,
+    preset: str | None,
+) -> list[str]:
+    result: list[str] = []
+
+    if questions:
+        for question in questions:
+            clean = (question or "").strip()
+            if clean:
+                result.append(clean)
+
+    if questions_file:
+        result.extend(_load_questions_from_file(questions_file))
+
+    if not result:
+        result.append(_resolve_question(None, preset))
+
+    return result
 
 
 def _result_to_debug_dict(result: object) -> dict:
@@ -93,9 +132,64 @@ def _result_to_debug_dict(result: object) -> dict:
     return fields
 
 
+async def _run_one_question(
+    *,
+    runtime: AppRuntime,
+    question_text: str,
+    intent: QuestionIntentEnum,
+    question_index: int,
+    total_questions: int,
+) -> None:
+    started_at = time.perf_counter()
+
+    async with runtime.session_scope() as session:
+        service_factory = runtime.build_service_factory(session)
+        service = service_factory.get_runtime_answer_service()
+
+        normalized_question = " ".join(question_text.strip().lower().split())
+
+        result = await service.build_answer(
+            RuntimeAnswerInput(
+                session_id=uuid4(),
+                question_event_id=uuid4(),
+                channel_code="CLI_TEST",
+                question_text_raw=question_text,
+                question_text_normalized=normalized_question,
+                language_code="ru",
+                intent_type=intent,
+            )
+        )
+
+    elapsed = time.perf_counter() - started_at
+    debug_result = _result_to_debug_dict(result)
+
+    print("=" * 100)
+    print(f"QUESTION {question_index}/{total_questions}")
+    print("-" * 100)
+    print(question_text)
+    print()
+    print("INTENT:")
+    print(getattr(intent, "value", str(intent)))
+    print()
+    print("ELAPSED SECONDS:")
+    print(f"{elapsed:.2f}")
+    print()
+    print("RESULT TYPE:")
+    print(type(result).__name__)
+    print()
+    print("KNOWN RESULT FIELDS:")
+    for key in sorted(debug_result.keys()):
+        print(f"- {key}")
+    print()
+    print("RESULT PAYLOAD:")
+    print(debug_result)
+    print("=" * 100)
+    print()
+
+
 async def run(
     *,
-    question_text: str,
+    question_texts: list[str],
     intent: QuestionIntentEnum,
 ) -> None:
     settings = load_settings()
@@ -105,52 +199,33 @@ async def run(
         )
     )
 
+    batch_started_at = time.perf_counter()
     await runtime.startup()
+
     try:
-        async with runtime.session_scope() as session:
-            service_factory = runtime.build_service_factory(session)
-            service = service_factory.get_runtime_answer_service()
-
-            normalized_question = " ".join(question_text.strip().lower().split())
-
-            result = await service.build_answer(
-                RuntimeAnswerInput(
-                    session_id=uuid4(),
-                    question_event_id=uuid4(),
-                    channel_code="CLI_TEST",
-                    question_text_raw=question_text,
-                    question_text_normalized=normalized_question,
-                    language_code="ru",
-                    intent_type=intent,
-                )
+        total = len(question_texts)
+        for idx, question_text in enumerate(question_texts, start=1):
+            await _run_one_question(
+                runtime=runtime,
+                question_text=question_text,
+                intent=intent,
+                question_index=idx,
+                total_questions=total,
             )
-
-            debug_result = _result_to_debug_dict(result)
-
-            print("=" * 80)
-            print("QUESTION:")
-            print(question_text)
-            print()
-            print("INTENT:")
-            print(getattr(intent, "value", str(intent)))
-            print()
-            print("RESULT TYPE:")
-            print(type(result).__name__)
-            print()
-            print("KNOWN RESULT FIELDS:")
-            for key in sorted(debug_result.keys()):
-                print(f"- {key}")
-            print()
-            print("RESULT PAYLOAD:")
-            print(debug_result)
-            print("=" * 80)
     finally:
         await runtime.shutdown()
+
+    batch_elapsed = time.perf_counter() - batch_started_at
+    print("#" * 100)
+    print("BATCH FINISHED")
+    print(f"TOTAL QUESTIONS: {len(question_texts)}")
+    print(f"TOTAL ELAPSED SECONDS: {batch_elapsed:.2f}")
+    print("#" * 100)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Smoke-test for runtime answer path"
+        description="Batch smoke-test for runtime answer path with one shared AppRuntime startup"
     )
     parser.add_argument(
         "--intent",
@@ -159,22 +234,37 @@ def main() -> int:
     )
     parser.add_argument(
         "--question",
+        action="append",
         required=False,
-        help="Raw user question text",
+        help="Raw user question text. Can be passed multiple times.",
+    )
+    parser.add_argument(
+        "--questions-file",
+        required=False,
+        help="UTF-8 text file: one question per line.",
     )
     parser.add_argument(
         "--preset",
         required=False,
-        help="Question preset: documents, documents_epgu, deadline, deadline_decision, deadline_review, deadline_notification, deadline_payment, procedure, refusal",
+        help=(
+            "Fallback preset if no explicit questions are passed: "
+            "documents, documents_epgu, deadline, deadline_decision, "
+            "deadline_review, deadline_notification, deadline_payment, "
+            "deadline_registration, procedure, refusal"
+        ),
     )
     args = parser.parse_args()
 
     intent = _parse_intent(args.intent)
-    question_text = _resolve_question(args.question, args.preset)
+    question_texts = _collect_questions(
+        questions=args.question,
+        questions_file=args.questions_file,
+        preset=args.preset,
+    )
 
     asyncio.run(
         run(
-            question_text=question_text,
+            question_texts=question_texts,
             intent=intent,
         )
     )
