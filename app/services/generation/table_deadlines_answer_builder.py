@@ -8,13 +8,16 @@ from typing import Any, Optional
 @dataclass(slots=True)
 class DeadlineAnswerItem:
     deadline_value: str
-    scope_text: Optional[str] = None
-    deadline_kind: str = "other"
-    kind_confidence: float = 0.0
-    source_row_ids: list[str] = field(default_factory=list)
-    source_block_ids: list[str] = field(default_factory=list)
-    source_table_types: list[str] = field(default_factory=list)
-    source_scores: list[float] = field(default_factory=list)
+    scope_text: str
+    source_type: str
+    citation_json: dict[str, Any] = field(default_factory=dict)
+
+    fact_type: str | None = None
+    is_service_core_deadline: bool = False
+    candidate_score: float = 0.0
+
+    table_title: str | None = None
+    table_number: str | None = None
 
 
 @dataclass(slots=True)
@@ -72,6 +75,19 @@ class DeadlinesAnswerBuildResult:
             "dropped_rows": self.dropped_rows_debug,
             "ambiguity_reason": self.ambiguity_reason,
             "reason": self.reason,
+            "raw_items_count": len(raw_items),
+            "merged_items_count": len(merged_items),
+            "ranked_items_preview": [
+                {
+                    "deadline_value": item.deadline_value,
+                    "scope_text": item.scope_text,
+                    "source_type": item.source_type,
+                    "fact_type": item.fact_type,
+                    "is_service_core_deadline": item.is_service_core_deadline,
+                    "rank_score": self._rank_item(item=item, question_text=question_text),
+                }
+                for item in ranked_items[:10]
+            ],
         }
 
 
@@ -234,34 +250,18 @@ class TableDeadlinesAnswerBuilder:
         dropped_rows_debug: list[dict[str, Any]] = []
 
         normalized_question = self._normalize(question_text)
-        question_deadline_kind = self._detect_question_deadline_kind(normalized_question)
+        question_deadline_kind = self._question_deadline_kind(normalized_question)
 
         for candidate in candidates:
-            source_type = getattr(candidate, "source_type", None)
-            if source_type == "table_row":
-                item = self._build_item_from_table_row(
-                    candidate=candidate,
-                    normalized_question=normalized_question,
-                    question_deadline_kind=question_deadline_kind,
-                    dropped_rows_debug=dropped_rows_debug,
-                )
-            elif source_type == "block":
-                item = self._build_item_from_block(
-                    candidate=candidate,
-                    normalized_question=normalized_question,
-                    question_deadline_kind=question_deadline_kind,
-                    dropped_rows_debug=dropped_rows_debug,
-                )
-            else:
+            item = self._build_item_from_candidate(candidate)
+            if item is None:
                 continue
-
-            if item is not None:
-                raw_items.append(item)
+            raw_items.append(item)
 
         if not raw_items:
             return DeadlinesAnswerBuildResult(
                 can_answer=False,
-                question_deadline_kind=question_deadline_kind,
+                question_deadline_kind=question_deadline_kind or "other",
                 reason="no_deadline_items",
                 dropped_rows_debug=dropped_rows_debug,
             )
@@ -270,21 +270,23 @@ class TableDeadlinesAnswerBuilder:
         if not merged_items:
             return DeadlinesAnswerBuildResult(
                 can_answer=False,
-                question_deadline_kind=question_deadline_kind,
+                question_deadline_kind=question_deadline_kind or "other",
                 reason="no_merged_deadline_items",
                 dropped_rows_debug=dropped_rows_debug,
                 merged_items_debug=merged_items_debug,
             )
 
-        merged_items.sort(
-            key=lambda item: self._primary_sort_key(
+        ranked_items = sorted(
+            merged_items,
+            key=lambda item: self._rank_item(
                 item=item,
-                question_deadline_kind=question_deadline_kind,
-            )
+                question_text=normalized_question,
+            ),
+            reverse=True,
         )
 
-        primary_item = merged_items[0]
-        alternative_items = merged_items[1:]
+        primary_item = ranked_items[0]
+        alternative_items = ranked_items[1:]
 
         ambiguity_reason: Optional[str] = None
         if alternative_items and any(
@@ -293,16 +295,363 @@ class TableDeadlinesAnswerBuilder:
         ):
             ambiguity_reason = "multiple_distinct_deadlines"
 
-        return DeadlinesAnswerBuildResult(
+        result = DeadlinesAnswerBuildResult(
             can_answer=True,
-            question_deadline_kind=question_deadline_kind,
+            question_deadline_kind=question_deadline_kind or "other",
             primary_item=primary_item,
             alternative_items=alternative_items,
             dropped_rows_debug=dropped_rows_debug,
-            merged_items_debug=merged_items_debug,
+            merged_items_debug=[
+                *merged_items_debug,
+                {
+                    "raw_items_count": len(raw_items),
+                    "merged_items_count": len(merged_items),
+                    "ranked_items_preview": [
+                        {
+                            "deadline_value": item.deadline_value,
+                            "scope_text": item.scope_text,
+                            "source_type": item.source_type,
+                            "fact_type": item.fact_type,
+                            "is_service_core_deadline": item.is_service_core_deadline,
+                            "candidate_score": item.candidate_score,
+                            "rank_score": self._rank_item(
+                                item=item,
+                                question_text=normalized_question,
+                            ),
+                        }
+                        for item in ranked_items[:10]
+                    ],
+                },
+            ],
             ambiguity_reason=ambiguity_reason,
             reason=None,
         )
+        return result
+        
+    def _build_item_from_candidate(
+        self,
+        candidate: Any,
+    ) -> DeadlineAnswerItem | None:
+        source_type = self._candidate_source_type(candidate)
+
+        if source_type == "legal_fact":
+            return self._build_item_from_legal_fact_candidate(candidate)
+
+        if source_type == "table_row":
+            return self._build_item_from_table_row_candidate(candidate)
+
+        return None
+        
+    def _build_item_from_table_row_candidate(
+        self,
+        candidate: Any,
+    ) -> DeadlineAnswerItem | None:
+        deadline_value = self._extract_deadline_value(candidate)
+        if not deadline_value:
+            return None
+
+        if self._is_service_value(deadline_value):
+            return None
+        if not self._looks_like_deadline_value(deadline_value):
+            return None
+
+        scope_text = self._extract_scope_text(candidate)
+        scope_text = self._clean(scope_text) if scope_text else ""
+
+        citation_json = self._candidate_citation_json(candidate)
+        metadata_json = self._candidate_metadata_json(candidate)
+
+        return DeadlineAnswerItem(
+            deadline_value=self._clean(deadline_value),
+            scope_text=scope_text or "",
+            source_type="table_row",
+            citation_json=citation_json,
+            fact_type=None,
+            is_service_core_deadline=self._table_row_is_service_core(scope_text),
+            candidate_score=self._candidate_score(candidate),
+            table_title=metadata_json.get("table_title"),
+            table_number=metadata_json.get("table_number"),
+        )
+        
+    def _build_item_from_legal_fact_candidate(
+        self,
+        candidate: Any,
+    ) -> DeadlineAnswerItem | None:
+        payload = self._candidate_payload(candidate)
+        value_json = payload.get("value_json") or {}
+        metadata_json = payload.get("metadata_json") or {}
+        condition_json = payload.get("condition_json") or {}
+
+        deadline_value = (
+            value_json.get("deadline_value")
+            or value_json.get("value")
+            or ""
+        )
+        deadline_value = self._clean(deadline_value)
+
+        if not deadline_value:
+            return None
+        if not self._looks_like_deadline_value(deadline_value):
+            return None
+
+        scope_text = (
+            metadata_json.get("deadline_scope_text")
+            or condition_json.get("deadline_scope_text")
+            or condition_json.get("heading_text")
+            or value_json.get("source_text")
+            or self._candidate_text(candidate)
+            or ""
+        )
+        scope_text = self._clean(scope_text)
+
+        fact_type = (
+            self._candidate_attr(candidate, "fact_type")
+            or payload.get("fact_type")
+            or metadata_json.get("fact_type")
+        )
+
+        is_service_core_deadline = bool(
+            metadata_json.get("is_service_core_deadline")
+            or condition_json.get("is_service_core_deadline")
+        )
+
+        return DeadlineAnswerItem(
+            deadline_value=deadline_value,
+            scope_text=scope_text,
+            source_type="legal_fact",
+            citation_json=self._candidate_citation_json(candidate),
+            fact_type=fact_type,
+            is_service_core_deadline=is_service_core_deadline,
+            candidate_score=self._candidate_score(candidate),
+            table_title=None,
+            table_number=None,
+        )
+        
+    def _rank_item(
+        self,
+        *,
+        item: DeadlineAnswerItem,
+        question_text: str,
+    ) -> float:
+        score = 0.0
+
+        # 1. legal_fact приоритетнее table_row
+        if item.source_type == "legal_fact":
+            score += 50.0
+        elif item.source_type == "table_row":
+            score += 20.0
+
+        # 2. core-сроки приоритетнее procedural/fallback
+        if item.is_service_core_deadline:
+            score += 80.0
+
+        # 3. совпадение типа вопроса и типа срока
+        score += self._fact_type_bonus(
+            fact_type=item.fact_type,
+            question_text=question_text,
+        )
+
+        # 4. старый бонус за совпадение scope с вопросом сохраняем
+        score += self._question_scope_bonus(
+            question_text=question_text,
+            scope_text=item.scope_text,
+        )
+
+        # 5. чем “сильнее” формулировка срока, тем лучше
+        score += self._deadline_specificity_score(item.deadline_value)
+
+        # 6. retrieval/rerank score как дополнительный, но не главный сигнал
+        score += min(max(item.candidate_score, 0.0), 1.0) * 10.0
+
+        return score
+        
+    def _fact_type_bonus(
+        self,
+        *,
+        fact_type: str | None,
+        question_text: str,
+    ) -> float:
+        question_kind = self._question_deadline_kind(question_text)
+
+        if not fact_type:
+            return 0.0
+
+        generic_weights = {
+            "decision_deadline": 60.0,
+            "notification_deadline": 45.0,
+            "payment_deadline": 40.0,
+            "registration_deadline": 20.0,
+            "correction_deadline": 5.0,
+            "applicant_action_deadline": -20.0,
+            "internal_procedure_deadline": -30.0,
+        }
+
+        decision_weights = {
+            "decision_deadline": 100.0,
+            "notification_deadline": 25.0,
+            "payment_deadline": 10.0,
+            "registration_deadline": 10.0,
+            "correction_deadline": -10.0,
+            "applicant_action_deadline": -40.0,
+            "internal_procedure_deadline": -50.0,
+        }
+
+        notification_weights = {
+            "decision_deadline": 20.0,
+            "notification_deadline": 100.0,
+            "payment_deadline": 5.0,
+            "registration_deadline": 5.0,
+            "correction_deadline": -10.0,
+            "applicant_action_deadline": -40.0,
+            "internal_procedure_deadline": -50.0,
+        }
+
+        payment_weights = {
+            "decision_deadline": 10.0,
+            "notification_deadline": 10.0,
+            "payment_deadline": 100.0,
+            "registration_deadline": 0.0,
+            "correction_deadline": -20.0,
+            "applicant_action_deadline": -50.0,
+            "internal_procedure_deadline": -50.0,
+        }
+
+        registration_weights = {
+            "decision_deadline": 10.0,
+            "notification_deadline": 10.0,
+            "payment_deadline": 0.0,
+            "registration_deadline": 100.0,
+            "correction_deadline": 0.0,
+            "applicant_action_deadline": -30.0,
+            "internal_procedure_deadline": -20.0,
+        }
+
+        correction_weights = {
+            "decision_deadline": 0.0,
+            "notification_deadline": 0.0,
+            "payment_deadline": -20.0,
+            "registration_deadline": 0.0,
+            "correction_deadline": 100.0,
+            "applicant_action_deadline": -20.0,
+            "internal_procedure_deadline": -20.0,
+        }
+
+        by_kind = {
+            "decision": decision_weights,
+            "notification": notification_weights,
+            "payment": payment_weights,
+            "registration": registration_weights,
+            "correction": correction_weights,
+            None: generic_weights,
+        }
+
+        weights = by_kind.get(question_kind, generic_weights)
+        return weights.get(fact_type, 0.0)
+        
+    def _question_deadline_kind(
+        self,
+        question_text: str,
+    ) -> str | None:
+        text = self._clean(question_text).lower()
+
+        if any(x in text for x in ("выплат", "перечисл", "деньги", "26-го числа", "26 числа")):
+            return "payment"
+
+        if any(x in text for x in ("уведом", "сообщ", "извест", "когда ответят")):
+            return "notification"
+
+        if any(x in text for x in ("зарегистр", "регистрац")):
+            return "registration"
+
+        if any(x in text for x in ("опечат", "ошиб")):
+            return "correction"
+
+        if any(x in text for x in ("примут решение", "принятия решения", "когда примут", "срок предоставления")):
+            return "decision"
+
+        return None
+        
+    def _candidate_attr(
+        self,
+        candidate: Any,
+        name: str,
+        default: Any = None,
+    ) -> Any:
+        if isinstance(candidate, dict):
+            return candidate.get(name, default)
+        return getattr(candidate, name, default)
+
+    def _candidate_source_type(
+        self,
+        candidate: Any,
+    ) -> str | None:
+        return (
+            self._candidate_attr(candidate, "source_type")
+            or self._candidate_attr(candidate, "evidence_item_type")
+            or self._candidate_attr(candidate, "item_type")
+        )
+
+    def _candidate_payload(
+        self,
+        candidate: Any,
+    ) -> dict[str, Any]:
+        payload = (
+            self._candidate_attr(candidate, "payload_json")
+            or self._candidate_attr(candidate, "payload")
+            or {}
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    def _candidate_metadata_json(
+        self,
+        candidate: Any,
+    ) -> dict[str, Any]:
+        payload = self._candidate_payload(candidate)
+        metadata = (
+            self._candidate_attr(candidate, "metadata_json")
+            or payload.get("metadata_json")
+            or {}
+        )
+        return metadata if isinstance(metadata, dict) else {}
+
+    def _candidate_citation_json(
+        self,
+        candidate: Any,
+    ) -> dict[str, Any]:
+        payload = self._candidate_payload(candidate)
+        citation = (
+            self._candidate_attr(candidate, "citation_json")
+            or payload.get("citation_json")
+            or {}
+        )
+        return citation if isinstance(citation, dict) else {}
+
+    def _candidate_text(
+        self,
+        candidate: Any,
+    ) -> str:
+        payload = self._candidate_payload(candidate)
+        return (
+            self._candidate_attr(candidate, "content_text")
+            or self._candidate_attr(candidate, "text")
+            or payload.get("validity_note")
+            or ""
+        )
+
+    def _candidate_score(
+        self,
+        candidate: Any,
+    ) -> float:
+        raw = (
+            self._candidate_attr(candidate, "effective_score")
+            or self._candidate_attr(candidate, "score")
+            or self._candidate_attr(candidate, "source_score")
+            or 0.0
+        )
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return 0.0
 
     def render_text(
         self,
@@ -489,70 +838,101 @@ class TableDeadlinesAnswerBuilder:
         self,
         items: list[DeadlineAnswerItem],
     ) -> tuple[list[DeadlineAnswerItem], list[dict[str, Any]]]:
-        groups: dict[tuple[str, str, str], list[DeadlineAnswerItem]] = {}
+        merged: dict[tuple[str, str], DeadlineAnswerItem] = {}
+        debug: list[dict[str, Any]] = []
+
         for item in items:
-            key = (
-                self._normalize(item.deadline_value),
-                self._normalize(item.scope_text),
-                item.deadline_kind,
-            )
-            groups.setdefault(key, []).append(item)
+            normalized_value = self._normalize(item.deadline_value)
+            normalized_scope = self._normalize(item.scope_text)
 
-        merged_items: list[DeadlineAnswerItem] = []
-        merged_items_debug: list[dict[str, Any]] = []
+            # Мержим по deadline_value + scope_text.
+            # Если scope пустой, всё равно не теряем item.
+            merge_key = (normalized_value, normalized_scope)
 
-        for _, group_items in groups.items():
-            best_item = sorted(
-                group_items,
-                key=lambda item: (
-                    -self._best_score(item),
-                    -item.kind_confidence,
-                    -self._deadline_specificity_score(item.deadline_value),
-                    len(item.scope_text or ""),
-                ),
-            )[0]
-
-            row_ids: list[str] = []
-            block_ids: list[str] = []
-            table_types: list[str] = []
-            scores: list[float] = []
-            for item in group_items:
-                for row_id in item.source_row_ids:
-                    if row_id and row_id not in row_ids:
-                        row_ids.append(row_id)
-                for block_id in item.source_block_ids:
-                    if block_id and block_id not in block_ids:
-                        block_ids.append(block_id)
-                for table_type in item.source_table_types:
-                    if table_type and table_type not in table_types:
-                        table_types.append(table_type)
-                scores.extend(item.source_scores)
-
-            merged_item = DeadlineAnswerItem(
-                deadline_value=best_item.deadline_value,
-                scope_text=best_item.scope_text,
-                deadline_kind=best_item.deadline_kind,
-                kind_confidence=max((item.kind_confidence for item in group_items), default=0.0),
-                source_row_ids=row_ids,
-                source_block_ids=block_ids,
-                source_table_types=table_types,
-                source_scores=sorted(scores, reverse=True),
-            )
-            merged_items.append(merged_item)
-
-            if len(group_items) > 1:
-                merged_items_debug.append(
+            existing = merged.get(merge_key)
+            if existing is None:
+                merged[merge_key] = DeadlineAnswerItem(
+                    deadline_value=item.deadline_value,
+                    scope_text=item.scope_text,
+                    source_type=item.source_type,
+                    citation_json=item.citation_json or {},
+                    fact_type=item.fact_type,
+                    is_service_core_deadline=item.is_service_core_deadline,
+                    candidate_score=item.candidate_score,
+                    table_title=item.table_title,
+                    table_number=item.table_number,
+                )
+                debug.append(
                     {
-                        "merged_deadline_value": merged_item.deadline_value,
-                        "merged_scope_text": merged_item.scope_text,
-                        "deadline_kind": merged_item.deadline_kind,
-                        "source_row_ids": row_ids,
-                        "source_block_ids": block_ids,
-                        "source_items_count": len(group_items),
+                        "action": "create",
+                        "merge_key": merge_key,
+                        "deadline_value": item.deadline_value,
+                        "scope_text": item.scope_text,
+                        "source_type": item.source_type,
+                        "fact_type": item.fact_type,
+                        "is_service_core_deadline": item.is_service_core_deadline,
+                        "candidate_score": item.candidate_score,
                     }
                 )
+                continue
 
-        return merged_items, merged_items_debug
+            # 1. Сохраняем максимальный score.
+            existing.candidate_score = max(existing.candidate_score, item.candidate_score)
+
+            # 2. Если любой из item core -> merged тоже core.
+            existing.is_service_core_deadline = (
+                existing.is_service_core_deadline or item.is_service_core_deadline
+            )
+
+            # 3. legal_fact приоритетнее table_row.
+            if existing.source_type != "legal_fact" and item.source_type == "legal_fact":
+                existing.source_type = "legal_fact"
+                existing.fact_type = item.fact_type or existing.fact_type
+                if item.citation_json:
+                    existing.citation_json = item.citation_json
+                if item.scope_text and (
+                    not existing.scope_text
+                    or len(item.scope_text) > len(existing.scope_text)
+                ):
+                    existing.scope_text = item.scope_text
+
+            # 4. Если fact_type ещё пустой — дозаполняем.
+            if not existing.fact_type and item.fact_type:
+                existing.fact_type = item.fact_type
+
+            # 5. Берём более содержательный scope_text.
+            if item.scope_text and (
+                not existing.scope_text
+                or len(self._clean(item.scope_text)) > len(self._clean(existing.scope_text))
+            ):
+                existing.scope_text = item.scope_text
+
+            # 6. Если у existing нет citation_json — дозаполняем.
+            if not existing.citation_json and item.citation_json:
+                existing.citation_json = item.citation_json
+
+            # 7. Если table metadata пустые — дозаполняем.
+            if not existing.table_title and item.table_title:
+                existing.table_title = item.table_title
+            if not existing.table_number and item.table_number:
+                existing.table_number = item.table_number
+
+            debug.append(
+                {
+                    "action": "merge",
+                    "merge_key": merge_key,
+                    "existing_source_type": existing.source_type,
+                    "incoming_source_type": item.source_type,
+                    "deadline_value": existing.deadline_value,
+                    "scope_text": existing.scope_text,
+                    "fact_type": existing.fact_type,
+                    "is_service_core_deadline": existing.is_service_core_deadline,
+                    "candidate_score": existing.candidate_score,
+                }
+            )
+
+        merged_items = list(merged.values())
+        return merged_items, debug
 
     def _primary_sort_key(
         self,
@@ -909,3 +1289,38 @@ class TableDeadlinesAnswerBuilder:
         if not cleaned:
             return ""
         return cleaned.lower().replace("ё", "е")
+        
+    def _table_row_is_service_core(
+        self,
+        scope_text: str,
+    ) -> bool:
+        text = self._clean(scope_text).lower()
+
+        if any(
+            marker in text
+            for marker in (
+                "предоставления государственной услуги",
+                "принятия решения",
+                "о принятом решении",
+                "уведомляется",
+                "выплата",
+                "не позднее 26-го числа",
+                "регистрация запроса",
+            )
+        ):
+            return True
+
+        if any(
+            marker in text
+            for marker in (
+                "межведомствен",
+                "опросн",
+                "обратн",
+                "доработк",
+                "представить лично",
+                "опечаток и ошибок",
+            )
+        ):
+            return False
+
+        return False
