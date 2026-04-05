@@ -23,71 +23,49 @@ class DeadlineAnswerItem:
 @dataclass(slots=True)
 class DeadlinesAnswerBuildResult:
     can_answer: bool
-    question_deadline_kind: str = "other"
-    primary_item: Optional[DeadlineAnswerItem] = None
+    question_deadline_kind: str
+
+    primary_item: DeadlineAnswerItem | None = None
     alternative_items: list[DeadlineAnswerItem] = field(default_factory=list)
+
     dropped_rows_debug: list[dict[str, Any]] = field(default_factory=list)
     merged_items_debug: list[dict[str, Any]] = field(default_factory=list)
-    ambiguity_reason: Optional[str] = None
-    reason: Optional[str] = None
 
-    @property
-    def all_items(self) -> list[DeadlineAnswerItem]:
-        items: list[DeadlineAnswerItem] = []
-        if self.primary_item is not None:
-            items.append(self.primary_item)
-        items.extend(self.alternative_items)
-        return items
+    ambiguity_reason: str | None = None
+    reason: str | None = None
 
     def debug_payload(self) -> dict[str, Any]:
         return {
             "can_answer": self.can_answer,
             "question_deadline_kind": self.question_deadline_kind,
-            "primary_item": (
-                {
-                    "deadline_value": self.primary_item.deadline_value,
-                    "scope_text": self.primary_item.scope_text,
-                    "deadline_kind": self.primary_item.deadline_kind,
-                    "kind_confidence": self.primary_item.kind_confidence,
-                    "source_row_ids": self.primary_item.source_row_ids,
-                    "source_block_ids": self.primary_item.source_block_ids,
-                    "source_table_types": self.primary_item.source_table_types,
-                    "source_scores": self.primary_item.source_scores,
-                }
-                if self.primary_item is not None
-                else None
-            ),
-            "alternative_items_count": len(self.alternative_items),
-            "items": [
-                {
-                    "deadline_value": item.deadline_value,
-                    "scope_text": item.scope_text,
-                    "deadline_kind": item.deadline_kind,
-                    "kind_confidence": item.kind_confidence,
-                    "source_row_ids": item.source_row_ids,
-                    "source_block_ids": item.source_block_ids,
-                    "source_table_types": item.source_table_types,
-                    "source_scores": item.source_scores,
-                }
-                for item in self.all_items
-            ],
-            "merged_items": self.merged_items_debug,
-            "dropped_rows": self.dropped_rows_debug,
-            "ambiguity_reason": self.ambiguity_reason,
             "reason": self.reason,
-            "raw_items_count": len(raw_items),
-            "merged_items_count": len(merged_items),
-            "ranked_items_preview": [
-                {
-                    "deadline_value": item.deadline_value,
-                    "scope_text": item.scope_text,
-                    "source_type": item.source_type,
-                    "fact_type": item.fact_type,
-                    "is_service_core_deadline": item.is_service_core_deadline,
-                    "rank_score": self._rank_item(item=item, question_text=question_text),
-                }
-                for item in ranked_items[:10]
+            "ambiguity_reason": self.ambiguity_reason,
+            "primary_item": self._item_to_debug_dict(self.primary_item),
+            "alternative_items": [
+                self._item_to_debug_dict(item)
+                for item in self.alternative_items
             ],
+            "dropped_rows_debug": self.dropped_rows_debug,
+            "merged_items_debug": self.merged_items_debug,
+        }
+
+    def _item_to_debug_dict(
+        self,
+        item: DeadlineAnswerItem | None,
+    ) -> dict[str, Any] | None:
+        if item is None:
+            return None
+
+        return {
+            "deadline_value": item.deadline_value,
+            "scope_text": item.scope_text,
+            "source_type": item.source_type,
+            "fact_type": item.fact_type,
+            "is_service_core_deadline": item.is_service_core_deadline,
+            "candidate_score": item.candidate_score,
+            "table_title": item.table_title,
+            "table_number": item.table_number,
+            "citation_json": item.citation_json,
         }
 
 
@@ -264,16 +242,31 @@ class TableDeadlinesAnswerBuilder:
                 question_deadline_kind=question_deadline_kind or "other",
                 reason="no_deadline_items",
                 dropped_rows_debug=dropped_rows_debug,
+                merged_items_debug=[
+                    {
+                        "raw_items_count": 0,
+                        "merged_items_count": 0,
+                        "ranked_items_preview": [],
+                    }
+                ],
             )
 
-        merged_items, merged_items_debug = self._merge_similar_items(raw_items)
+        merged_items, merge_debug = self._merge_similar_items(raw_items)
+
         if not merged_items:
             return DeadlinesAnswerBuildResult(
                 can_answer=False,
                 question_deadline_kind=question_deadline_kind or "other",
                 reason="no_merged_deadline_items",
                 dropped_rows_debug=dropped_rows_debug,
-                merged_items_debug=merged_items_debug,
+                merged_items_debug=[
+                    *merge_debug,
+                    {
+                        "raw_items_count": len(raw_items),
+                        "merged_items_count": 0,
+                        "ranked_items_preview": [],
+                    },
+                ],
             )
 
         ranked_items = sorted(
@@ -288,21 +281,21 @@ class TableDeadlinesAnswerBuilder:
         primary_item = ranked_items[0]
         alternative_items = ranked_items[1:]
 
-        ambiguity_reason: Optional[str] = None
+        ambiguity_reason: str | None = None
         if alternative_items and any(
             self._normalize(item.deadline_value) != self._normalize(primary_item.deadline_value)
             for item in alternative_items
         ):
             ambiguity_reason = "multiple_distinct_deadlines"
 
-        result = DeadlinesAnswerBuildResult(
+        return DeadlinesAnswerBuildResult(
             can_answer=True,
             question_deadline_kind=question_deadline_kind or "other",
             primary_item=primary_item,
             alternative_items=alternative_items,
             dropped_rows_debug=dropped_rows_debug,
             merged_items_debug=[
-                *merged_items_debug,
+                *merge_debug,
                 {
                     "raw_items_count": len(raw_items),
                     "merged_items_count": len(merged_items),
@@ -326,7 +319,6 @@ class TableDeadlinesAnswerBuilder:
             ambiguity_reason=ambiguity_reason,
             reason=None,
         )
-        return result
         
     def _build_item_from_candidate(
         self,
