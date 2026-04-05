@@ -31,6 +31,11 @@ from uuid import UUID
 from sqlalchemy import and_, case, desc, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config.measure_registry import (
+    detect_primary_measure_code,
+    get_measure_search_terms,
+)
+
 from app.db.models.documents import (
     DocumentBlock,
     DocumentRegistry,
@@ -490,7 +495,9 @@ class RetrievalOrchestrator:
         if payload.intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
             question_deadline_kind = self._detect_deadline_question_kind(normalized_text)
 
-        question_measure_family = self._detect_measure_family(normalized_text)
+        question_measure_family = self._detect_measure_family(
+            payload.measure_code or normalized_text
+        )
 
         requested_column_hints = self._build_requested_column_hints(
             table_question_profile=table_question_profile,
@@ -551,18 +558,12 @@ class RetrievalOrchestrator:
         base_tokens = self._extract_meaningful_terms(question_text)
         terms.extend(base_tokens)
 
-        if measure_code:
-            terms.append(self._normalize_text(measure_code))
-
-        if "едв" in question_text:
-            terms.extend(
-                [
-                    "едв",
-                    "ежемесячной денежной выплаты",
-                    "ежемесячная денежная выплата",
-                    "денежной выплаты",
-                ]
-            )
+        resolved_measure_code = self._normalize_text(
+            measure_code or self._detect_measure_family(question_text) or ""
+        )
+        if resolved_measure_code:
+            terms.append(resolved_measure_code)
+            terms.extend(get_measure_search_terms(resolved_measure_code))
 
         if intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
             # Важное правило: не загрязняем payment/notification запросы

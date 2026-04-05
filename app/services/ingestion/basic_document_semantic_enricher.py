@@ -3,6 +3,10 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.config.measure_registry import (
+    build_measure_alias_records,
+    detect_measure_codes as detect_registered_measure_codes,
+)
 from app.services.ingestion.document_ingestion_pipeline import (
     ExtractionResult,
     SemanticEnrichmentInput,
@@ -106,34 +110,14 @@ class BasicDocumentSemanticEnricher:
         return "normative_document"
 
     def _detect_measure_codes(self, haystack: str) -> list[str]:
-        codes: list[str] = []
-
-        if re.search(
-            r"\bедв\b|ежемесячн\w*\s+денежн\w*\s+выплат",
-            haystack,
-            flags=re.IGNORECASE,
-        ):
-            codes.append("edv")
-
-        return codes
+        return detect_registered_measure_codes(haystack)
 
     def _build_aliases(self, measure_codes: list[str]) -> list[dict[str, Any]]:
-        aliases: list[dict[str, Any]] = []
-
-        if "edv" in measure_codes:
-            aliases.append(
-                {
-                    "alias": "ЕДВ",
-                    "measure_code": "edv",
-                    "canonical_name": "Ежемесячная денежная выплата",
-                    "metadata_json": {
-                        "source": "deterministic_enricher",
-                        "temporary": True,
-                    },
-                }
-            )
-
-        return aliases
+        return build_measure_alias_records(
+            measure_codes,
+            source="deterministic_enricher",
+            temporary=True,
+        )
         
     def _extract_deadline_facts(
         self,

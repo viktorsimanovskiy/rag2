@@ -11,40 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from app.config.measure_registry import detect_primary_measure_code
 from app.config.settings import load_settings
 from app.db.models.enums import QuestionIntentEnum
 from app.runtime.app_runtime import AppRuntime, AppRuntimeConfig
 from app.services.answers.runtime_answer_service import RuntimeAnswerInput
-
-
-_MEASURE_ALIAS_MAP: dict[str, tuple[str, ...]] = {
-    "edv": (
-        " едв ",
-        "ежемесячной денежной выплаты",
-        "ежемесячная денежная выплата",
-    ),
-    "subsidy": (
-        "субсид",
-        "оплату жилого помещения",
-        "коммунальных услуг",
-    ),
-    "social_contract": (
-        "соцконтракт",
-        "социального контракта",
-        "социальный контракт",
-    ),
-    "hardship": (
-        " тжс ",
-        "трудной жизненной ситуации",
-        "адресной материальной помощи",
-    ),
-    "sanatorium": (
-        "санкур",
-        "санаторно-курорт",
-        "бесплатных путевок",
-        "путевок на санаторно-курортное лечение",
-    ),
-}
 
 
 def _parse_intent(value: str) -> QuestionIntentEnum:
@@ -144,19 +115,6 @@ def _collect_questions(
     return result
 
 
-def _infer_measure_code(question_text: str) -> str | None:
-    normalized = " ".join((question_text or "").strip().lower().split())
-    if not normalized:
-        return None
-
-    padded = f" {normalized} "
-    for measure_code, aliases in _MEASURE_ALIAS_MAP.items():
-        if any(alias in padded or alias in normalized for alias in aliases):
-            return measure_code
-
-    return None
-
-
 def _resolve_measure_code_for_question(
     *,
     question_text: str,
@@ -164,7 +122,7 @@ def _resolve_measure_code_for_question(
 ) -> str | None:
     if explicit_measure_code:
         return explicit_measure_code.strip().lower() or None
-    return _infer_measure_code(question_text)
+    return detect_primary_measure_code(question_text)
 
 
 def _result_to_debug_dict(result: object) -> dict:
@@ -321,8 +279,8 @@ def main() -> int:
         "--measure-code",
         required=False,
         help=(
-            "Explicit measure code override for all questions in the batch. "
-            "If omitted, the script will try to infer it from question text."
+            "Явный код меры для всей пачки вопросов. "
+            "Если не задан, скрипт попробует определить его по тексту вопроса."
         ),
     )
     args = parser.parse_args()
