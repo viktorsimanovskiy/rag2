@@ -612,6 +612,27 @@ class RetrievalOrchestrator:
                         "26 числа",
                     ]
                 )
+            elif question_deadline_kind == "registration":
+                terms.extend(
+                    [
+                        "срок регистрации заявления",
+                        "срок регистрации запроса",
+                        "регистрация заявления",
+                        "регистрация запроса",
+                        "регистрируется",
+                        "первый рабочий день",
+                    ]
+                )
+            elif question_deadline_kind == "correction":
+                terms.extend(
+                    [
+                        "срок исправления ошибок",
+                        "срок исправления опечаток",
+                        "исправление ошибок",
+                        "опечаток и ошибок",
+                        "нового документа",
+                    ]
+                )
             else:
                 terms.extend(
                     [
@@ -848,6 +869,21 @@ class RetrievalOrchestrator:
                 "перечисление",
                 "зачисление",
             ],
+            "registration": [
+                "срок регистрации заявления",
+                "срок регистрации запроса",
+                "регистрация заявления",
+                "регистрация запроса",
+                "регистрируется",
+                "первый рабочий день",
+            ],
+            "correction": [
+                "срок исправления ошибок",
+                "срок исправления опечаток",
+                "исправление ошибок",
+                "исправление опечаток",
+                "опечаток и ошибок",
+            ],
         }
 
         priority = kind_priority_map.get(question_deadline_kind or "other", []) + common_priority
@@ -1083,6 +1119,23 @@ class RetrievalOrchestrator:
                         "срок выплаты",
                         "выплата",
                         "не позднее 26-го числа",
+                    ]
+                )
+            elif question_deadline_kind == "registration":
+                hints.extend(
+                    [
+                        "срок регистрации заявления",
+                        "срок регистрации запроса",
+                        "регистрация заявления",
+                        "регистрация запроса",
+                    ]
+                )
+            elif question_deadline_kind == "correction":
+                hints.extend(
+                    [
+                        "срок исправления ошибок",
+                        "срок исправления опечаток",
+                        "опечаток и ошибок",
                     ]
                 )
             else:
@@ -1686,7 +1739,20 @@ class RetrievalOrchestrator:
             )
         elif intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
             score = score + case(
-                (LegalFact.fact_type.in_(["deadline", "review_period", "payment_deadline"]), 0.9),
+                (
+                    LegalFact.fact_type.in_(
+                        [
+                            "deadline",
+                            "review_period",
+                            "decision_deadline",
+                            "notification_deadline",
+                            "payment_deadline",
+                            "registration_deadline",
+                            "correction_deadline",
+                        ]
+                    ),
+                    0.9,
+                ),
                 else_=0.0,
             )
         elif intent_type == QuestionIntentEnum.REJECTION_QUESTION:
@@ -2711,9 +2777,24 @@ class RetrievalOrchestrator:
                 has_deadline_value = isinstance(cells, dict) and bool(cells.get("deadline_value"))
                 has_temporal_markers = self._has_temporal_deadline_markers(candidate)
                 candidate_kind = self._classify_deadline_candidate_kind(candidate)
+                legal_fact_type = self._normalize_text(candidate.title if candidate.source_type == "legal_fact" else "")
+                is_service_core_deadline = bool(metadata.get("is_service_core_deadline"))
 
                 if self._is_deadline_noise_candidate(candidate):
                     score -= 1.20
+                    
+                if candidate.source_type == "legal_fact":
+                    score += 0.38
+                    if is_service_core_deadline:
+                        score += 0.28
+                    if legal_fact_type in {
+                        "decision_deadline",
+                        "notification_deadline",
+                        "payment_deadline",
+                        "registration_deadline",
+                        "correction_deadline",
+                    }:
+                        score += 0.18
 
                 if self._has_table_semantic_type(candidate, "deadlines") or self._has_table_semantic_type(candidate, "deadline"):
                     if candidate.source_type == "table_row":
@@ -2827,20 +2908,41 @@ class RetrievalOrchestrator:
             "зачисления",
             "зачисление",
         ]
+        registration_markers = [
+            "регистрации заявления",
+            "регистрация заявления",
+            "регистрации запроса",
+            "регистрация запроса",
+            "зарегистрируют",
+            "зарегистрируют заявление",
+            "зарегистрируют запрос",
+        ]
+        correction_markers = [
+            "исправления ошибок",
+            "исправления опечаток",
+            "опечаток и ошибок",
+            "исправят ошибки",
+            "исправят опечатки",
+        ]
         decision_markers = [
             "принятия решения",
             "принятие решения",
             "рассмотрения заявления",
             "рассмотрение заявления",
-            "регистрации заявления",
             "назначении",
             "назначение",
+            "срок предоставления государственной услуги",
+            "срок предоставления",
         ]
 
         if any(marker in text for marker in notification_markers):
             return "notification"
         if any(marker in text for marker in payment_markers):
             return "payment"
+        if any(marker in text for marker in registration_markers):
+            return "registration"
+        if any(marker in text for marker in correction_markers):
+            return "correction"
         if any(marker in text for marker in decision_markers):
             return "decision"
         return "other"
@@ -2874,6 +2976,22 @@ class RetrievalOrchestrator:
             "26-го числа",
             "26 числа",
         ]
+        registration_markers = [
+            "регистрации заявления",
+            "регистрация заявления",
+            "регистрации запроса",
+            "регистрация запроса",
+            "регистрируется",
+            "первый рабочий день",
+            "со дня их поступления",
+        ]
+        correction_markers = [
+            "исправления ошибок",
+            "исправления опечаток",
+            "опечаток и ошибок",
+            "нового документа",
+            "уведомления об отсутствии ошибок",
+        ]
         decision_markers = [
             "принятия решения",
             "принятие решения",
@@ -2881,18 +2999,31 @@ class RetrievalOrchestrator:
             "решение о назначении",
             "рассмотрения заявления",
             "рассмотрение заявления",
-            "регистрации заявления",
             "назначении",
             "назначение",
+            "срок предоставления государственной услуги",
+            "срок предоставления",
         ]
 
-        scores = {"decision": 0, "notification": 0, "payment": 0}
+        scores = {
+            "decision": 0,
+            "notification": 0,
+            "payment": 0,
+            "registration": 0,
+            "correction": 0,
+        }
         for marker in notification_markers:
             if marker in text:
                 scores["notification"] += 1
         for marker in payment_markers:
             if marker in text:
                 scores["payment"] += 1
+        for marker in registration_markers:
+            if marker in text:
+                scores["registration"] += 1
+        for marker in correction_markers:
+            if marker in text:
+                scores["correction"] += 1
         for marker in decision_markers:
             if marker in text:
                 scores["decision"] += 1
