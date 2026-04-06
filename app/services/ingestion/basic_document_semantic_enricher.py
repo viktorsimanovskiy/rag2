@@ -337,9 +337,39 @@ class BasicDocumentSemanticEnricher:
         if self._is_applicant_action_deadline(haystack):
             return "applicant_action_deadline"
 
-        # 5. Срок принятия решения должен идти РАНЬШЕ notification,
-        # иначе фразы вроде "принимает решение ... и уведомляет" уезжают не туда.
-        if any(
+        # 5. Сначала ловим ЯВНОЕ уведомление заявителя.
+        # Это нужно, чтобы фразы вида
+        # "направляет уведомление ... в течение 2 рабочих дней со дня принятия решения"
+        # не уезжали в decision_deadline только из-за слов "принятия решения".
+        explicit_notification_markers = (
+            "уведомляется",
+            "уведомление направляется",
+            "направляется заявителю",
+            "извещает заявителя",
+            "о принятом решении заявитель",
+            "направляет уведомление",
+            "уведомление о назначении",
+            "уведомление о предоставлении",
+            "уведомление об отказе",
+        )
+        has_explicit_notification = any(
+            marker in haystack for marker in explicit_notification_markers
+        )
+
+        notification_deadline_markers = (
+            "в течение 2 рабочих дней со дня принятия решения",
+            "в течение двух рабочих дней со дня принятия решения",
+            "в течение 2 рабочих дней",
+            "в течение двух рабочих дней",
+        )
+
+        if has_explicit_notification and any(
+            marker in haystack for marker in notification_deadline_markers
+        ):
+            return "notification_deadline"
+
+        # 6. Срок принятия решения.
+        has_decision_markers = any(
             marker in haystack
             for marker in (
                 "принимает решение",
@@ -355,40 +385,28 @@ class BasicDocumentSemanticEnricher:
                 "срок предоставления государственной услуги не должен превышать",
                 "принятие решения",
             )
-        ):
+        )
+
+        if has_decision_markers and not has_explicit_notification:
             return "decision_deadline"
 
-        # 6. Уведомление заявителя — отдельный тип.
-        if any(
-            marker in haystack
-            for marker in (
-                "уведомляется",
-                "уведомление направляется",
-                "направляется заявителю",
-                "извещает заявителя",
-                "о принятом решении заявитель",
-                "о готовности нового документа",
-            )
-        ):
+        # 7. Уведомление заявителя — отдельный тип.
+        if has_explicit_notification:
             return "notification_deadline"
 
-        # 7. Внутренние procedural deadlines.
+        # 8. Внутренние procedural deadlines.
         if any(
             marker in haystack
             for marker in (
-                "межведомствен",
-                "направляет межведомственный запрос",
-                "направляет ее в министерство",
-                "передаются руководителю",
-                "передается руководителю",
-                "направляет представленный запрос",
-                "направляет представленные документы",
-                "в течение 3 рабочих дней со дня получения",
-                "в течение 1 рабочего дня со дня регистрации документов",
+                "в течение 3 рабочих дней направляет",
+                "в течение 1 рабочего дня со дня регистрации",
+                "в течение одного рабочего дня со дня регистрации",
+                "в течение 3 дней со дня завершения проведения такой проверки",
             )
         ):
             return "internal_procedure_deadline"
 
+        # 9. Фоллбэк по hint.
         if hint == "payment":
             return "payment_deadline"
         if hint == "notification":
