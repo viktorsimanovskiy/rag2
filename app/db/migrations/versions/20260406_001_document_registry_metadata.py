@@ -5,7 +5,7 @@ import sqlalchemy as sa
 
 
 # Revision identifiers, used by Alembic.
-revision = "20260406_001_document_registry_metadata"
+revision = "docregmeta_20260406"
 down_revision = "20260310_001_seed_channels"
 branch_labels = None
 depends_on = None
