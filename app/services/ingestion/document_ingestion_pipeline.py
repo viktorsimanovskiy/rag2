@@ -178,6 +178,12 @@ class ExtractionResult:
     doc_uid_base: Optional[str]
     revision_date: Optional[datetime]
 
+    document_number: Optional[str] = None
+    document_date: Optional[datetime] = None
+    service_name_full: Optional[str] = None
+    service_name_short: Optional[str] = None
+    primary_measure_code: Optional[str] = None
+
     blocks: list[dict[str, Any]] = field(default_factory=list)
     tables: list[dict[str, Any]] = field(default_factory=list)
     table_rows: list[dict[str, Any]] = field(default_factory=list)
@@ -475,6 +481,12 @@ class DocumentIngestionPipeline:
                     "qc_metrics_json": qc_result.metrics_json,
                     "document_title": extraction_result.document_title,
                     "doc_uid_base": extraction_result.doc_uid_base,
+                    "document_number": extraction_result.document_number,
+                    "document_date": extraction_result.document_date,
+                    "revision_date": extraction_result.revision_date,
+                    "service_name_full": extraction_result.service_name_full,
+                    "service_name_short": extraction_result.service_name_short,
+                    "primary_measure_code": extraction_result.primary_measure_code,
                 },
             )
 

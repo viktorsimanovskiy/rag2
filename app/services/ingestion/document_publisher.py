@@ -82,6 +82,12 @@ class ExtractionResult:
     doc_uid_base: Optional[str]
     revision_date: Optional[datetime]
 
+    document_number: Optional[str] = None
+    document_date: Optional[datetime] = None
+    service_name_full: Optional[str] = None
+    service_name_short: Optional[str] = None
+    primary_measure_code: Optional[str] = None
+
     blocks: list[dict[str, Any]] = field(default_factory=list)
     tables: list[dict[str, Any]] = field(default_factory=list)
     table_rows: list[dict[str, Any]] = field(default_factory=list)
@@ -384,6 +390,19 @@ class DocumentPublisher:
             doc_uid_base=payload.extraction_result.doc_uid_base,
             revision_date=payload.extraction_result.revision_date,
 
+            document_number=payload.extraction_result.document_number,
+            document_date=payload.extraction_result.document_date,
+            service_name_full=payload.extraction_result.service_name_full,
+            service_name_short=payload.extraction_result.service_name_short,
+            primary_measure_code=(
+                payload.extraction_result.primary_measure_code
+                or (
+                    payload.enrichment_result.measure_codes[0]
+                    if payload.enrichment_result.measure_codes
+                    else None
+                )
+            ),
+
             document_name=payload.extraction_result.document_title,
             document_type=payload.enrichment_result.document_type,
             source_type=payload.input_payload.source_type,
@@ -412,6 +431,22 @@ class DocumentPublisher:
                 "warnings": payload.qc_result.warnings,
                 "input_metadata": payload.input_payload.metadata_json,
                 "uploaded_by": payload.input_payload.uploaded_by,
+                "extracted_document_metadata": {
+                    "document_number": payload.extraction_result.document_number,
+                    "document_date": (
+                        payload.extraction_result.document_date.isoformat()
+                        if payload.extraction_result.document_date is not None
+                        else None
+                    ),
+                    "revision_date": (
+                        payload.extraction_result.revision_date.isoformat()
+                        if payload.extraction_result.revision_date is not None
+                        else None
+                    ),
+                    "service_name_full": payload.extraction_result.service_name_full,
+                    "service_name_short": payload.extraction_result.service_name_short,
+                    "primary_measure_code": payload.extraction_result.primary_measure_code,
+                },
             },
 
             created_at=self._utcnow(),

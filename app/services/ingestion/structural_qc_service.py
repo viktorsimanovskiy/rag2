@@ -41,6 +41,12 @@ class ExtractionResult:
     doc_uid_base: Optional[str]
     revision_date: Optional[Any]
 
+    document_number: Optional[str] = None
+    document_date: Optional[Any] = None
+    service_name_full: Optional[str] = None
+    service_name_short: Optional[str] = None
+    primary_measure_code: Optional[str] = None
+
     blocks: list[dict[str, Any]] = field(default_factory=list)
     tables: list[dict[str, Any]] = field(default_factory=list)
     table_rows: list[dict[str, Any]] = field(default_factory=list)
@@ -224,6 +230,11 @@ class StructuralQcService:
             "document_title_present": bool((payload.extraction_result.document_title or "").strip()),
             "doc_uid_base_present": bool((payload.extraction_result.doc_uid_base or "").strip()),
             "revision_date_present": payload.extraction_result.revision_date is not None,
+            "document_number_present": bool((payload.extraction_result.document_number or "").strip()),
+            "document_date_present": payload.extraction_result.document_date is not None,
+            "service_name_full_present": bool((payload.extraction_result.service_name_full or "").strip()),
+            "service_name_short_present": bool((payload.extraction_result.service_name_short or "").strip()),
+            "primary_measure_code_present": bool((payload.extraction_result.primary_measure_code or "").strip()),
         }
 
     # ---------------------------------------------------------
@@ -259,6 +270,8 @@ class StructuralQcService:
     ) -> None:
         title_present = bool((payload.extraction_result.document_title or "").strip())
         uid_present = bool((payload.extraction_result.doc_uid_base or "").strip())
+        document_number_present = bool((payload.extraction_result.document_number or "").strip())
+        service_name_full_present = bool((payload.extraction_result.service_name_full or "").strip())
 
         if self.config.require_title_or_uid and not (title_present or uid_present):
             errors.append("document_identity_missing")
@@ -271,6 +284,18 @@ class StructuralQcService:
 
         if payload.extraction_result.revision_date is None:
             warnings.append("revision_date_missing")
+
+        if not document_number_present:
+            warnings.append("document_number_missing")
+
+        if payload.extraction_result.document_date is None:
+            warnings.append("document_date_missing")
+
+        if not service_name_full_present:
+            warnings.append("service_name_full_missing")
+
+        if not (payload.extraction_result.primary_measure_code or "").strip():
+            warnings.append("primary_measure_code_missing")
 
     # ---------------------------------------------------------
     # Blocks checks

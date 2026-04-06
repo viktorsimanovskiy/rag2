@@ -20,6 +20,11 @@ from app.services.ingestion.document_ingestion_pipeline import (
     ExtractionResult,
 )
 
+from app.config.measure_registry import (
+    detect_primary_measure_code,
+    get_measure_definition,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -211,7 +216,6 @@ class DocxStructureExtractor:
                     paragraph_context=list(paragraph_context),
                 )
 
-                # Skip blank/template tables that do not produce any meaningful rows.
                 if not row_payloads:
                     skipped_blank_tables_count += 1
                     logger.info(
@@ -239,15 +243,45 @@ class DocxStructureExtractor:
             original_filename=payload.original_filename,
             blocks=blocks,
         )
+
+        document_number, document_date = self._extract_document_date_and_number(
+            original_filename=payload.original_filename,
+            blocks=blocks,
+        )
+
+        service_name_full = self._detect_service_name_full(
+            blocks=blocks,
+        )
+
+        primary_measure_code = detect_primary_measure_code(
+            service_name_full
+            or document_title
+            or payload.normalized_text[:4000]
+        )
+
+        measure_definition = get_measure_definition(primary_measure_code)
+        service_name_short = None
+        if measure_definition is not None:
+            service_name_short = (
+                measure_definition.aliases[0]
+                if measure_definition.aliases
+                else measure_definition.canonical_name
+            )
+
         revision_date = self._detect_revision_date(
             original_filename=payload.original_filename,
             blocks=blocks,
             normalized_text=payload.normalized_text,
+            document_date=document_date,
         )
+
         doc_uid_base = self._detect_doc_uid_base(
             original_filename=payload.original_filename,
             document_title=document_title,
             normalized_text=payload.normalized_text,
+            service_name_full=service_name_full,
+            document_number=document_number,
+            document_date=document_date,
         )
 
         extraction_payload_json = {
@@ -259,6 +293,20 @@ class DocxStructureExtractor:
             "table_rows_count": len(table_rows),
             "meaningful_paragraph_count": meaningful_paragraph_count,
             "source_format": "docx",
+            "document_number": document_number,
+            "document_date": (
+                document_date.isoformat()
+                if document_date is not None
+                else None
+            ),
+            "revision_date": (
+                revision_date.isoformat()
+                if revision_date is not None
+                else None
+            ),
+            "service_name_full": service_name_full,
+            "service_name_short": service_name_short,
+            "primary_measure_code": primary_measure_code,
         }
 
         logger.info(
@@ -269,6 +317,7 @@ class DocxStructureExtractor:
                 "tables_count": len(tables),
                 "table_rows_count": len(table_rows),
                 "doc_uid_base": doc_uid_base,
+                "primary_measure_code": primary_measure_code,
             },
         )
 
@@ -276,6 +325,11 @@ class DocxStructureExtractor:
             document_title=document_title,
             doc_uid_base=doc_uid_base,
             revision_date=revision_date,
+            document_number=document_number,
+            document_date=document_date,
+            service_name_full=service_name_full,
+            service_name_short=service_name_short,
+            primary_measure_code=primary_measure_code,
             blocks=blocks,
             tables=tables,
             table_rows=table_rows,
@@ -1555,42 +1609,188 @@ class DocxStructureExtractor:
 
         return False
 
+    def _collect_leading_texts(
+        self,
+        blocks: list[dict[str, Any]],
+        *,
+        limit: int = 120,
+    ) -> list[str]:
+        return [
+            self._clean_text(str(block.get("content_clean") or ""))
+            for block in blocks[:limit]
+            if self._is_meaningful_text(block.get("content_clean"))
+        ]
+
+    def _extract_document_number(
+        self,
+        text: str,
+    ) -> Optional[str]:
+        clean_text = self._clean_text(text)
+        if not clean_text:
+            return None
+
+        match = self._NUMBER_RE.search(clean_text)
+        if match is None:
+            return None
+
+        number = self._clean_text(match.group("number"))
+        number = number.replace(" ", "")
+        return number or None
+
+    def _extract_document_date_and_number(
+        self,
+        *,
+        original_filename: str,
+        blocks: list[dict[str, Any]],
+    ) -> tuple[Optional[str], Optional[datetime]]:
+        texts = [original_filename, *self._collect_leading_texts(blocks, limit=80)]
+
+        for text in texts[:25]:
+            clean_text = self._clean_text(text)
+            if not clean_text:
+                continue
+
+            dates = self._extract_candidate_dates(clean_text)
+            number = self._extract_document_number(clean_text)
+
+            lowered = clean_text.lower()
+            looks_like_header = (
+                ("приказ" in lowered)
+                or lowered.startswith("от ")
+                or ("№" in clean_text)
+                or (" N " in clean_text)
+                or (" N" in clean_text)
+            )
+
+            if looks_like_header and dates and number:
+                return number, dates[0]
+
+        for text in texts[:25]:
+            clean_text = self._clean_text(text)
+            if not clean_text:
+                continue
+
+            number = self._extract_document_number(clean_text)
+            if number:
+                dates = self._extract_candidate_dates(clean_text)
+                return number, (dates[0] if dates else None)
+
+        return None, None
+
+    def _strip_clause_prefix(
+        self,
+        text: str,
+    ) -> str:
+        clean_text = self._clean_text(text)
+        match = self._CLAUSE_RE.match(clean_text)
+        if match:
+            return self._clean_text(match.group("text"))
+        return clean_text
+
+    def _looks_like_service_name_candidate(
+        self,
+        text: str,
+    ) -> bool:
+        clean_text = self._clean_text(text)
+        lowered = clean_text.lower()
+
+        if len(clean_text) < 15 or len(clean_text) > 500:
+            return False
+
+        strong_markers = (
+            "предоставление",
+            "назначение",
+            "ежемесячной денежной выплаты",
+            "субсид",
+            "социального контракта",
+            "адресной материальной помощи",
+            "санаторно-курорт",
+            "бесплатных путевок",
+            "государственной социальной помощи",
+        )
+        return any(marker in lowered for marker in strong_markers)
+
+    def _detect_service_name_full(
+        self,
+        *,
+        blocks: list[dict[str, Any]],
+    ) -> Optional[str]:
+        anchor_seen = False
+
+        for block in blocks[:260]:
+            text = self._clean_text(str(block.get("content_clean") or ""))
+            if not text:
+                continue
+
+            lowered = text.lower()
+            block_type = self._clean_text(block.get("block_type") or "").lower()
+
+            if "наименование государственной услуги" in lowered:
+                anchor_seen = True
+                continue
+
+            if not anchor_seen:
+                continue
+
+            if block_type == "heading":
+                break
+
+            candidate = self._strip_clause_prefix(text).rstrip(" .;:")
+
+            if block.get("clause_number"):
+                if self._looks_like_service_name_candidate(candidate):
+                    return candidate
+
+            if self._looks_like_service_name_candidate(candidate):
+                return candidate
+
+        return None
+
     def _detect_revision_date(
         self,
         *,
         original_filename: str,
         blocks: list[dict[str, Any]],
         normalized_text: str,
+        document_date: Optional[datetime] = None,
     ) -> Optional[datetime]:
-        filename_dates = self._extract_candidate_dates(original_filename)
-        if filename_dates:
-            return filename_dates[0]
+        texts = self._collect_leading_texts(blocks, limit=120)
 
-        texts = [
-            self._clean_text(str(block.get("content_clean") or ""))
-            for block in blocks[:40]
-            if self._is_meaningful_text(block.get("content_clean"))
-        ]
+        for text in texts[:30]:
+            lowered = text.lower()
+            if "в ред." in lowered or "в ред " in lowered:
+                text_dates = self._extract_candidate_dates(text)
+                if text_dates:
+                    return text_dates[0]
 
-        for idx, text in enumerate(texts[:12]):
-            if text.lower() == "приказ":
-                for nearby in texts[idx + 1 : idx + 4]:
+        for idx, text in enumerate(texts[:40]):
+            lowered = text.lower()
+            if "список изменяющих документов" not in lowered:
+                continue
+
+            for nearby in texts[idx + 1 : idx + 5]:
+                nearby_lowered = nearby.lower()
+                if "в ред." in nearby_lowered or "в ред " in nearby_lowered:
                     nearby_dates = self._extract_candidate_dates(nearby)
                     if nearby_dates:
                         return nearby_dates[0]
 
-        for text in texts[:8]:
+        if document_date is not None:
+            return document_date
+
+        for text in texts[:12]:
             if self._looks_like_order_date_line(text):
                 text_dates = self._extract_candidate_dates(text)
                 if text_dates:
                     return text_dates[0]
 
-        for text in texts[:8]:
-            text_dates = self._extract_candidate_dates(text)
-            if text_dates:
-                return text_dates[0]
+        filename_dates = self._extract_candidate_dates(original_filename)
+        if filename_dates:
+            return filename_dates[0]
 
-        prefix_dates = self._extract_candidate_dates(self._clean_text(normalized_text[:1500]))
+        prefix_dates = self._extract_candidate_dates(
+            self._clean_text(normalized_text[:1200])
+        )
         if prefix_dates:
             return prefix_dates[0]
 
@@ -1729,23 +1929,34 @@ class DocxStructureExtractor:
         original_filename: str,
         document_title: str,
         normalized_text: str,
+        service_name_full: Optional[str] = None,
+        document_number: Optional[str] = None,
+        document_date: Optional[datetime] = None,
     ) -> Optional[str]:
-        number_match = self._NUMBER_RE.search(original_filename)
-        if number_match is None:
-            number_match = self._NUMBER_RE.search(document_title)
-        if number_match is None:
-            number_match = self._NUMBER_RE.search(normalized_text[:3000])
-
-        if number_match is None:
+        identity_basis = (
+            service_name_full
+            or document_title
+            or Path(original_filename).stem
+            or ""
+        )
+        identity_token = self._normalize_token(identity_basis)[:160]
+        if not identity_token:
             return None
 
-        raw_number = self._normalize_token(number_match.group("number"))
-        title_basis = self._normalize_token(document_title)[:80] if document_title else "document"
+        suffix_parts: list[str] = []
 
-        if not raw_number:
-            return None
+        if document_number:
+            normalized_number = self._normalize_token(document_number)
+            if normalized_number:
+                suffix_parts.append(normalized_number)
 
-        return f"{title_basis}__{raw_number}"
+        if not suffix_parts and document_date is not None:
+            suffix_parts.append(document_date.strftime("%Y_%m_%d"))
+
+        if not suffix_parts:
+            return identity_token
+
+        return f"{identity_token}__{'__'.join(suffix_parts)}"
 
     def _detect_appendix_number_from_context(
         self,

@@ -51,7 +51,15 @@ class BasicDocumentSemanticEnricher:
 
         source_authority = self._detect_source_authority(haystack)
         document_type = self._detect_document_type(haystack)
-        measure_codes = self._detect_measure_codes(haystack)
+
+        measure_codes: list[str] = []
+        if extraction.primary_measure_code:
+            measure_codes.append(extraction.primary_measure_code)
+
+        for detected_code in self._detect_measure_codes(haystack):
+            if detected_code not in measure_codes:
+                measure_codes.append(detected_code)
+
         aliases = self._build_aliases(measure_codes)
         
         legal_facts = self._extract_deadline_facts(
@@ -73,6 +81,15 @@ class BasicDocumentSemanticEnricher:
                 if extraction.revision_date is not None
                 else None
             ),
+            "document_number": extraction.document_number,
+            "document_date": (
+                extraction.document_date.isoformat()
+                if extraction.document_date is not None
+                else None
+            ),
+            "service_name_full": extraction.service_name_full,
+            "service_name_short": extraction.service_name_short,
+            "primary_measure_code": extraction.primary_measure_code,            
             "warning": (
                 "Temporary deterministic enrichment. "
                 "Must be replaced later with a more scalable approach."

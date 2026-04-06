@@ -160,6 +160,9 @@ class DocumentRegistry(Base):
         Index("idx_document_registry_status", "status"),
         Index("idx_document_registry_doc_uid_base", "doc_uid_base"),
         Index("idx_document_registry_revision_date", "revision_date"),
+        Index("idx_document_registry_document_number", "document_number"),
+        Index("idx_document_registry_document_date", "document_date"),
+        Index("idx_document_registry_primary_measure_code", "primary_measure_code"),
         Index("idx_document_registry_file_hash", "file_hash"),
         Index("idx_document_registry_content_hash", "content_hash"),
         Index("idx_document_registry_document_type", "document_type"),
@@ -192,6 +195,31 @@ class DocumentRegistry(Base):
 
     revision_date: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True),
+        nullable=True,
+    )
+
+    document_number: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    document_date: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    service_name_full: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    service_name_short: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    primary_measure_code: Mapped[Optional[str]] = mapped_column(
+        Text,
         nullable=True,
     )
 
