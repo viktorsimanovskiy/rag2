@@ -3095,21 +3095,16 @@ class RetrievalOrchestrator:
             "выплаты",
             "выплата",
             "выплачивается",
+            "выплатят",
+            "получу выплату",
+            "получу деньги",
+            "поступят деньги",
             "перечисления",
             "перечисление",
             "зачисления",
             "зачисление",
             "26-го числа",
             "26 числа",
-        ]
-        registration_markers = [
-            "регистрации заявления",
-            "регистрация заявления",
-            "регистрации запроса",
-            "регистрация запроса",
-            "регистрируется",
-            "первый рабочий день",
-            "со дня их поступления",
         ]
         correction_markers = [
             "исправления ошибок",
@@ -3125,17 +3120,15 @@ class RetrievalOrchestrator:
             "решение о назначении",
             "рассмотрения заявления",
             "рассмотрение заявления",
+            "регистрации заявления",
             "назначении",
             "назначение",
-            "срок предоставления государственной услуги",
-            "срок предоставления",
         ]
 
         scores = {
             "decision": 0,
             "notification": 0,
             "payment": 0,
-            "registration": 0,
             "correction": 0,
         }
         for marker in notification_markers:
@@ -3144,9 +3137,6 @@ class RetrievalOrchestrator:
         for marker in payment_markers:
             if marker in text:
                 scores["payment"] += 1
-        for marker in registration_markers:
-            if marker in text:
-                scores["registration"] += 1
         for marker in correction_markers:
             if marker in text:
                 scores["correction"] += 1
