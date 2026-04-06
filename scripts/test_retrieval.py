@@ -91,7 +91,7 @@ def _effective_score(candidate: object) -> float:
     return float(getattr(candidate, "score", 0.0) or 0.0)
 
 
-def _shorten_text(value: str | None, limit: int = 700) -> str | None:
+def _shorten_text(value: str | None, limit: int = 220) -> str | None:
     if value is None:
         return None
     text = " ".join(str(value).split())
@@ -163,6 +163,62 @@ def _render_candidate(candidate: object) -> dict[str, object]:
     }
 
 
+def _candidate_brief(candidate: object) -> str:
+    source_type = getattr(candidate, "source_type", "?")
+    title = getattr(candidate, "title", None) or "без_названия"
+    score = round(_effective_score(candidate), 4)
+    document_name = getattr(candidate, "document_name", None) or "без названия документа"
+    snippet = _shorten_text(getattr(candidate, "snippet", None), limit=200) or "—"
+    return (
+        f"[{source_type}] {title} | score={score} | {document_name}\n"
+        f"    {snippet}"
+    )
+
+
+def _render_compact_output(
+    *,
+    question_text: str,
+    intent: QuestionIntentEnum,
+    strategy_code: str,
+    metrics_json: dict,
+    debug_payload_json: dict,
+    candidates: list[object],
+    top_k: int,
+) -> None:
+    top_document_name = None
+    if candidates:
+        top_document_name = getattr(candidates[0], "document_name", None)
+
+    query_bundle = debug_payload_json.get("query_bundle", {}) or {}
+    priority_document_ids = debug_payload_json.get("priority_document_ids", []) or []
+
+    print("=" * 100)
+    print(f"ВОПРОС: {question_text}")
+    print(f"ИНТЕНТ: {intent.value}")
+    print(f"СТРАТЕГИЯ: {strategy_code}")
+    print(
+        "КАЧЕСТВО: "
+        f"{metrics_json.get('evidence_quality')} | "
+        f"документов={metrics_json.get('selected_document_ids_count')} | "
+        f"сильных={metrics_json.get('strong_candidate_count')} | "
+        f"top_share={metrics_json.get('top_document_share')}"
+    )
+    if top_document_name:
+        print(f"ЛУЧШИЙ ДОКУМЕНТ: {top_document_name}")
+    if priority_document_ids:
+        print(f"ПРИОРИТЕТНЫЕ ДОКУМЕНТЫ: {len(priority_document_ids)}")
+    if query_bundle.get("submission_channel"):
+        print(f"КАНАЛ ПОДАЧИ: {query_bundle.get('submission_channel')}")
+    if query_bundle.get("table_question_profile"):
+        print(f"ПРОФИЛЬ ВОПРОСА: {query_bundle.get('table_question_profile')}")
+
+    print("-" * 100)
+    print("ЛУЧШИЕ КАНДИДАТЫ:")
+    for index, candidate in enumerate(candidates[:top_k], start=1):
+        print(f"{index}. {_candidate_brief(candidate)}")
+    print("=" * 100)
+
+
 async def run(
     *,
     question_text: str,
@@ -170,6 +226,7 @@ async def run(
     document_id: UUID | None,
     top_k: int,
     exclude_form_noise: bool,
+    output_format: str,
 ) -> int:
     settings = load_settings()
 
@@ -223,14 +280,25 @@ async def run(
                 ],
             }
 
-            print(
-                json.dumps(
-                    output,
-                    ensure_ascii=False,
-                    indent=2,
-                    default=str,
+            if output_format == "json":
+                print(
+                    json.dumps(
+                        output,
+                        ensure_ascii=False,
+                        indent=2,
+                        default=str,
+                    )
                 )
-            )
+            else:
+                _render_compact_output(
+                    question_text=question_text,
+                    intent=intent,
+                    strategy_code=evidence.strategy_code,
+                    metrics_json=evidence.metrics_json or {},
+                    debug_payload_json=evidence.debug_payload_json or {},
+                    candidates=filtered_candidates,
+                    top_k=top_k,
+                )
 
         return 0
     finally:
@@ -262,13 +330,19 @@ def main() -> int:
     parser.add_argument(
         "--top-k",
         type=int,
-        default=10,
+        default=5,
         help="How many candidates to print.",
     )
     parser.add_argument(
         "--include-form-noise",
         action="store_true",
         help="Do not filter form-like table noise from the printed output.",
+    )
+    parser.add_argument(
+        "--output",
+        choices=("compact", "json"),
+        default="compact",
+        help="compact = короткая человекочитаемая сводка, json = старый полный вывод.",
     )
 
     args = parser.parse_args()
@@ -287,6 +361,7 @@ def main() -> int:
             document_id=document_id,
             top_k=args.top_k,
             exclude_form_noise=not args.include_form_noise,
+            output_format=args.output,
         )
     )
 
