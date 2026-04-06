@@ -602,6 +602,8 @@ class RetrievalOrchestrator:
                         "направления уведомления",
                         "уведомляет",
                         "сообщение о решении",
+                        "направляется заявителю",
+                        "в течение 2 рабочих дней со дня принятия решения",
                     ]
                 )
             elif question_deadline_kind == "payment":
@@ -610,6 +612,10 @@ class RetrievalOrchestrator:
                         "срок выплаты",
                         "выплата",
                         "выплачивает",
+                        "выплатят",
+                        "получу выплату",
+                        "получу деньги",
+                        "поступят деньги",
                         "ежемесячно",
                         "не позднее 26-го числа",
                         "26-го числа",
@@ -861,11 +867,16 @@ class RetrievalOrchestrator:
                 "направляет уведомление",
                 "уведомляет",
                 "сообщение о решении",
+                "направляется заявителю",
             ],
             "payment": [
                 "срок выплаты",
                 "выплата",
                 "выплачивает",
+                "выплатят",
+                "получу выплату",
+                "получу деньги",
+                "поступят деньги",
                 "ежемесячно",
                 "не позднее 26-го числа",
                 "26-го числа",
@@ -1189,6 +1200,7 @@ class RetrievalOrchestrator:
                         "срок уведомления",
                         "уведомление",
                         "направления уведомления",
+                        "направляется заявителю",
                     ]
                 )
             elif question_deadline_kind == "payment":
@@ -1196,6 +1208,8 @@ class RetrievalOrchestrator:
                     [
                         "срок выплаты",
                         "выплата",
+                        "выплатят",
+                        "получу выплату",
                         "не позднее 26-го числа",
                     ]
                 )
@@ -2942,14 +2956,31 @@ class RetrievalOrchestrator:
 
                 if question_deadline_kind == "notification":
                     if "уведом" in text_norm:
-                        score += 0.16
+                        score += 0.22
+                    if "об отсутствии ошибок" in text_norm:
+                        score -= 0.85
+                    if candidate_kind == "correction":
+                        score -= 0.95
                     if candidate_kind == "decision" and "уведом" not in text_norm:
                         score -= 0.25
+
                 if question_deadline_kind == "payment":
-                    if "26-го числа" in text_norm or "26 числа" in text_norm or "ежемесячно" in text_norm:
-                        score += 0.24
-                    if candidate_kind == "decision" and not has_temporal_markers:
-                        score -= 0.30
+                    if (
+                        "26-го числа" in text_norm
+                        or "26 числа" in text_norm
+                        or "ежемесячно" in text_norm
+                        or "выплачива" in text_norm
+                        or "перечисля" in text_norm
+                        or "зачисля" in text_norm
+                    ):
+                        score += 0.28
+                    if candidate_kind == "payment":
+                        score += 0.22
+                    if candidate_kind == "decision":
+                        score -= 0.55
+                    if candidate_kind == "notification":
+                        score -= 0.18
+
                 if question_deadline_kind == "decision" and "решение о предоставлении" in text_norm:
                     score += 0.16
 
@@ -2985,6 +3016,7 @@ class RetrievalOrchestrator:
             reverse=True,
         )
         return reranked
+        
     def _detect_deadline_question_kind(
         self,
         question_text: str,
@@ -3005,19 +3037,15 @@ class RetrievalOrchestrator:
             "выплаты",
             "выплата",
             "выплачивается",
+            "выплатят",
+            "выплатят ли",
+            "получу выплату",
+            "получу деньги",
+            "поступят деньги",
             "перечисления",
             "перечисление",
             "зачисления",
             "зачисление",
-        ]
-        registration_markers = [
-            "регистрации заявления",
-            "регистрация заявления",
-            "регистрации запроса",
-            "регистрация запроса",
-            "зарегистрируют",
-            "зарегистрируют заявление",
-            "зарегистрируют запрос",
         ]
         correction_markers = [
             "исправления ошибок",
@@ -3031,26 +3059,22 @@ class RetrievalOrchestrator:
             "принятие решения",
             "рассмотрения заявления",
             "рассмотрение заявления",
+            "регистрации заявления",
             "назначении",
             "назначение",
-            "срок предоставления государственной услуги",
-            "срок предоставления",
         ]
 
         if any(marker in text for marker in notification_markers):
             return "notification"
         if any(marker in text for marker in payment_markers):
             return "payment"
-        if any(marker in text for marker in registration_markers):
-            return "registration"
         if any(marker in text for marker in correction_markers):
             return "correction"
         if any(marker in text for marker in decision_markers):
             return "decision"
         return "other"
 
-
-    def _classify_deadline_candidate_kind(
+     def _classify_deadline_candidate_kind(
         self,
         candidate: RetrievedCandidate,
     ) -> str:
@@ -3071,21 +3095,16 @@ class RetrievalOrchestrator:
             "выплаты",
             "выплата",
             "выплачивается",
+            "выплатят",
+            "получу выплату",
+            "получу деньги",
+            "поступят деньги",
             "перечисления",
             "перечисление",
             "зачисления",
             "зачисление",
             "26-го числа",
             "26 числа",
-        ]
-        registration_markers = [
-            "регистрации заявления",
-            "регистрация заявления",
-            "регистрации запроса",
-            "регистрация запроса",
-            "регистрируется",
-            "первый рабочий день",
-            "со дня их поступления",
         ]
         correction_markers = [
             "исправления ошибок",
@@ -3101,17 +3120,15 @@ class RetrievalOrchestrator:
             "решение о назначении",
             "рассмотрения заявления",
             "рассмотрение заявления",
+            "регистрации заявления",
             "назначении",
             "назначение",
-            "срок предоставления государственной услуги",
-            "срок предоставления",
         ]
 
         scores = {
             "decision": 0,
             "notification": 0,
             "payment": 0,
-            "registration": 0,
             "correction": 0,
         }
         for marker in notification_markers:
@@ -3120,9 +3137,6 @@ class RetrievalOrchestrator:
         for marker in payment_markers:
             if marker in text:
                 scores["payment"] += 1
-        for marker in registration_markers:
-            if marker in text:
-                scores["registration"] += 1
         for marker in correction_markers:
             if marker in text:
                 scores["correction"] += 1
@@ -3134,7 +3148,6 @@ class RetrievalOrchestrator:
         if scores[winner] <= 0:
             return "other"
         return winner
-
 
     def _has_temporal_deadline_markers(
         self,
