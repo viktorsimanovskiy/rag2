@@ -365,6 +365,103 @@ class TableDeadlinesAnswerBuilder:
         lines.append("Конкретный срок зависит от того, о каком действии или этапе процедуры идёт речь.")
         return "\n".join(lines)
         
+    def _should_render_single_primary(
+        self,
+        *,
+        primary: DeadlineAnswerItem,
+        alternatives: list[DeadlineAnswerItem],
+        question_deadline_kind: str,
+    ) -> bool:
+        if not alternatives:
+            return True
+
+        primary_kind = self._resolve_render_deadline_kind(
+            item=primary,
+            question_deadline_kind=question_deadline_kind,
+        )
+
+        visible_alternatives = self._select_visible_alternatives(
+            primary=primary,
+            alternatives=alternatives,
+            question_deadline_kind=question_deadline_kind,
+        )
+        if not visible_alternatives:
+            return True
+
+        first_alt = visible_alternatives[0]
+        first_alt_kind = self._resolve_render_deadline_kind(
+            item=first_alt,
+            question_deadline_kind=question_deadline_kind,
+        )
+
+        if (
+            primary_kind == first_alt_kind
+            and self._normalize(primary.deadline_value) == self._normalize(first_alt.deadline_value)
+        ):
+            return True
+
+        if primary.candidate_score >= first_alt.candidate_score + 0.35:
+            return True
+
+        if primary.kind_confidence >= 0.90 and first_alt.kind_confidence <= 0.55:
+            return True
+
+        return False
+
+    def _select_visible_alternatives(
+        self,
+        *,
+        primary: DeadlineAnswerItem,
+        alternatives: list[DeadlineAnswerItem],
+        question_deadline_kind: str,
+    ) -> list[DeadlineAnswerItem]:
+        primary_kind = self._resolve_render_deadline_kind(
+            item=primary,
+            question_deadline_kind=question_deadline_kind,
+        )
+        primary_value = self._normalize(primary.deadline_value)
+
+        visible: list[DeadlineAnswerItem] = []
+
+        for item in alternatives:
+            item_kind = self._resolve_render_deadline_kind(
+                item=item,
+                question_deadline_kind=question_deadline_kind,
+            )
+            item_value = self._normalize(item.deadline_value)
+
+            if item_value == primary_value and item_kind == primary_kind:
+                continue
+
+            if question_deadline_kind != "other" and item_kind == "correction":
+                continue
+
+            if item.candidate_score < 0.15:
+                continue
+
+            visible.append(item)
+            if len(visible) >= 2:
+                break
+
+        return visible
+
+    def _render_bulleted_item(
+        self,
+        item: DeadlineAnswerItem,
+    ) -> str:
+        effective_kind = self._resolve_render_deadline_kind(
+            item=item,
+            question_deadline_kind="other",
+        )
+        label = self._DEADLINE_KIND_LABELS.get(
+            effective_kind,
+            self._DEADLINE_KIND_LABELS["other"],
+        )
+
+        if item.scope_text:
+            return f"- {item.deadline_value} — срок {label} ({item.scope_text})"
+        return f"- {item.deadline_value} — срок {label}"
+        
     def _deadline_kind_from_fact_type(
         self,
         fact_type: str | None,
