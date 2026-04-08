@@ -320,18 +320,85 @@ class TableDeadlinesAnswerBuilder:
             return None
 
         primary = result.primary_item
-        label = self._DEADLINE_KIND_LABELS.get(
-            primary.deadline_kind,
+        question_kind = result.question_deadline_kind
+
+        render_kind = self._resolve_render_deadline_kind(
+            item=primary,
+            question_deadline_kind=question_kind,
+        )
+        primary_label = self._DEADLINE_KIND_LABELS.get(
+            render_kind,
             self._DEADLINE_KIND_LABELS["other"],
         )
 
-        if primary.scope_text:
-            return (
-                f"Срок {label} по найденным источникам: "
-                f"{primary.deadline_value} ({primary.scope_text})."
-            )
+        if self._should_render_single_primary(
+            primary=primary,
+            alternatives=result.alternative_items,
+            question_deadline_kind=question_kind,
+        ):
+            if primary.scope_text:
+                return (
+                    f"Срок {primary_label} по найденным источникам: "
+                    f"{primary.deadline_value} ({primary.scope_text})."
+                )
+            return f"Срок {primary_label} по найденным источникам: {primary.deadline_value}."
 
-        return f"Срок {label} по найденным источникам: {primary.deadline_value}."
+        visible_alternatives = self._select_visible_alternatives(
+            primary=primary,
+            alternatives=result.alternative_items,
+            question_deadline_kind=question_kind,
+        )
+
+        if not visible_alternatives:
+            if primary.scope_text:
+                return (
+                    f"Срок {primary_label} по найденным источникам: "
+                    f"{primary.deadline_value} ({primary.scope_text})."
+                )
+            return f"Срок {primary_label} по найденным источникам: {primary.deadline_value}."
+
+        lines: list[str] = ["По найденным источникам установлены следующие сроки:"]
+        lines.append(self._render_bulleted_item(primary))
+        for item in visible_alternatives:
+            lines.append(self._render_bulleted_item(item))
+        lines.append("")
+        lines.append("Конкретный срок зависит от того, о каком действии или этапе процедуры идёт речь.")
+        return "\n".join(lines)
+        
+    def _deadline_kind_from_fact_type(
+        self,
+        fact_type: str | None,
+    ) -> str:
+        fact_type_norm = self._normalize(fact_type)
+        mapping = {
+            "decision_deadline": "decision",
+            "notification_deadline": "notification",
+            "payment_deadline": "payment",
+            "registration_deadline": "registration",
+            "correction_deadline": "correction",
+        }
+        return mapping.get(fact_type_norm, "other")
+
+    def _resolve_render_deadline_kind(
+        self,
+        *,
+        item: DeadlineAnswerItem,
+        question_deadline_kind: str,
+    ) -> str:
+        fact_type_kind = self._deadline_kind_from_fact_type(item.fact_type)
+        if fact_type_kind != "other":
+            return fact_type_kind
+
+        if item.kind_confidence >= 0.60 and item.deadline_kind != "other":
+            return item.deadline_kind
+
+        if question_deadline_kind and question_deadline_kind != "other":
+            return question_deadline_kind
+
+        if item.deadline_kind and item.deadline_kind != "other":
+            return item.deadline_kind
+
+        return "other"
 
     # --------------------------------------------------------
     # Candidate conversion
@@ -389,9 +456,14 @@ class TableDeadlinesAnswerBuilder:
         )
         fact_type = self._clean(fact_type)
 
-        deadline_kind, kind_confidence = self._classify_deadline_kind(
-            text=" ".join([deadline_value, scope_text, fact_type or ""]),
-        )
+        fact_type_kind = self._deadline_kind_from_fact_type(fact_type)
+        if fact_type_kind != "other":
+            deadline_kind = fact_type_kind
+            kind_confidence = 1.0
+        else:
+            deadline_kind, kind_confidence = self._classify_deadline_kind(
+                text=" ".join([deadline_value, scope_text, fact_type or ""]),
+            )
 
         is_service_core_deadline = bool(
             metadata_json.get("is_service_core_deadline")
