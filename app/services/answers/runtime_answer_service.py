@@ -9,22 +9,21 @@
 #   - invoke retrieval orchestrator
 #   - invoke generation pipeline
 #   - apply safe runtime fallbacks
+#   - resolve measure consistently before retrieval
 #   - return generation result with retrieval debug payload
-#
-# Design principles:
-#   - keep answer_orchestrator thin
-#   - isolate runtime answer assembly from transport/session logic
-#   - conservative fallbacks
-#   - production-oriented observability
 # ============================================================
 
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any, Optional
 from uuid import UUID
 
+from app.config.measure_registry import (
+    get_measure_search_terms,
+    resolve_measure_code,
+)
 from app.db.models.enums import QuestionIntentEnum
 from app.services.generation.generation_pipeline import (
     GenerationPipeline,
@@ -122,26 +121,30 @@ class RuntimeAnswerService:
         self,
         payload: RuntimeAnswerInput,
     ) -> RuntimeAnswerResult:
-        """
-        Main runtime answer flow.
-
-        Flow:
-        1. Validate input
-        2. Build retrieval input
-        3. Run retrieval
-        4. Build generation request
-        5. Run generation
-        6. Enrich generation payload with retrieval/runtime debug info
-        """
         self._validate_input(payload)
 
-        retrieval_input = self._build_retrieval_input(payload)
+        (
+            resolved_measure_code,
+            measure_resolution_source,
+            resolved_query_terms,
+        ) = self._resolve_measure_context(payload)
+
+        retrieval_input = self._build_retrieval_input(
+            payload,
+            resolved_measure_code=resolved_measure_code,
+            measure_resolution_source=measure_resolution_source,
+            resolved_query_terms=resolved_query_terms,
+        )
 
         evidence_package = await self.retrieval_orchestrator.retrieve(
             retrieval_input
         )
 
-        generation_request = self._build_generation_request(payload)
+        generation_request = self._build_generation_request(
+            payload,
+            resolved_measure_code=resolved_measure_code,
+            measure_resolution_source=measure_resolution_source,
+        )
 
         generation_result = await self.generation_pipeline.generate_answer(
             payload=generation_request,
@@ -152,11 +155,15 @@ class RuntimeAnswerService:
             generation_result=generation_result,
             evidence_package=evidence_package,
             payload=payload,
+            resolved_measure_code=resolved_measure_code,
+            measure_resolution_source=measure_resolution_source,
         )
 
         runtime_payload_json = {
             "question_event_id": str(payload.question_event_id),
             "strategy_code": evidence_package.strategy_code,
+            "resolved_measure_code": resolved_measure_code,
+            "measure_resolution_source": measure_resolution_source,
             "selected_candidates_count": len(evidence_package.selected_candidates),
             "selected_document_ids_count": len(evidence_package.selected_document_ids),
             "selected_fact_ids_count": len(evidence_package.selected_fact_ids),
@@ -171,6 +178,8 @@ class RuntimeAnswerService:
                 "question_event_id": str(payload.question_event_id),
                 "intent_type": str(payload.intent_type),
                 "strategy_code": evidence_package.strategy_code,
+                "resolved_measure_code": resolved_measure_code,
+                "measure_resolution_source": measure_resolution_source,
                 "answer_mode": str(enriched_generation_result.answer_mode),
                 "confidence_score": enriched_generation_result.confidence_score,
             },
@@ -189,16 +198,24 @@ class RuntimeAnswerService:
     def _build_retrieval_input(
         self,
         payload: RuntimeAnswerInput,
+        *,
+        resolved_measure_code: Optional[str],
+        measure_resolution_source: str,
+        resolved_query_terms: list[str],
     ) -> RetrievalInput:
+        constraints_json = dict(payload.query_constraints_json or {})
+        constraints_json["resolved_measure_code"] = resolved_measure_code
+        constraints_json["measure_resolution_source"] = measure_resolution_source
+
         return RetrievalInput(
             question_event_id=payload.question_event_id,
             question_text_raw=payload.question_text_raw,
             question_text_normalized=payload.question_text_normalized,
             intent_type=payload.intent_type,
-            measure_code=payload.measure_code,
+            measure_code=resolved_measure_code,
             subject_category_code=payload.subject_category_code,
-            query_terms=payload.query_terms,
-            constraints_json=payload.query_constraints_json,
+            query_terms=resolved_query_terms,
+            constraints_json=constraints_json,
             top_k_facts=payload.top_k_facts,
             top_k_tables=payload.top_k_tables,
             top_k_rows=payload.top_k_rows,
@@ -209,7 +226,22 @@ class RuntimeAnswerService:
     def _build_generation_request(
         self,
         payload: RuntimeAnswerInput,
+        *,
+        resolved_measure_code: Optional[str],
+        measure_resolution_source: str,
     ) -> GenerationRequest:
+        routing_payload_json = dict(payload.routing_payload_json or {})
+        routing_payload_json["resolved_measure_code"] = resolved_measure_code
+        routing_payload_json["measure_resolution_source"] = measure_resolution_source
+
+        query_constraints_json = dict(payload.query_constraints_json or {})
+        query_constraints_json["resolved_measure_code"] = resolved_measure_code
+        query_constraints_json["measure_resolution_source"] = measure_resolution_source
+
+        request_metadata_json = dict(payload.request_metadata_json or {})
+        request_metadata_json["resolved_measure_code"] = resolved_measure_code
+        request_metadata_json["measure_resolution_source"] = measure_resolution_source
+
         return GenerationRequest(
             session_id=payload.session_id,
             question_event_id=payload.question_event_id,
@@ -218,11 +250,11 @@ class RuntimeAnswerService:
             question_text_normalized=payload.question_text_normalized,
             language_code=payload.language_code,
             intent_type=payload.intent_type,
-            measure_code=payload.measure_code,
+            measure_code=resolved_measure_code,
             subject_category_code=payload.subject_category_code,
-            routing_payload_json=payload.routing_payload_json,
-            query_constraints_json=payload.query_constraints_json,
-            request_metadata_json=payload.request_metadata_json,
+            routing_payload_json=routing_payload_json,
+            query_constraints_json=query_constraints_json,
+            request_metadata_json=request_metadata_json,
         )
 
     def _enrich_generation_result(
@@ -231,15 +263,15 @@ class RuntimeAnswerService:
         generation_result: GenerationResult,
         evidence_package: EvidencePackage,
         payload: RuntimeAnswerInput,
+        resolved_measure_code: Optional[str],
+        measure_resolution_source: str,
     ) -> GenerationResult:
-        """
-        Add retrieval/runtime diagnostics into answer_payload_json
-        without changing core answer text.
-        """
         answer_payload_json = dict(generation_result.answer_payload_json or {})
         answer_payload_json["runtime_answer_service"] = {
             "question_event_id": str(payload.question_event_id),
             "strategy_code": evidence_package.strategy_code,
+            "resolved_measure_code": resolved_measure_code,
+            "measure_resolution_source": measure_resolution_source,
             "evidence_metrics": evidence_package.metrics_json,
             "selected_document_ids": [str(x) for x in evidence_package.selected_document_ids],
             "selected_fact_ids": [str(x) for x in evidence_package.selected_fact_ids],
@@ -249,7 +281,6 @@ class RuntimeAnswerService:
             "debug_payload_json": evidence_package.debug_payload_json,
         }
 
-        # Recreate dataclass immutably-like, but without requiring replace()
         return GenerationResult(
             answer_mode=generation_result.answer_mode,
             answer_text=generation_result.answer_text,
@@ -269,6 +300,69 @@ class RuntimeAnswerService:
             generation_prompt_version=generation_result.generation_prompt_version,
             pipeline_version=generation_result.pipeline_version,
         )
+
+    # --------------------------------------------------------
+    # Measure resolution
+    # --------------------------------------------------------
+
+    def _resolve_measure_context(
+        self,
+        payload: RuntimeAnswerInput,
+    ) -> tuple[Optional[str], str, list[str]]:
+        routing_payload_json = dict(payload.routing_payload_json or {})
+        query_constraints_json = dict(payload.query_constraints_json or {})
+        request_metadata_json = dict(payload.request_metadata_json or {})
+
+        resolution_candidates: list[tuple[str, Optional[str]]] = [
+            ("explicit_measure_code", payload.measure_code),
+            ("routing_payload.measure_code", routing_payload_json.get("measure_code")),
+            ("routing_payload.resolved_measure_code", routing_payload_json.get("resolved_measure_code")),
+            ("query_constraints.measure_code", query_constraints_json.get("measure_code")),
+            ("query_constraints.resolved_measure_code", query_constraints_json.get("resolved_measure_code")),
+            ("request_metadata.measure_code", request_metadata_json.get("measure_code")),
+            ("request_metadata.resolved_measure_code", request_metadata_json.get("resolved_measure_code")),
+            ("question_text_normalized", payload.question_text_normalized),
+            ("question_text_raw", payload.question_text_raw),
+        ]
+
+        resolved_measure_code: Optional[str] = None
+        measure_resolution_source = "unresolved"
+
+        for source_name, raw_value in resolution_candidates:
+            resolved = resolve_measure_code(raw_value)
+            if resolved:
+                resolved_measure_code = resolved
+                measure_resolution_source = source_name
+                break
+
+        resolved_query_terms = list(payload.query_terms or [])
+        if resolved_measure_code:
+            resolved_query_terms.append(resolved_measure_code)
+            resolved_query_terms.extend(get_measure_search_terms(resolved_measure_code))
+
+        resolved_query_terms = self._deduplicate_terms(resolved_query_terms)
+
+        return (
+            resolved_measure_code,
+            measure_resolution_source,
+            resolved_query_terms,
+        )
+
+    def _deduplicate_terms(
+        self,
+        values: list[str],
+    ) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+
+        for value in values:
+            clean = " ".join((value or "").strip().lower().split())
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            result.append(clean)
+
+        return result
 
     # --------------------------------------------------------
     # Validation

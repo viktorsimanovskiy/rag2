@@ -112,6 +112,30 @@ def get_measure_definition(measure_code: str | None) -> Optional[MeasureDefiniti
     if not measure_code:
         return None
     return _MEASURE_BY_CODE.get(normalize_measure_text(measure_code))
+    
+def resolve_measure_code(*values: str | None) -> str | None:
+    """
+    Resolve measure code from:
+    - explicit code ("edv", "subsidy", ...)
+    - canonical name
+    - alias occurrence inside free text
+
+    Resolution order follows the order of input values.
+    """
+    for value in values:
+        normalized = normalize_measure_text(value or "")
+        if not normalized:
+            continue
+
+        direct = _MEASURE_BY_CODE.get(normalized)
+        if direct is not None:
+            return direct.code
+
+        detected = detect_primary_measure_code(normalized)
+        if detected:
+            return detected
+
+    return None
 
 
 def detect_measure_codes(text: str) -> list[str]:

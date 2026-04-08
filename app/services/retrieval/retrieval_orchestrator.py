@@ -32,8 +32,8 @@ from sqlalchemy import and_, case, desc, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.measure_registry import (
-    detect_primary_measure_code,
     get_measure_search_terms,
+    resolve_measure_code,
 )
 
 from app.db.models.documents import (
@@ -482,6 +482,11 @@ class RetrievalOrchestrator:
             if self._normalize_text(x)
         ]
 
+        resolved_measure_code = self._resolve_measure_code(
+            payload=payload,
+            normalized_text=normalized_text,
+        )
+
         table_question_profile = self._detect_table_question_profile(
             question_text=normalized_text,
             intent_type=payload.intent_type,
@@ -491,13 +496,12 @@ class RetrievalOrchestrator:
             question_text=normalized_text,
             intent_type=payload.intent_type,
         )
+
         question_deadline_kind = None
         if payload.intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
             question_deadline_kind = self._detect_deadline_question_kind(normalized_text)
 
-        question_measure_family = self._detect_measure_family(
-            payload.measure_code or normalized_text
-        )
+        question_measure_family = resolved_measure_code
 
         requested_column_hints = self._build_requested_column_hints(
             table_question_profile=table_question_profile,
@@ -513,7 +517,7 @@ class RetrievalOrchestrator:
         expanded_terms = self._expand_query_terms(
             question_text=normalized_text,
             intent_type=payload.intent_type,
-            measure_code=payload.measure_code,
+            measure_code=resolved_measure_code,
             submission_channel=submission_channel,
             requested_column_hints=requested_column_hints,
             question_deadline_kind=question_deadline_kind,
@@ -531,7 +535,8 @@ class RetrievalOrchestrator:
         return {
             "normalized_text": normalized_text,
             "query_terms": query_terms,
-            "measure_code": payload.measure_code,
+            "measure_code": resolved_measure_code,
+            "requested_measure_code": payload.measure_code,
             "subject_category_code": payload.subject_category_code,
             "table_question_profile": table_question_profile,
             "submission_channel": submission_channel,
@@ -541,7 +546,22 @@ class RetrievalOrchestrator:
             "question_measure_family": question_measure_family,
             "wants_full_documents_list": wants_full_documents_list,
         }
+        
+    def _resolve_measure_code(
+        self,
+        *,
+        payload: RetrievalInput,
+        normalized_text: str,
+    ) -> Optional[str]:
+        constraints = payload.constraints_json or {}
 
+        return resolve_measure_code(
+            payload.measure_code,
+            constraints.get("resolved_measure_code"),
+            constraints.get("measure_code"),
+            normalized_text,
+            payload.question_text_raw,
+        )
 
     def _expand_query_terms(
         self,
@@ -558,17 +578,12 @@ class RetrievalOrchestrator:
         base_tokens = self._extract_meaningful_terms(question_text)
         terms.extend(base_tokens)
 
-        resolved_measure_code = self._normalize_text(
-            measure_code or self._detect_measure_family(question_text) or ""
-        )
+        resolved_measure_code = resolve_measure_code(measure_code, question_text)
         if resolved_measure_code:
             terms.append(resolved_measure_code)
             terms.extend(get_measure_search_terms(resolved_measure_code))
 
         if intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
-            # Важное правило: не загрязняем payment/notification запросы
-            # терминами decision по умолчанию. Иначе retrieval снова начинает
-            # тянуть "принятие решения" и front-matter вместо нужного этапа.
             terms.extend(
                 [
                     "срок",
@@ -618,19 +633,15 @@ class RetrievalOrchestrator:
                         "поступят деньги",
                         "ежемесячно",
                         "не позднее 26-го числа",
-                        "26-го числа",
-                        "26 числа",
                     ]
                 )
             elif question_deadline_kind == "registration":
                 terms.extend(
                     [
-                        "срок регистрации заявления",
-                        "срок регистрации запроса",
+                        "срок регистрации",
                         "регистрация заявления",
                         "регистрация запроса",
-                        "регистрируется",
-                        "первый рабочий день",
+                        "не позднее одного рабочего дня",
                     ]
                 )
             elif question_deadline_kind == "correction":
@@ -638,161 +649,54 @@ class RetrievalOrchestrator:
                     [
                         "срок исправления ошибок",
                         "срок исправления опечаток",
-                        "исправление ошибок",
                         "опечаток и ошибок",
-                        "нового документа",
                     ]
                 )
             else:
                 terms.extend(
                     [
                         "срок предоставления",
-                        "срок предоставления государственной услуги",
-                        "максимальный срок",
+                        "максимальный срок предоставления",
                     ]
                 )
 
-        elif intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION:
+        if intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION:
             terms.extend(
                 [
                     "документы",
                     "перечень документов",
                     "необходимые документы",
-                    "документов необходимых",
-                    "представляемые документы",
-                    "документы представляемые заявителем",
-                    "к заявлению",
-                    "заявление",
-                    "заявителем",
-                    "прилагаемые документы",
-                    "предоставления государственной услуги",
                     "наименование документа",
-                    "документы необходимые для предоставления государственной услуги",
+                    "таблица 2",
+                    "приложение 2",
                 ]
             )
 
-            if submission_channel == "epgu":
-                terms.extend(
-                    [
-                        "епгу",
-                        "госуслуги",
-                        "единый портал",
-                        "посредством епгу",
-                        "электронной подаче",
-                        "в электронной форме",
-                        "электронный образ документа",
-                        "сведения о документе",
-                        "единого портала",
-                    ]
-                )
-
-            elif submission_channel == "regional_portal":
-                terms.extend(
-                    [
-                        "рпгу",
-                        "краевой портал",
-                        "региональный портал",
-                        "посредством краевого портала",
-                        "электронной подаче",
-                        "при электронной подаче посредством рпгу",
-                        "электронный образ документа",
-                        "сведения о документе",
-                    ]
-                )
-
-            elif submission_channel == "in_person":
-                terms.extend(
-                    [
-                        "лично",
-                        "личной подаче",
-                        "личном обращении",
-                        "при личной подаче",
-                        "через представителя",
-                        "по доверенности",
-                        "через социального работника",
-                    ]
-                )
-
-            elif submission_channel == "post":
-                terms.extend(
-                    [
-                        "почтой",
-                        "почтовым отправлением",
-                        "по почте",
-                    ]
-                )
-
-            elif submission_channel == "mfc":
-                terms.extend(
-                    [
-                        "мфц",
-                        "через мфц",
-                    ]
-                )
-
-        elif intent_type == QuestionIntentEnum.REJECTION_QUESTION:
+        if intent_type == QuestionIntentEnum.REJECTION_QUESTION:
             terms.extend(
                 [
-                    "отказ",
                     "основания отказа",
+                    "отказ в предоставлении",
                     "причины отказа",
-                    "решение об отказе",
-                    "может быть отказано",
-                    "отказывается в предоставлении",
-                    "отказывается в назначении",
-                    "принимается решение об отказе",
-                    "непредставление документов",
-                    "недостоверные сведения",
-                    "отсутствие права",
+                    "отказа в приеме",
                 ]
             )
 
-        elif intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION:
-            terms.extend(
-                [
-                    "имеет право",
-                    "право на едв",
-                    "право на получение",
-                    "категории граждан",
-                    "категории заявителей",
-                    "заявитель",
-                    "получатели",
-                    "предоставляется",
-                    "предоставляется заявителям",
-                    "условия предоставления",
-                    "при наличии права",
-                ]
-            )
-
-        elif intent_type == QuestionIntentEnum.PROCEDURE_QUESTION:
-            terms.extend(
-                [
-                    "порядок",
-                    "порядок предоставления",
-                    "процедура",
-                    "последовательность",
-                    "предоставление услуги",
-                    "назначение",
-                    "назначается",
-                    "рассмотрение заявления",
-                    "принятие решения",
-                ]
-            )
+        if submission_channel == "epgu":
+            terms.extend(["епгу", "единый портал", "госуслуги"])
+        elif submission_channel == "regional_portal":
+            terms.extend(["рпгу", "краевой портал", "региональный портал"])
+        elif submission_channel == "mfc":
+            terms.extend(["мфц"])
+        elif submission_channel == "post":
+            terms.extend(["почтой", "почтовым отправлением"])
+        elif submission_channel == "in_person":
+            terms.extend(["лично", "личный прием"])
 
         if requested_column_hints:
             terms.extend(requested_column_hints)
 
-        terms = self._deduplicate_preserve_order(
-            [self._normalize_text(x) for x in terms if self._normalize_text(x)]
-        )
-
-        if intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
-            terms = self._prioritize_deadline_query_terms(
-                terms=terms,
-                question_deadline_kind=question_deadline_kind,
-            )
-
-        return terms[:24]
+        return self._deduplicate_preserve_order(terms)
 
 
     def _extract_meaningful_terms(self, text: str) -> list[str]:
@@ -986,59 +890,7 @@ class RetrievalOrchestrator:
         self,
         text: str,
     ) -> Optional[str]:
-        text = self._normalize_text(text)
-        if not text:
-            return None
-
-        families: list[tuple[str, tuple[str, ...]]] = [
-            (
-                "edv",
-                (
-                    " едв ",
-                    "ежемесячной денежной выплаты",
-                    "ежемесячная денежная выплата",
-                ),
-            ),
-            (
-                "subsidy",
-                (
-                    "субсид",
-                    "оплату жилого помещения",
-                    "коммунальных услуг",
-                ),
-            ),
-            (
-                "social_contract",
-                (
-                    "соцконтракт",
-                    "социального контракта",
-                    "социальный контракт",
-                ),
-            ),
-            (
-                "hardship",
-                (
-                    "тжс",
-                    "трудной жизненной ситуации",
-                    "адресной материальной помощи",
-                ),
-            ),
-            (
-                "sanatorium",
-                (
-                    "санкур",
-                    "санаторно-курорт",
-                    "бесплатных путевок",
-                    "путевок на санаторно-курортное лечение",
-                ),
-            ),
-        ]
-
-        padded = f" {text} "
-        for family, markers in families:
-            if any(marker in padded or marker in text for marker in markers):
-                return family
-        return None
+        return resolve_measure_code(text)
 
 
     def _candidate_measure_family(
@@ -1046,15 +898,17 @@ class RetrievalOrchestrator:
         candidate: RetrievedCandidate,
     ) -> Optional[str]:
         metadata = candidate.metadata_json or {}
-        explicit_measure_code = self._normalize_text(
-            candidate.measure_code
-            or metadata.get("measure_code")
-            or ""
-        )
-        if explicit_measure_code == "edv":
-            return "edv"
 
-        return self._detect_measure_family(self._candidate_text_blob(candidate))
+        return resolve_measure_code(
+            candidate.measure_code,
+            metadata.get("measure_code"),
+            metadata.get("service_name_short"),
+            metadata.get("service_name_full"),
+            candidate.document_name,
+            candidate.title,
+            candidate.snippet,
+            self._candidate_text_blob(candidate),
+        )
 
     def _detect_submission_channel(self, text: str) -> Optional[str]:
         """
@@ -1478,15 +1332,6 @@ class RetrievalOrchestrator:
         strategy: RetrievalStrategy,
         query_bundle: dict[str, Any],
     ) -> list[RetrievedCandidate]:
-        """
-        Retrieve from normalized legal facts.
-
-        Priority:
-        - active documents only
-        - measure_code exact match if present
-        - subject_category exact match if present
-        - fact_type boosts depending on intent
-        """
         text_terms = query_bundle["query_terms"]
         measure_code = query_bundle["measure_code"]
         subject_category = query_bundle["subject_category_code"]
@@ -1520,8 +1365,14 @@ class RetrievalOrchestrator:
         if measure_code:
             stmt = stmt.where(
                 or_(
-                    LegalFact.measure_code == measure_code,
-                    LegalFact.measure_code.is_(None),
+                    DocumentRegistry.primary_measure_code == measure_code,
+                    and_(
+                        DocumentRegistry.primary_measure_code.is_(None),
+                        or_(
+                            LegalFact.measure_code == measure_code,
+                            LegalFact.measure_code.is_(None),
+                        ),
+                    ),
                 )
             )
 
@@ -1570,10 +1421,8 @@ class RetrievalOrchestrator:
         strategy: RetrievalStrategy,
         query_bundle: dict[str, Any],
     ) -> list[RetrievedCandidate]:
-        """
-        Retrieve tables by title/summary/preview plus document filters.
-        """
         text_terms = query_bundle["query_terms"]
+        measure_code = query_bundle["measure_code"]
 
         stmt = (
             select(
@@ -1596,11 +1445,17 @@ class RetrievalOrchestrator:
             .where(DocumentRegistry.status == "active")
         )
 
-        if payload.measure_code:
+        if measure_code:
             stmt = stmt.where(
                 or_(
-                    DocumentTable.metadata_json["measure_code"].astext == payload.measure_code,
-                    DocumentTable.metadata_json["measure_code"].astext.is_(None),
+                    DocumentRegistry.primary_measure_code == measure_code,
+                    and_(
+                        DocumentRegistry.primary_measure_code.is_(None),
+                        or_(
+                            DocumentTable.metadata_json["measure_code"].astext == measure_code,
+                            DocumentTable.metadata_json["measure_code"].astext.is_(None),
+                        ),
+                    ),
                 )
             )
 
@@ -1639,17 +1494,9 @@ class RetrievalOrchestrator:
         strategy: RetrievalStrategy,
         query_bundle: dict[str, Any],
     ) -> list[RetrievedCandidate]:
-        """
-        Retrieve row-level evidence.
-
-        Important for:
-        - documents_question
-        - form_question
-        - deadline_question
-        where exact row selection often matters.
-        """
         text_terms = query_bundle["query_terms"]
-        
+        measure_code = query_bundle["measure_code"]
+
         wants_full_documents_list = bool(query_bundle.get("wants_full_documents_list"))
         is_documents_question = payload.intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION
 
@@ -1674,19 +1521,23 @@ class RetrievalOrchestrator:
             .where(DocumentRegistry.status == "active")
         )
 
-        if payload.measure_code:
+        if measure_code:
             stmt = stmt.where(
                 or_(
-                    DocumentTableRow.metadata_json["measure_code"].astext == payload.measure_code,
-                    DocumentTableRow.metadata_json["measure_code"].astext.is_(None),
+                    DocumentRegistry.primary_measure_code == measure_code,
+                    and_(
+                        DocumentRegistry.primary_measure_code.is_(None),
+                        or_(
+                            DocumentTableRow.metadata_json["measure_code"].astext == measure_code,
+                            DocumentTableRow.metadata_json["measure_code"].astext.is_(None),
+                        ),
+                    ),
                 )
             )
 
         rows_limit = payload.top_k_rows
 
         if is_documents_question and wants_full_documents_list:
-            # Для полного перечня нельзя жить на обычном row-limit,
-            # иначе до generation физически не дойдут все строки таблицы.
             rows_limit = max(payload.top_k_rows, 48)
 
         stmt = stmt.order_by(desc("score")).limit(rows_limit)
@@ -1724,16 +1575,8 @@ class RetrievalOrchestrator:
         strategy: RetrievalStrategy,
         query_bundle: dict[str, Any],
     ) -> list[RetrievedCandidate]:
-        """
-        Retrieve paragraph/list/heading level blocks.
-
-        Blocks remain useful for:
-        - explanatory norms
-        - procedure descriptions
-        - appeal rules
-        - narrative fallback when no exact structured object exists
-        """
         text_terms = query_bundle["query_terms"]
+        measure_code = query_bundle["measure_code"]
 
         stmt = (
             select(
@@ -1758,6 +1601,14 @@ class RetrievalOrchestrator:
             .join(DocumentRegistry, DocumentRegistry.document_id == DocumentBlock.document_id)
             .where(DocumentRegistry.status == "active")
         )
+
+        if measure_code:
+            stmt = stmt.where(
+                or_(
+                    DocumentRegistry.primary_measure_code == measure_code,
+                    DocumentRegistry.primary_measure_code.is_(None),
+                )
+            )
 
         stmt = stmt.order_by(desc("score")).limit(payload.top_k_blocks)
 
@@ -2823,7 +2674,16 @@ class RetrievalOrchestrator:
         requested_column_hints = query_bundle.get("requested_column_hints") or []
         question_norm = self._normalize_text(payload.question_text_normalized or payload.question_text_raw)
         question_deadline_kind = self._detect_deadline_question_kind(question_norm)
-        question_measure_family = query_bundle.get("question_measure_family") or self._detect_measure_family(question_norm)
+        resolved_measure_code = self._normalize_text(
+            query_bundle.get("measure_code")
+            or payload.measure_code
+            or ""
+        )
+        question_measure_family = (
+            resolved_measure_code
+            or query_bundle.get("question_measure_family")
+            or self._detect_measure_family(question_norm)
+        )
 
         reranked: list[RetrievedCandidate] = []
 
@@ -2840,8 +2700,8 @@ class RetrievalOrchestrator:
             elif question_measure_family and candidate_measure_family and candidate_measure_family != question_measure_family:
                 score -= 1.05 if intent_type == QuestionIntentEnum.DEADLINE_QUESTION else 0.55
 
-            if payload.measure_code and candidate_measure_code:
-                if candidate_measure_code == self._normalize_text(payload.measure_code):
+            if resolved_measure_code and candidate_measure_code:
+                if candidate_measure_code == resolved_measure_code:
                     score += 0.30
                 else:
                     score -= 0.90
