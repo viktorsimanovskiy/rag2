@@ -891,7 +891,65 @@ class RetrievalOrchestrator:
         text: str,
     ) -> Optional[str]:
         return resolve_measure_code(text)
+        
+    def _detect_deadline_question_kind(
+        self,
+        text: str,
+    ) -> str:
+        text_norm = self._normalize_text(text)
+        if not text_norm:
+            return "other"
 
+        payment_markers = (
+            "выплат",
+            "перечисл",
+            "зачисл",
+            "деньги",
+            "26-го числа",
+            "26 числа",
+        )
+        notification_markers = (
+            "уведом",
+            "сообщ",
+            "извест",
+            "о решении",
+            "о принятом решении",
+        )
+        registration_markers = (
+            "регистрац",
+            "зарегистр",
+            "регистрир",
+        )
+        correction_markers = (
+            "опечат",
+            "ошиб",
+            "исправлен",
+        )
+        decision_markers = (
+            "примут решение",
+            "принятия решения",
+            "принятие решения",
+            "рассмотрения заявления",
+            "рассмотрение заявления",
+            "срок предоставления",
+        )
+
+        if any(marker in text_norm for marker in payment_markers):
+            return "payment"
+
+        if any(marker in text_norm for marker in notification_markers):
+            return "notification"
+
+        if any(marker in text_norm for marker in registration_markers):
+            return "registration"
+
+        if any(marker in text_norm for marker in correction_markers):
+            return "correction"
+
+        if any(marker in text_norm for marker in decision_markers):
+            return "decision"
+
+        return "other"
 
     def _candidate_measure_family(
         self,
