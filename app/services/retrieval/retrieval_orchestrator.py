@@ -2753,6 +2753,7 @@ class RetrievalOrchestrator:
                 has_deadline_value = isinstance(cells, dict) and bool(cells.get("deadline_value"))
                 has_temporal_markers = self._has_temporal_deadline_markers(candidate)
                 candidate_kind = self._classify_deadline_candidate_kind(candidate)
+                exact_notification_match = self._has_exact_notification_decision_marker(candidate)                
                 legal_fact_type = self._normalize_text(candidate.title if candidate.source_type == "legal_fact" else "")
                 is_service_core_deadline = bool(metadata.get("is_service_core_deadline"))
 
@@ -2815,14 +2816,29 @@ class RetrievalOrchestrator:
                     score -= 0.30
 
                 if question_deadline_kind == "notification":
+                    if exact_notification_match:
+                        score += 0.60
+
                     if "уведом" in text_norm:
                         score += 0.22
+
+                    if "о принятом решении" in text_norm or "о решении" in text_norm:
+                        score += 0.20
+
                     if "об отсутствии ошибок" in text_norm:
-                        score -= 0.85
-                    if candidate_kind == "correction":
+                        score -= 1.20
+
+                    if "опечат" in text_norm or "ошиб" in text_norm:
                         score -= 0.95
-                    if candidate_kind == "decision" and "уведом" not in text_norm:
-                        score -= 0.25
+
+                    if "проверки подписи" in text_norm or "электронной подписи" in text_norm:
+                        score -= 1.00
+
+                    if candidate_kind == "correction":
+                        score -= 1.10
+
+                    if candidate_kind == "decision" and not exact_notification_match:
+                        score -= 0.18
 
                 if question_deadline_kind == "payment":
                     if (
@@ -2877,63 +2893,6 @@ class RetrievalOrchestrator:
         )
         return reranked
         
-    def _detect_deadline_question_kind(
-        self,
-        question_text: str,
-    ) -> str:
-        text = self._normalize_text(question_text)
-        if not text:
-            return "other"
-
-        notification_markers = [
-            "уведомления",
-            "уведомить",
-            "уведомление",
-            "направления уведомления",
-            "информирования",
-            "сообщения о решении",
-        ]
-        payment_markers = [
-            "выплаты",
-            "выплата",
-            "выплачивается",
-            "выплатят",
-            "выплатят ли",
-            "получу выплату",
-            "получу деньги",
-            "поступят деньги",
-            "перечисления",
-            "перечисление",
-            "зачисления",
-            "зачисление",
-        ]
-        correction_markers = [
-            "исправления ошибок",
-            "исправления опечаток",
-            "опечаток и ошибок",
-            "исправят ошибки",
-            "исправят опечатки",
-        ]
-        decision_markers = [
-            "принятия решения",
-            "принятие решения",
-            "рассмотрения заявления",
-            "рассмотрение заявления",
-            "регистрации заявления",
-            "назначении",
-            "назначение",
-        ]
-
-        if any(marker in text for marker in notification_markers):
-            return "notification"
-        if any(marker in text for marker in payment_markers):
-            return "payment"
-        if any(marker in text for marker in correction_markers):
-            return "correction"
-        if any(marker in text for marker in decision_markers):
-            return "decision"
-        return "other"
-
     def _classify_deadline_candidate_kind(
         self,
         candidate: RetrievedCandidate,
@@ -2942,14 +2901,26 @@ class RetrievalOrchestrator:
         if not text:
             return "other"
 
+        if any(marker in text for marker in [
+            "об отсутствии ошибок",
+            "уведомления об отсутствии ошибок",
+            "исправлении ошибок",
+            "исправлении опечаток",
+            "опечаток и ошибок",
+            "нового документа",
+        ]):
+            return "correction"
+
         notification_markers = [
-            "уведомления",
+            "уведомление о принятом решении",
+            "о принятом решении",
             "уведомление",
-            "направляет уведомление",
-            "направления уведомления",
+            "уведомляет",
             "уведомить",
-            "информирования",
-            "сообщения о решении",
+            "направляет заявителю",
+            "направляется заявителю",
+            "заявитель уведомляется",
+            "сообщение о решении",
         ]
         payment_markers = [
             "выплаты",
@@ -2966,21 +2937,19 @@ class RetrievalOrchestrator:
             "26-го числа",
             "26 числа",
         ]
-        correction_markers = [
-            "исправления ошибок",
-            "исправления опечаток",
-            "опечаток и ошибок",
-            "нового документа",
-            "уведомления об отсутствии ошибок",
+        registration_markers = [
+            "регистрация заявления",
+            "регистрация запроса",
+            "регистрируется",
+            "зарегистрировано",
         ]
         decision_markers = [
-            "принятия решения",
-            "принятие решения",
             "решение о предоставлении",
             "решение о назначении",
+            "принятия решения",
+            "принятие решения",
             "рассмотрения заявления",
             "рассмотрение заявления",
-            "регистрации заявления",
             "назначении",
             "назначение",
         ]
@@ -2989,20 +2958,28 @@ class RetrievalOrchestrator:
             "decision": 0,
             "notification": 0,
             "payment": 0,
+            "registration": 0,
             "correction": 0,
         }
+
         for marker in notification_markers:
             if marker in text:
-                scores["notification"] += 1
+                scores["notification"] += 2 if "уведомление о принятом решении" in marker else 1
+
         for marker in payment_markers:
             if marker in text:
                 scores["payment"] += 1
-        for marker in correction_markers:
+
+        for marker in registration_markers:
             if marker in text:
-                scores["correction"] += 1
+                scores["registration"] += 1
+
         for marker in decision_markers:
             if marker in text:
                 scores["decision"] += 1
+
+        if scores["notification"] > 0 and "принятия решения" in text:
+            scores["decision"] = int(scores["decision"] * 0.55)
 
         winner = max(scores, key=scores.get)
         if scores[winner] <= 0:
@@ -3030,7 +3007,26 @@ class RetrievalOrchestrator:
             return True
 
         return any(ch.isdigit() for ch in text) and any(word in text for word in ["дней", "дня", "числа"])
+        
+    def _has_exact_notification_decision_marker(
+        self,
+        candidate: RetrievedCandidate,
+    ) -> bool:
+        text = self._normalize_text(self._candidate_text_blob(candidate))
+        if not text:
+            return False
 
+        return (
+            "уведом" in text
+            and (
+                "о принятом решении" in text
+                or "о решении" in text
+                or "направляется заявителю" in text
+                or "направляет заявителю" in text
+                or "заявитель уведомляется" in text
+                or "заявитель или представитель уведомляется" in text
+            )
+        )
 
     def _is_deadline_noise_candidate(
         self,
@@ -3058,11 +3054,24 @@ class RetrievalOrchestrator:
             return True
 
         text = self._normalize_text(self._candidate_text_blob(candidate))
+
         if "отказа в предоставлении" in text or "перечень оснований" in text:
             return True
 
-        return False
+        if any(marker in text for marker in [
+            "уведомления об отсутствии ошибок",
+            "об отсутствии ошибок",
+            "опечаток и ошибок",
+            "исправлении опечаток",
+            "исправлении ошибок",
+            "проверки подписи",
+            "электронной подписи",
+            "статьи 9",
+            "статьи 11",
+        ]):
+            return True
 
+        return False
 
     def _deadline_candidate_priority_bucket(
         self,
@@ -3074,27 +3083,55 @@ class RetrievalOrchestrator:
         kind = self._classify_deadline_candidate_kind(candidate)
         has_temporal_markers = self._has_temporal_deadline_markers(candidate)
         in_priority_doc = candidate.document_id in priority_document_set
+        exact_notification_match = self._has_exact_notification_decision_marker(candidate)
 
         if self._is_deadline_noise_candidate(candidate):
-            return 9
+            return 99
 
-        if in_priority_doc and candidate.source_type == "block" and has_temporal_markers and kind == question_deadline_kind and question_deadline_kind != "other":
-            return 0
-        if in_priority_doc and candidate.source_type == "table_row" and self._has_table_semantic_type(candidate, "deadlines") and kind == question_deadline_kind and question_deadline_kind != "other":
-            return 1
-        if in_priority_doc and candidate.source_type == "block" and has_temporal_markers:
-            return 2
-        if in_priority_doc and candidate.source_type == "table_row" and self._has_table_semantic_type(candidate, "deadlines"):
-            return 3
+        if question_deadline_kind == "notification":
+            if in_priority_doc and candidate.source_type == "legal_fact" and kind == "notification":
+                return 0
+            if in_priority_doc and exact_notification_match:
+                return 1
+            if in_priority_doc and candidate.source_type == "block" and kind == "notification" and has_temporal_markers:
+                return 2
+            if in_priority_doc and candidate.source_type == "table_row" and kind == "notification":
+                return 3
+            if in_priority_doc and candidate.source_type == "block" and kind == "decision" and has_temporal_markers:
+                return 4
+            if in_priority_doc and candidate.source_type == "table_row" and kind == "decision":
+                return 5
+            if in_priority_doc and has_temporal_markers:
+                return 6
+            return 20
+
+        if question_deadline_kind == "decision":
+            if in_priority_doc and candidate.source_type == "legal_fact" and kind == "decision":
+                return 0
+            if in_priority_doc and candidate.source_type == "block" and kind == "decision" and has_temporal_markers:
+                return 1
+            if in_priority_doc and candidate.source_type == "table_row" and kind == "decision":
+                return 2
+            if in_priority_doc and has_temporal_markers:
+                return 3
+            return 20
+
+        if question_deadline_kind == "payment":
+            if in_priority_doc and candidate.source_type == "legal_fact" and kind == "payment":
+                return 0
+            if in_priority_doc and candidate.source_type == "block" and kind == "payment" and has_temporal_markers:
+                return 1
+            if in_priority_doc and candidate.source_type == "table_row" and kind == "payment":
+                return 2
+            if in_priority_doc and has_temporal_markers:
+                return 3
+            return 20
+
         if in_priority_doc and has_temporal_markers:
-            return 4
-        if candidate.source_type == "block" and has_temporal_markers:
-            return 5
-        if candidate.source_type == "table_row" and self._has_table_semantic_type(candidate, "deadlines"):
-            return 6
+            return 0
         if has_temporal_markers:
-            return 7
-        return 8
+            return 1
+        return 20
 
     def _has_min_intent_anchor_match(
         self,

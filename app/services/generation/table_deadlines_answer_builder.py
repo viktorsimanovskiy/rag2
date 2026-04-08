@@ -13,11 +13,18 @@ class DeadlineAnswerItem:
     citation_json: dict[str, Any] = field(default_factory=dict)
 
     fact_type: str | None = None
+    deadline_kind: str = "other"
+    kind_confidence: float = 0.0
     is_service_core_deadline: bool = False
     candidate_score: float = 0.0
 
     table_title: str | None = None
     table_number: str | None = None
+
+    source_row_ids: list[str] = field(default_factory=list)
+    source_block_ids: list[str] = field(default_factory=list)
+    source_fact_ids: list[str] = field(default_factory=list)
+    source_scores: list[float] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -61,11 +68,17 @@ class DeadlinesAnswerBuildResult:
             "scope_text": item.scope_text,
             "source_type": item.source_type,
             "fact_type": item.fact_type,
+            "deadline_kind": item.deadline_kind,
+            "kind_confidence": item.kind_confidence,
             "is_service_core_deadline": item.is_service_core_deadline,
             "candidate_score": item.candidate_score,
             "table_title": item.table_title,
             "table_number": item.table_number,
             "citation_json": item.citation_json,
+            "source_row_ids": item.source_row_ids,
+            "source_block_ids": item.source_block_ids,
+            "source_fact_ids": item.source_fact_ids,
+            "source_scores": item.source_scores,
         }
 
 
@@ -73,13 +86,10 @@ class TableDeadlinesAnswerBuilder:
     """
     Deterministic builder for deadline questions.
 
-    Что меняем по сравнению с предыдущей версией:
-    - block-кандидаты остаются полноправным источником срока;
-    - классификация kind становится контекстной: payment / notification
-      должны выигрывать у простого упоминания "принятия решения", если
-      это лишь опорная точка для последующего этапа;
-    - render_text по возможности отдаёт один основной срок, а не свалку
-      всех найденных сроков разных этапов.
+    Цель:
+    - выбрать один основной срок по типу вопроса;
+    - не смешивать procedural noise с целевым сроком;
+    - уметь брать сроки из legal_fact, table_row и block.
     """
 
     _IGNORED_SCOPE_KEYS = {
@@ -102,16 +112,12 @@ class TableDeadlinesAnswerBuilder:
         "decision": "принятия решения",
         "notification": "уведомления",
         "payment": "выплаты",
+        "registration": "регистрации",
+        "correction": "исправления ошибок",
         "other": "срока",
     }
 
-    # Общие deadline-паттерны. Порядок важен: сначала более длинные и
-    # предметные формулы, затем более короткие.
     _BLOCK_DEADLINE_PATTERNS = [
-        re.compile(
-            r"не позднее\s+26(?:-го)?\s+числа\s+месяца[^.;]{0,160}",
-            re.IGNORECASE,
-        ),
         re.compile(
             r"в течение\s+\d+\s+(?:рабоч(?:их|его)|календарн(?:ых|ого))\s+дн(?:я|ей)",
             re.IGNORECASE,
@@ -121,24 +127,21 @@ class TableDeadlinesAnswerBuilder:
             r"не более\s+\d+\s+(?:рабоч(?:их|его)|календарн(?:ых|ого))\s+дн(?:я|ей)",
             re.IGNORECASE,
         ),
-        re.compile(r"не позднее\s+[^.;]{3,160}", re.IGNORECASE),
+        re.compile(
+            r"не позднее\s+26(?:-го)?\s+числа(?:\s+месяца)?",
+            re.IGNORECASE,
+        ),
+        re.compile(r"не позднее\s+[^.;]{3,140}", re.IGNORECASE),
     ]
 
-    # Для жёсткого отсечения нерелевантных procedural block-ов, которые
-    # попадали в shortlist, но не отвечали на вопрос о сроке ЕДВ как услуги.
-    _OFFTOPIC_BLOCK_MARKERS = (
+    _OFFTOPIC_MARKERS = (
         "исправлении опечаток",
         "опечаток и ошибок",
         "исправлении ошибок",
-        "отказе в приеме к рассмотрению документов",
-        "новый документ взамен",
-        "новый документ",
-        "получения нового документа",
-        "уведомление об отсутствии ошибок",
+        "об отсутствии ошибок",
         "уведомления об отсутствии ошибок",
-        "отсутствии ошибок",
-        "отсутствия ошибок",
-        "содержащего опечатки и ошибки",
+        "нового документа взамен",
+        "новый документ",
         "проверки подписи",
         "подлинности простой электронной подписи",
         "усиленной квалифицированной электронной подписи",
@@ -147,75 +150,67 @@ class TableDeadlinesAnswerBuilder:
         "федерального закона n 63-фз",
     )
 
-    # Маркеры kind-а разбиты по силе. Это позволяет не считать любое
-    # упоминание "принятия решения" признаком decision, если основной смысл
-    # блока - уведомление или выплата после уже принятого решения.
+    _NOTIFICATION_STRONG_MARKERS = (
+        "уведомление о принятом решении",
+        "о принятом решении заявитель",
+        "заявитель уведомляется",
+        "заявитель или представитель уведомляется",
+        "направляется заявителю",
+        "направляет заявителю",
+        "уведомление направляется",
+        "уведомляет заявителя",
+        "уведомляет представителя",
+    )
+    _NOTIFICATION_WEAK_MARKERS = (
+        "уведомление",
+        "уведомляет",
+        "уведомить",
+        "извещает",
+        "извещение",
+        "сообщение о решении",
+        "информирует",
+    )
+
     _PAYMENT_STRONG_MARKERS = (
         "выплачивает",
         "выплачивается",
         "выплата",
         "выплаты",
-        "ежемесячно",
         "перечисление",
-        "перечисления",
         "зачисление",
-        "зачисления",
-        "доставки выплаты",
-        "осуществления выплаты",
-        "через отделение почтовой связи",
-        "российскую кредитную организацию",
+        "ежемесячно",
         "не позднее 26-го числа",
         "не позднее 26 числа",
-        "не позднее 26-го числа месяца",
-        "не позднее 26 числа месяца",
         "26-го числа текущего месяца",
         "26 числа текущего месяца",
-    )
-    _PAYMENT_WEAK_MARKERS = (
-        "предоставление едв",
-        "возобновление едв",
-        "получателю",
-        "денежн",
-    )
-
-    _NOTIFICATION_STRONG_MARKERS = (
-        "направляет",
-        "направить",
-        "уведомление",
-        "уведомляет",
-        "уведомить",
-        "извещение",
-        "извещает",
-        "сообщение о решении",
-        "сообщает заявителю",
-        "информирование",
-        "информирует",
-    )
-    _NOTIFICATION_WEAK_MARKERS = (
-        "заявителю",
-        "ветерану труда края уведомление",
-        "направление уведомления",
     )
 
     _DECISION_STRONG_MARKERS = (
         "решение о предоставлении",
         "решение о назначении",
         "решение принимается",
-        "принимается уполномоченным учреждением",
-        "принятие решения",
         "принятия решения",
-        "назначении едв",
-        "назначение едв",
+        "принятие решения",
         "рассмотрения заявления",
         "рассмотрение заявления",
-        "рассмотрения документов",
-        "регистрации заявления",
+        "назначении едв",
+        "назначение едв",
     )
-    _DECISION_WEAK_MARKERS = (
-        "назначении",
-        "назначение",
-        "решение",
-        "рассмотрение",
+
+    _REGISTRATION_MARKERS = (
+        "регистрация запроса",
+        "регистрация заявления",
+        "регистрируется",
+        "зарегистрировано",
+    )
+
+    _CORRECTION_MARKERS = (
+        "исправление ошибок",
+        "исправлении ошибок",
+        "исправление опечаток",
+        "исправлении опечаток",
+        "об отсутствии ошибок",
+        "опечаток и ошибок",
     )
 
     def build(
@@ -224,31 +219,32 @@ class TableDeadlinesAnswerBuilder:
         candidates: list[Any],
         question_text: Optional[str] = None,
     ) -> DeadlinesAnswerBuildResult:
+        normalized_question = self._normalize(question_text)
+        question_deadline_kind = self._question_deadline_kind(normalized_question) or "other"
+
         raw_items: list[DeadlineAnswerItem] = []
         dropped_rows_debug: list[dict[str, Any]] = []
-
-        normalized_question = self._normalize(question_text)
-        question_deadline_kind = self._question_deadline_kind(normalized_question)
 
         for candidate in candidates:
             item = self._build_item_from_candidate(candidate)
             if item is None:
+                dropped_rows_debug.append(
+                    {
+                        "source_type": self._candidate_source_type(candidate),
+                        "source_id": str(self._candidate_attr(candidate, "source_id", "") or ""),
+                        "reason": "candidate_not_converted",
+                    }
+                )
                 continue
             raw_items.append(item)
 
         if not raw_items:
             return DeadlinesAnswerBuildResult(
                 can_answer=False,
-                question_deadline_kind=question_deadline_kind or "other",
+                question_deadline_kind=question_deadline_kind,
                 reason="no_deadline_items",
                 dropped_rows_debug=dropped_rows_debug,
-                merged_items_debug=[
-                    {
-                        "raw_items_count": 0,
-                        "merged_items_count": 0,
-                        "ranked_items_preview": [],
-                    }
-                ],
+                merged_items_debug=[],
             )
 
         merged_items, merge_debug = self._merge_similar_items(raw_items)
@@ -256,17 +252,10 @@ class TableDeadlinesAnswerBuilder:
         if not merged_items:
             return DeadlinesAnswerBuildResult(
                 can_answer=False,
-                question_deadline_kind=question_deadline_kind or "other",
+                question_deadline_kind=question_deadline_kind,
                 reason="no_merged_deadline_items",
                 dropped_rows_debug=dropped_rows_debug,
-                merged_items_debug=[
-                    *merge_debug,
-                    {
-                        "raw_items_count": len(raw_items),
-                        "merged_items_count": 0,
-                        "ranked_items_preview": [],
-                    },
-                ],
+                merged_items_debug=merge_debug,
             )
 
         ranked_items = sorted(
@@ -290,7 +279,7 @@ class TableDeadlinesAnswerBuilder:
 
         return DeadlinesAnswerBuildResult(
             can_answer=True,
-            question_deadline_kind=question_deadline_kind or "other",
+            question_deadline_kind=question_deadline_kind,
             primary_item=primary_item,
             alternative_items=alternative_items,
             dropped_rows_debug=dropped_rows_debug,
@@ -305,6 +294,8 @@ class TableDeadlinesAnswerBuilder:
                             "scope_text": item.scope_text,
                             "source_type": item.source_type,
                             "fact_type": item.fact_type,
+                            "deadline_kind": item.deadline_kind,
+                            "kind_confidence": item.kind_confidence,
                             "is_service_core_deadline": item.is_service_core_deadline,
                             "candidate_score": item.candidate_score,
                             "rank_score": self._rank_item(
@@ -319,7 +310,33 @@ class TableDeadlinesAnswerBuilder:
             ambiguity_reason=ambiguity_reason,
             reason=None,
         )
-        
+
+    def render_text(
+        self,
+        *,
+        result: DeadlinesAnswerBuildResult,
+    ) -> Optional[str]:
+        if not result.can_answer or result.primary_item is None:
+            return None
+
+        primary = result.primary_item
+        label = self._DEADLINE_KIND_LABELS.get(
+            primary.deadline_kind,
+            self._DEADLINE_KIND_LABELS["other"],
+        )
+
+        if primary.scope_text:
+            return (
+                f"Срок {label} по найденным источникам: "
+                f"{primary.deadline_value} ({primary.scope_text})."
+            )
+
+        return f"Срок {label} по найденным источникам: {primary.deadline_value}."
+
+    # --------------------------------------------------------
+    # Candidate conversion
+    # --------------------------------------------------------
+
     def _build_item_from_candidate(
         self,
         candidate: Any,
@@ -332,74 +349,48 @@ class TableDeadlinesAnswerBuilder:
         if source_type == "table_row":
             return self._build_item_from_table_row_candidate(candidate)
 
+        if source_type == "block":
+            return self._build_item_from_block_candidate(candidate)
+
         return None
-        
-    def _build_item_from_table_row_candidate(
-        self,
-        candidate: Any,
-    ) -> DeadlineAnswerItem | None:
-        deadline_value = self._extract_deadline_value(candidate)
-        if not deadline_value:
-            return None
 
-        if self._is_service_value(deadline_value):
-            return None
-        if not self._looks_like_deadline_value(deadline_value):
-            return None
-
-        scope_text = self._extract_scope_text(candidate)
-        scope_text = self._clean(scope_text) if scope_text else ""
-
-        citation_json = self._candidate_citation_json(candidate)
-        metadata_json = self._candidate_metadata_json(candidate)
-
-        return DeadlineAnswerItem(
-            deadline_value=self._clean(deadline_value),
-            scope_text=scope_text or "",
-            source_type="table_row",
-            citation_json=citation_json,
-            fact_type=None,
-            is_service_core_deadline=self._table_row_is_service_core(scope_text),
-            candidate_score=self._candidate_score(candidate),
-            table_title=metadata_json.get("table_title"),
-            table_number=metadata_json.get("table_number"),
-        )
-        
     def _build_item_from_legal_fact_candidate(
         self,
         candidate: Any,
     ) -> DeadlineAnswerItem | None:
         payload = self._candidate_payload(candidate)
         value_json = payload.get("value_json") or {}
-        metadata_json = payload.get("metadata_json") or {}
+        metadata_json = self._candidate_metadata_json(candidate)
         condition_json = payload.get("condition_json") or {}
 
-        deadline_value = (
+        deadline_value = self._clean(
             value_json.get("deadline_value")
             or value_json.get("value")
             or ""
         )
-        deadline_value = self._clean(deadline_value)
-
         if not deadline_value:
             return None
         if not self._looks_like_deadline_value(deadline_value):
             return None
 
-        scope_text = (
+        scope_text = self._clean(
             metadata_json.get("deadline_scope_text")
             or condition_json.get("deadline_scope_text")
             or condition_json.get("heading_text")
             or value_json.get("source_text")
             or self._candidate_text(candidate)
             or ""
-        )
-        scope_text = self._clean(scope_text)
+        ) or ""
 
         fact_type = (
             self._candidate_attr(candidate, "fact_type")
             or payload.get("fact_type")
             or metadata_json.get("fact_type")
+        )
+        fact_type = self._clean(fact_type)
+
+        deadline_kind, kind_confidence = self._classify_deadline_kind(
+            text=" ".join([deadline_value, scope_text, fact_type or ""]),
         )
 
         is_service_core_deadline = bool(
@@ -407,149 +398,536 @@ class TableDeadlinesAnswerBuilder:
             or condition_json.get("is_service_core_deadline")
         )
 
+        source_id = str(self._candidate_attr(candidate, "source_id", "") or "")
+
         return DeadlineAnswerItem(
             deadline_value=deadline_value,
             scope_text=scope_text,
             source_type="legal_fact",
             citation_json=self._candidate_citation_json(candidate),
             fact_type=fact_type,
+            deadline_kind=deadline_kind,
+            kind_confidence=kind_confidence,
             is_service_core_deadline=is_service_core_deadline,
             candidate_score=self._candidate_score(candidate),
-            table_title=None,
-            table_number=None,
+            source_fact_ids=[source_id] if source_id else [],
+            source_scores=[self._candidate_score(candidate)],
         )
-        
+
+    def _build_item_from_table_row_candidate(
+        self,
+        candidate: Any,
+    ) -> DeadlineAnswerItem | None:
+        metadata_json = self._candidate_metadata_json(candidate)
+        cells = (
+            metadata_json.get("cells_by_semantic_key")
+            or metadata_json.get("cells_by_header_key")
+            or {}
+        )
+        if not isinstance(cells, dict):
+            cells = {}
+
+        deadline_value = self._extract_deadline_value(cells)
+        if not deadline_value:
+            deadline_value = self._extract_deadline_value_from_text(
+                self._candidate_text(candidate)
+            )
+
+        deadline_value = self._clean(deadline_value)
+        if not deadline_value:
+            return None
+        if self._is_service_value(deadline_value):
+            return None
+        if not self._looks_like_deadline_value(deadline_value):
+            return None
+
+        scope_text = self._extract_scope_text(cells)
+        if not scope_text:
+            scope_text = self._candidate_text(candidate)
+        scope_text = self._clean(scope_text) or ""
+
+        deadline_kind, kind_confidence = self._classify_deadline_kind(
+            text=" ".join([deadline_value, scope_text]),
+        )
+
+        source_id = str(self._candidate_attr(candidate, "source_id", "") or "")
+        source_score = self._candidate_score(candidate)
+
+        return DeadlineAnswerItem(
+            deadline_value=deadline_value,
+            scope_text=scope_text,
+            source_type="table_row",
+            citation_json=self._candidate_citation_json(candidate),
+            fact_type=None,
+            deadline_kind=deadline_kind,
+            kind_confidence=kind_confidence,
+            is_service_core_deadline=self._table_row_is_service_core(scope_text),
+            candidate_score=source_score,
+            table_title=self._clean(metadata_json.get("table_title")),
+            table_number=self._clean(metadata_json.get("table_number")),
+            source_row_ids=[source_id] if source_id else [],
+            source_scores=[source_score],
+        )
+
+    def _build_item_from_block_candidate(
+        self,
+        candidate: Any,
+    ) -> DeadlineAnswerItem | None:
+        text = self._clean(self._candidate_text(candidate))
+        if not text:
+            return None
+
+        if self._is_offtopic_deadline_block(text):
+            return None
+
+        deadline_value = self._extract_deadline_value_from_text(text)
+        if not deadline_value:
+            return None
+
+        deadline_kind, kind_confidence = self._classify_deadline_kind(text=text)
+        scope_text = self._extract_block_scope_text(text=text, deadline_kind=deadline_kind)
+
+        source_id = str(self._candidate_attr(candidate, "source_id", "") or "")
+        source_score = self._candidate_score(candidate)
+
+        return DeadlineAnswerItem(
+            deadline_value=deadline_value,
+            scope_text=scope_text or text,
+            source_type="block",
+            citation_json=self._candidate_citation_json(candidate),
+            fact_type=None,
+            deadline_kind=deadline_kind,
+            kind_confidence=kind_confidence,
+            is_service_core_deadline=self._block_is_service_core(text, deadline_kind),
+            candidate_score=source_score,
+            source_block_ids=[source_id] if source_id else [],
+            source_scores=[source_score],
+        )
+
+    # --------------------------------------------------------
+    # Ranking
+    # --------------------------------------------------------
+
     def _rank_item(
         self,
         *,
         item: DeadlineAnswerItem,
         question_text: str,
     ) -> float:
+        question_kind = self._question_deadline_kind(question_text) or "other"
         score = 0.0
 
-        # 1. legal_fact приоритетнее table_row
         if item.source_type == "legal_fact":
             score += 50.0
         elif item.source_type == "table_row":
-            score += 20.0
+            score += 25.0
+        elif item.source_type == "block":
+            score += 15.0
 
-        # 2. core-сроки приоритетнее procedural/fallback
         if item.is_service_core_deadline:
-            score += 80.0
+            score += 65.0
 
-        # 3. совпадение типа вопроса и типа срока
         score += self._fact_type_bonus(
-            fact_type=item.fact_type,
-            question_text=question_text,
+            deadline_kind=item.deadline_kind,
+            question_kind=question_kind,
         )
 
-        # 4. старый бонус за совпадение scope с вопросом сохраняем
         score += self._question_scope_bonus(
             question_text=question_text,
-            scope_text=item.scope_text,
+            item=item,
         )
 
-        # 5. чем “сильнее” формулировка срока, тем лучше
         score += self._deadline_specificity_score(item.deadline_value)
 
-        # 6. retrieval/rerank score как дополнительный, но не главный сигнал
         score += min(max(item.candidate_score, 0.0), 1.0) * 10.0
 
+        if question_kind == "notification":
+            score += self._notification_specificity_bonus(item)
+        elif question_kind == "decision":
+            score += self._decision_specificity_bonus(item)
+        elif question_kind == "payment":
+            score += self._payment_specificity_bonus(item)
+        elif question_kind == "registration":
+            score += self._registration_specificity_bonus(item)
+        elif question_kind == "correction":
+            score += self._correction_specificity_bonus(item)
+
         return score
-        
+
     def _fact_type_bonus(
         self,
         *,
-        fact_type: str | None,
-        question_text: str,
+        deadline_kind: str,
+        question_kind: str,
     ) -> float:
-        question_kind = self._question_deadline_kind(question_text)
+        if question_kind == "other":
+            weights = {
+                "decision": 30.0,
+                "notification": 25.0,
+                "payment": 25.0,
+                "registration": 15.0,
+                "correction": -10.0,
+                "other": 0.0,
+            }
+            return weights.get(deadline_kind, 0.0)
 
-        if not fact_type:
+        if deadline_kind == question_kind:
+            return 90.0
+
+        if question_kind == "notification":
+            cross = {
+                "decision": 10.0,
+                "payment": -20.0,
+                "registration": -10.0,
+                "correction": -80.0,
+                "other": -15.0,
+            }
+            return cross.get(deadline_kind, 0.0)
+
+        if question_kind == "decision":
+            cross = {
+                "notification": 5.0,
+                "payment": -25.0,
+                "registration": -5.0,
+                "correction": -60.0,
+                "other": -10.0,
+            }
+            return cross.get(deadline_kind, 0.0)
+
+        if question_kind == "payment":
+            cross = {
+                "notification": -20.0,
+                "decision": -20.0,
+                "registration": -10.0,
+                "correction": -60.0,
+                "other": -10.0,
+            }
+            return cross.get(deadline_kind, 0.0)
+
+        if question_kind == "registration":
+            cross = {
+                "notification": -10.0,
+                "decision": -5.0,
+                "payment": -15.0,
+                "correction": -40.0,
+                "other": -5.0,
+            }
+            return cross.get(deadline_kind, 0.0)
+
+        if question_kind == "correction":
+            cross = {
+                "notification": -30.0,
+                "decision": -30.0,
+                "payment": -30.0,
+                "registration": -15.0,
+                "other": -10.0,
+            }
+            return cross.get(deadline_kind, 0.0)
+
+        return 0.0
+
+    def _question_scope_bonus(
+        self,
+        *,
+        question_text: str,
+        item: DeadlineAnswerItem,
+    ) -> float:
+        question_norm = self._normalize(question_text)
+        scope_norm = self._normalize(item.scope_text)
+        if not question_norm or not scope_norm:
             return 0.0
 
-        generic_weights = {
-            "decision_deadline": 60.0,
-            "notification_deadline": 45.0,
-            "payment_deadline": 40.0,
-            "registration_deadline": 20.0,
-            "correction_deadline": 5.0,
-            "applicant_action_deadline": -20.0,
-            "internal_procedure_deadline": -30.0,
-        }
+        bonus = 0.0
+        for token in question_norm.split():
+            if len(token) < 4:
+                continue
+            if token in scope_norm:
+                bonus += 0.04
 
-        decision_weights = {
-            "decision_deadline": 100.0,
-            "notification_deadline": 25.0,
-            "payment_deadline": 10.0,
-            "registration_deadline": 10.0,
-            "correction_deadline": -10.0,
-            "applicant_action_deadline": -40.0,
-            "internal_procedure_deadline": -50.0,
-        }
+        return min(bonus, 0.20)
 
-        notification_weights = {
-            "decision_deadline": 20.0,
-            "notification_deadline": 100.0,
-            "payment_deadline": 5.0,
-            "registration_deadline": 5.0,
-            "correction_deadline": -10.0,
-            "applicant_action_deadline": -40.0,
-            "internal_procedure_deadline": -50.0,
-        }
+    def _notification_specificity_bonus(
+        self,
+        item: DeadlineAnswerItem,
+    ) -> float:
+        text = self._normalize(" ".join([item.deadline_value, item.scope_text, item.fact_type or ""]))
+        score = 0.0
 
-        payment_weights = {
-            "decision_deadline": 10.0,
-            "notification_deadline": 10.0,
-            "payment_deadline": 100.0,
-            "registration_deadline": 0.0,
-            "correction_deadline": -20.0,
-            "applicant_action_deadline": -50.0,
-            "internal_procedure_deadline": -50.0,
-        }
+        if self._has_exact_notification_decision_marker(text):
+            score += 40.0
 
-        registration_weights = {
-            "decision_deadline": 10.0,
-            "notification_deadline": 10.0,
-            "payment_deadline": 0.0,
-            "registration_deadline": 100.0,
-            "correction_deadline": 0.0,
-            "applicant_action_deadline": -30.0,
-            "internal_procedure_deadline": -20.0,
-        }
+        if "уведом" in text:
+            score += 12.0
 
-        correction_weights = {
-            "decision_deadline": 0.0,
-            "notification_deadline": 0.0,
-            "payment_deadline": -20.0,
-            "registration_deadline": 0.0,
-            "correction_deadline": 100.0,
-            "applicant_action_deadline": -20.0,
-            "internal_procedure_deadline": -20.0,
-        }
+        if "о принятом решении" in text or "о решении" in text:
+            score += 15.0
 
-        by_kind = {
-            "decision": decision_weights,
-            "notification": notification_weights,
-            "payment": payment_weights,
-            "registration": registration_weights,
-            "correction": correction_weights,
-            None: generic_weights,
-        }
+        if "об отсутствии ошибок" in text:
+            score -= 70.0
 
-        weights = by_kind.get(question_kind, generic_weights)
-        return weights.get(fact_type, 0.0)
-        
+        if "опечат" in text or "ошиб" in text:
+            score -= 55.0
+
+        if "проверки подписи" in text or "электронной подписи" in text:
+            score -= 60.0
+
+        return score
+
+    def _decision_specificity_bonus(
+        self,
+        item: DeadlineAnswerItem,
+    ) -> float:
+        text = self._normalize(" ".join([item.deadline_value, item.scope_text, item.fact_type or ""]))
+        score = 0.0
+
+        if "решение о предоставлении" in text or "решение о назначении" in text:
+            score += 22.0
+
+        if "рассмотрения заявления" in text or "принятия решения" in text:
+            score += 14.0
+
+        if "уведом" in text and "о принятом решении" not in text:
+            score -= 18.0
+
+        if "об отсутствии ошибок" in text:
+            score -= 60.0
+
+        return score
+
+    def _payment_specificity_bonus(
+        self,
+        item: DeadlineAnswerItem,
+    ) -> float:
+        text = self._normalize(" ".join([item.deadline_value, item.scope_text, item.fact_type or ""]))
+        score = 0.0
+
+        if "26-го числа" in text or "26 числа" in text:
+            score += 18.0
+        if "выплат" in text or "перечисл" in text or "зачисл" in text:
+            score += 14.0
+        if "уведом" in text:
+            score -= 18.0
+        return score
+
+    def _registration_specificity_bonus(
+        self,
+        item: DeadlineAnswerItem,
+    ) -> float:
+        text = self._normalize(" ".join([item.deadline_value, item.scope_text, item.fact_type or ""]))
+        if "регистрац" in text or "регистрир" in text:
+            return 18.0
+        return 0.0
+
+    def _correction_specificity_bonus(
+        self,
+        item: DeadlineAnswerItem,
+    ) -> float:
+        text = self._normalize(" ".join([item.deadline_value, item.scope_text, item.fact_type or ""]))
+        if "опечат" in text or "ошиб" in text:
+            return 20.0
+        return 0.0
+
+    # --------------------------------------------------------
+    # Merge
+    # --------------------------------------------------------
+
+    def _merge_similar_items(
+        self,
+        items: list[DeadlineAnswerItem],
+    ) -> tuple[list[DeadlineAnswerItem], list[dict[str, Any]]]:
+        merged: dict[tuple[str, str, str], DeadlineAnswerItem] = {}
+        debug: list[dict[str, Any]] = []
+
+        for item in items:
+            merge_key = (
+                self._normalize(item.deadline_value),
+                self._normalize(item.scope_text),
+                self._normalize(item.deadline_kind),
+            )
+
+            existing = merged.get(merge_key)
+            if existing is None:
+                merged[merge_key] = DeadlineAnswerItem(
+                    deadline_value=item.deadline_value,
+                    scope_text=item.scope_text,
+                    source_type=item.source_type,
+                    citation_json=item.citation_json or {},
+                    fact_type=item.fact_type,
+                    deadline_kind=item.deadline_kind,
+                    kind_confidence=item.kind_confidence,
+                    is_service_core_deadline=item.is_service_core_deadline,
+                    candidate_score=item.candidate_score,
+                    table_title=item.table_title,
+                    table_number=item.table_number,
+                    source_row_ids=list(item.source_row_ids),
+                    source_block_ids=list(item.source_block_ids),
+                    source_fact_ids=list(item.source_fact_ids),
+                    source_scores=list(item.source_scores),
+                )
+                debug.append(
+                    {
+                        "action": "create",
+                        "merge_key": merge_key,
+                        "deadline_value": item.deadline_value,
+                        "scope_text": item.scope_text,
+                        "deadline_kind": item.deadline_kind,
+                        "source_type": item.source_type,
+                    }
+                )
+                continue
+
+            existing.candidate_score = max(existing.candidate_score, item.candidate_score)
+            existing.kind_confidence = max(existing.kind_confidence, item.kind_confidence)
+            existing.is_service_core_deadline = (
+                existing.is_service_core_deadline or item.is_service_core_deadline
+            )
+
+            if existing.source_type != "legal_fact" and item.source_type == "legal_fact":
+                existing.source_type = "legal_fact"
+
+            if not existing.fact_type and item.fact_type:
+                existing.fact_type = item.fact_type
+
+            if item.scope_text and len(item.scope_text) > len(existing.scope_text or ""):
+                existing.scope_text = item.scope_text
+
+            if not existing.citation_json and item.citation_json:
+                existing.citation_json = item.citation_json
+
+            if not existing.table_title and item.table_title:
+                existing.table_title = item.table_title
+            if not existing.table_number and item.table_number:
+                existing.table_number = item.table_number
+
+            existing.source_row_ids.extend(x for x in item.source_row_ids if x not in existing.source_row_ids)
+            existing.source_block_ids.extend(x for x in item.source_block_ids if x not in existing.source_block_ids)
+            existing.source_fact_ids.extend(x for x in item.source_fact_ids if x not in existing.source_fact_ids)
+            existing.source_scores.extend(item.source_scores)
+
+            debug.append(
+                {
+                    "action": "merge",
+                    "merge_key": merge_key,
+                    "deadline_value": existing.deadline_value,
+                    "scope_text": existing.scope_text,
+                    "deadline_kind": existing.deadline_kind,
+                    "source_type": existing.source_type,
+                }
+            )
+
+        return list(merged.values()), debug
+
+    # --------------------------------------------------------
+    # Extraction helpers
+    # --------------------------------------------------------
+
+    def _extract_deadline_value(
+        self,
+        cells: dict[str, Any],
+    ) -> Optional[str]:
+        direct_value = self._clean(cells.get("deadline_value"))
+        if direct_value:
+            return direct_value
+
+        for key, value in cells.items():
+            key_norm = self._normalize(key)
+            if "срок" in key_norm or "рабочих дней" in key_norm or "календарных дней" in key_norm:
+                cleaned = self._clean(value)
+                if cleaned:
+                    return cleaned
+        return None
+
+    def _extract_scope_text(
+        self,
+        cells: dict[str, Any],
+    ) -> Optional[str]:
+        parts: list[str] = []
+
+        for key, value in cells.items():
+            if key in self._IGNORED_SCOPE_KEYS:
+                continue
+
+            cleaned_value = self._clean(value)
+            if not cleaned_value:
+                continue
+            if self._is_service_value(cleaned_value):
+                continue
+            if self._looks_like_deadline_value(cleaned_value):
+                continue
+
+            pretty_key = self._pretty_label(key)
+            if pretty_key:
+                parts.append(f"{pretty_key}: {cleaned_value}")
+            else:
+                parts.append(cleaned_value)
+
+        if not parts:
+            return None
+
+        if len(parts) == 1:
+            return parts[0]
+
+        return "; ".join(parts[:3])
+
+    def _extract_deadline_value_from_text(
+        self,
+        text: str,
+    ) -> Optional[str]:
+        for pattern in self._BLOCK_DEADLINE_PATTERNS:
+            match = pattern.search(text or "")
+            if match:
+                return self._clean(match.group(0))
+        return None
+
+    def _extract_block_scope_text(
+        self,
+        *,
+        text: str,
+        deadline_kind: str,
+    ) -> Optional[str]:
+        norm = self._normalize(text)
+
+        if deadline_kind == "notification":
+            if "о принятом решении" in norm:
+                return "уведомление о принятом решении"
+            if "уведомление" in norm:
+                return "уведомление о решении"
+            return "уведомление"
+
+        if deadline_kind == "decision":
+            if "решение о предоставлении" in norm:
+                return "принятие решения о предоставлении"
+            if "решение о назначении" in norm:
+                return "принятие решения о назначении"
+            return "принятие решения"
+
+        if deadline_kind == "payment":
+            if "едв" in norm:
+                return "выплата ЕДВ"
+            return "выплата"
+
+        if deadline_kind == "registration":
+            return "регистрация заявления"
+
+        if deadline_kind == "correction":
+            return "исправление ошибок и опечаток"
+
+        return None
+
+    # --------------------------------------------------------
+    # Classification helpers
+    # --------------------------------------------------------
+
     def _question_deadline_kind(
         self,
         question_text: str,
     ) -> str | None:
-        text = self._clean(question_text).lower()
+        text = self._normalize(question_text)
 
         if any(x in text for x in ("выплат", "перечисл", "деньги", "26-го числа", "26 числа")):
             return "payment"
 
-        if any(x in text for x in ("уведом", "сообщ", "извест", "когда ответят")):
+        if any(x in text for x in ("уведом", "сообщ", "извест", "о решении")):
             return "notification"
 
         if any(x in text for x in ("зарегистр", "регистрац")):
@@ -562,7 +940,55 @@ class TableDeadlinesAnswerBuilder:
             return "decision"
 
         return None
-        
+
+    def _classify_deadline_kind(
+        self,
+        *,
+        text: Optional[str],
+    ) -> tuple[str, float]:
+        norm = self._normalize(text)
+        if not norm:
+            return ("other", 0.0)
+
+        scores = {
+            "decision": 0.0,
+            "notification": 0.0,
+            "payment": 0.0,
+            "registration": 0.0,
+            "correction": 0.0,
+        }
+
+        scores["notification"] += self._score_by_markers(norm, self._NOTIFICATION_STRONG_MARKERS, 2.3)
+        scores["notification"] += self._score_by_markers(norm, self._NOTIFICATION_WEAK_MARKERS, 0.7)
+
+        scores["payment"] += self._score_by_markers(norm, self._PAYMENT_STRONG_MARKERS, 2.2)
+        scores["decision"] += self._score_by_markers(norm, self._DECISION_STRONG_MARKERS, 1.9)
+        scores["registration"] += self._score_by_markers(norm, self._REGISTRATION_MARKERS, 2.0)
+        scores["correction"] += self._score_by_markers(norm, self._CORRECTION_MARKERS, 2.4)
+
+        if scores["notification"] > 0 and "принятия решения" in norm:
+            scores["decision"] *= 0.55
+
+        if scores["payment"] > 0 and "принятия решения" in norm:
+            scores["decision"] *= 0.45
+
+        ordered = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        winner, winner_score = ordered[0]
+        if winner_score <= 0:
+            return ("other", 0.0)
+
+        total = sum(scores.values()) or 1.0
+        confidence = round(winner_score / total, 3)
+
+        if len(ordered) >= 2 and ordered[0][1] - ordered[1][1] < 0.35:
+            confidence = round(min(confidence, 0.58), 3)
+
+        return (winner, confidence)
+
+    # --------------------------------------------------------
+    # Utility helpers
+    # --------------------------------------------------------
+
     def _candidate_attr(
         self,
         candidate: Any,
@@ -623,19 +1049,25 @@ class TableDeadlinesAnswerBuilder:
         candidate: Any,
     ) -> str:
         payload = self._candidate_payload(candidate)
-        return (
-            self._candidate_attr(candidate, "content_text")
-            or self._candidate_attr(candidate, "text")
-            or payload.get("validity_note")
-            or ""
-        )
+        metadata = self._candidate_metadata_json(candidate)
+
+        parts: list[str] = [
+            self._clean(self._candidate_attr(candidate, "title", "")) or "",
+            self._clean(self._candidate_attr(candidate, "snippet", "")) or "",
+            self._clean(payload.get("validity_note")) or "",
+            self._clean(metadata.get("row_summary")) or "",
+            self._clean(metadata.get("row_text")) or "",
+        ]
+
+        return self._clean(" ".join(x for x in parts if x)) or ""
 
     def _candidate_score(
         self,
         candidate: Any,
     ) -> float:
         raw = (
-            self._candidate_attr(candidate, "effective_score")
+            self._candidate_attr(candidate, "rerank_score")
+            or self._candidate_attr(candidate, "effective_score")
             or self._candidate_attr(candidate, "score")
             or self._candidate_attr(candidate, "source_score")
             or 0.0
@@ -645,474 +1077,10 @@ class TableDeadlinesAnswerBuilder:
         except (TypeError, ValueError):
             return 0.0
 
-    def render_text(
+    def _deadline_specificity_score(
         self,
-        *,
-        result: DeadlinesAnswerBuildResult,
-    ) -> Optional[str]:
-        if not result.can_answer or result.primary_item is None:
-            return None
-
-        primary = result.primary_item
-        question_kind = result.question_deadline_kind
-        primary_label = self._DEADLINE_KIND_LABELS.get(
-            primary.deadline_kind,
-            self._DEADLINE_KIND_LABELS["other"],
-        )
-
-        # Главный режим: пользователь спросил про конкретный этап, и у нас
-        # есть сильный primary этого же типа. Тогда отвечаем одним сроком,
-        # не засоряя ответ уведомлением/выплатой из соседних пунктов.
-        if self._should_render_single_primary(
-            primary=primary,
-            alternatives=result.alternative_items,
-            question_deadline_kind=question_kind,
-        ):
-            if primary.scope_text:
-                return (
-                    f"Срок {primary_label} по найденным источникам: "
-                    f"{primary.deadline_value} ({primary.scope_text})."
-                )
-            return f"Срок {primary_label} по найденным источникам: {primary.deadline_value}."
-
-        # Осторожный fallback: выводим только близкие альтернативы. При
-        # вопросе про конкретный этап не показываем альтернативы других типов,
-        # чтобы не подменять ответ списком чужих сроков.
-        visible_alternatives = self._select_visible_alternatives(
-            primary=primary,
-            alternatives=result.alternative_items,
-            question_deadline_kind=question_kind,
-        )
-
-        if not visible_alternatives:
-            if primary.scope_text:
-                return (
-                    f"Срок {primary_label} по найденным источникам: "
-                    f"{primary.deadline_value} ({primary.scope_text})."
-                )
-            return f"Срок {primary_label} по найденным источникам: {primary.deadline_value}."
-
-        lines: list[str] = ["По найденным источникам установлены следующие сроки:"]
-        lines.append(self._render_bulleted_item(primary))
-        for item in visible_alternatives:
-            lines.append(self._render_bulleted_item(item))
-        lines.append("")
-        lines.append("Конкретный срок зависит от того, о каком действии или этапе процедуры идёт речь.")
-        return "\n".join(lines)
-
-    def _build_item_from_table_row(
-        self,
-        *,
-        candidate: Any,
-        normalized_question: str,
-        question_deadline_kind: str,
-        dropped_rows_debug: list[dict[str, Any]],
-    ) -> Optional[DeadlineAnswerItem]:
-        row_id = str(getattr(candidate, "source_id", "") or "")
-        metadata = getattr(candidate, "metadata_json", None) or {}
-        table_semantic_type = self._clean(metadata.get("table_semantic_type"))
-        score = self._extract_candidate_score(candidate)
-
-        cells = metadata.get("cells_by_semantic_key") or metadata.get("cells_by_header_key") or {}
-        if not isinstance(cells, dict):
-            dropped_rows_debug.append({"row_id": row_id, "reason": "cells_not_dict"})
-            return None
-
-        deadline_value = self._extract_deadline_value(cells)
-        if not deadline_value:
-            dropped_rows_debug.append(
-                {
-                    "row_id": row_id,
-                    "reason": "empty_deadline_value",
-                    "table_semantic_type": table_semantic_type,
-                }
-            )
-            return None
-
-        if self._is_service_value(deadline_value):
-            dropped_rows_debug.append(
-                {
-                    "row_id": row_id,
-                    "reason": "service_header_row",
-                    "deadline_value": deadline_value,
-                }
-            )
-            return None
-
-        if not self._looks_like_deadline_value(deadline_value):
-            dropped_rows_debug.append(
-                {
-                    "row_id": row_id,
-                    "reason": "not_deadline_like_value",
-                    "deadline_value": deadline_value,
-                }
-            )
-            return None
-
-        if table_semantic_type and table_semantic_type.lower() not in {"deadlines", "deadline"}:
-            dropped_rows_debug.append(
-                {
-                    "row_id": row_id,
-                    "reason": "not_deadlines_table",
-                    "table_semantic_type": table_semantic_type,
-                }
-            )
-            return None
-
-        scope_text = self._extract_scope_text(cells)
-        deadline_kind, kind_confidence = self._classify_deadline_kind(
-            text=" ".join([deadline_value or "", scope_text or ""]),
-        )
-        priority_score = score + self._question_scope_bonus(
-            question_text_normalized=normalized_question,
-            question_deadline_kind=question_deadline_kind,
-            item_deadline_kind=deadline_kind,
-            scope_text=scope_text,
-        )
-
-        return DeadlineAnswerItem(
-            deadline_value=deadline_value,
-            scope_text=scope_text,
-            deadline_kind=deadline_kind,
-            kind_confidence=kind_confidence,
-            source_row_ids=[row_id] if row_id else [],
-            source_table_types=[table_semantic_type] if table_semantic_type else [],
-            source_scores=[priority_score],
-        )
-
-    def _build_item_from_block(
-        self,
-        *,
-        candidate: Any,
-        normalized_question: str,
-        question_deadline_kind: str,
-        dropped_rows_debug: list[dict[str, Any]],
-    ) -> Optional[DeadlineAnswerItem]:
-        block_id = str(getattr(candidate, "source_id", "") or "")
-        text = self._clean(getattr(candidate, "snippet", None) or getattr(candidate, "title", None) or "")
-        if not text:
-            dropped_rows_debug.append({"row_id": block_id, "reason": "empty_block_text"})
-            return None
-
-        if self._is_offtopic_deadline_block(text):
-            dropped_rows_debug.append({"row_id": block_id, "reason": "offtopic_deadline_block"})
-            return None
-
-        if not self._has_block_deadline_marker(text):
-            dropped_rows_debug.append({"row_id": block_id, "reason": "block_without_deadline_marker"})
-            return None
-
-        deadline_value = self._extract_deadline_value_from_block(text)
-        if not deadline_value:
-            dropped_rows_debug.append({"row_id": block_id, "reason": "block_deadline_not_extracted"})
-            return None
-
-        deadline_kind, kind_confidence = self._classify_deadline_kind(text=text)
-        scope_text = self._extract_block_scope_text(text=text, deadline_kind=deadline_kind)
-        score = self._extract_candidate_score(candidate)
-        priority_score = score + self._question_scope_bonus(
-            question_text_normalized=normalized_question,
-            question_deadline_kind=question_deadline_kind,
-            item_deadline_kind=deadline_kind,
-            scope_text=scope_text,
-        )
-
-        return DeadlineAnswerItem(
-            deadline_value=deadline_value,
-            scope_text=scope_text,
-            deadline_kind=deadline_kind,
-            kind_confidence=kind_confidence,
-            source_block_ids=[block_id] if block_id else [],
-            source_scores=[priority_score],
-        )
-
-    def _merge_similar_items(
-        self,
-        items: list[DeadlineAnswerItem],
-    ) -> tuple[list[DeadlineAnswerItem], list[dict[str, Any]]]:
-        merged: dict[tuple[str, str], DeadlineAnswerItem] = {}
-        debug: list[dict[str, Any]] = []
-
-        for item in items:
-            normalized_value = self._normalize(item.deadline_value)
-            normalized_scope = self._normalize(item.scope_text)
-
-            # Мержим по deadline_value + scope_text.
-            # Если scope пустой, всё равно не теряем item.
-            merge_key = (normalized_value, normalized_scope)
-
-            existing = merged.get(merge_key)
-            if existing is None:
-                merged[merge_key] = DeadlineAnswerItem(
-                    deadline_value=item.deadline_value,
-                    scope_text=item.scope_text,
-                    source_type=item.source_type,
-                    citation_json=item.citation_json or {},
-                    fact_type=item.fact_type,
-                    is_service_core_deadline=item.is_service_core_deadline,
-                    candidate_score=item.candidate_score,
-                    table_title=item.table_title,
-                    table_number=item.table_number,
-                )
-                debug.append(
-                    {
-                        "action": "create",
-                        "merge_key": merge_key,
-                        "deadline_value": item.deadline_value,
-                        "scope_text": item.scope_text,
-                        "source_type": item.source_type,
-                        "fact_type": item.fact_type,
-                        "is_service_core_deadline": item.is_service_core_deadline,
-                        "candidate_score": item.candidate_score,
-                    }
-                )
-                continue
-
-            # 1. Сохраняем максимальный score.
-            existing.candidate_score = max(existing.candidate_score, item.candidate_score)
-
-            # 2. Если любой из item core -> merged тоже core.
-            existing.is_service_core_deadline = (
-                existing.is_service_core_deadline or item.is_service_core_deadline
-            )
-
-            # 3. legal_fact приоритетнее table_row.
-            if existing.source_type != "legal_fact" and item.source_type == "legal_fact":
-                existing.source_type = "legal_fact"
-                existing.fact_type = item.fact_type or existing.fact_type
-                if item.citation_json:
-                    existing.citation_json = item.citation_json
-                if item.scope_text and (
-                    not existing.scope_text
-                    or len(item.scope_text) > len(existing.scope_text)
-                ):
-                    existing.scope_text = item.scope_text
-
-            # 4. Если fact_type ещё пустой — дозаполняем.
-            if not existing.fact_type and item.fact_type:
-                existing.fact_type = item.fact_type
-
-            # 5. Берём более содержательный scope_text.
-            if item.scope_text and (
-                not existing.scope_text
-                or len(self._clean(item.scope_text)) > len(self._clean(existing.scope_text))
-            ):
-                existing.scope_text = item.scope_text
-
-            # 6. Если у existing нет citation_json — дозаполняем.
-            if not existing.citation_json and item.citation_json:
-                existing.citation_json = item.citation_json
-
-            # 7. Если table metadata пустые — дозаполняем.
-            if not existing.table_title and item.table_title:
-                existing.table_title = item.table_title
-            if not existing.table_number and item.table_number:
-                existing.table_number = item.table_number
-
-            debug.append(
-                {
-                    "action": "merge",
-                    "merge_key": merge_key,
-                    "existing_source_type": existing.source_type,
-                    "incoming_source_type": item.source_type,
-                    "deadline_value": existing.deadline_value,
-                    "scope_text": existing.scope_text,
-                    "fact_type": existing.fact_type,
-                    "is_service_core_deadline": existing.is_service_core_deadline,
-                    "candidate_score": existing.candidate_score,
-                }
-            )
-
-        merged_items = list(merged.values())
-        return merged_items, debug
-
-    def _primary_sort_key(
-        self,
-        *,
-        item: DeadlineAnswerItem,
-        question_deadline_kind: str,
-    ) -> tuple[int, float, float, float, int, int]:
-        kind_bucket = 1
-        if question_deadline_kind == "other":
-            kind_bucket = 0
-        elif item.deadline_kind == question_deadline_kind:
-            kind_bucket = 0
-
-        # table_row оставляем слегка предпочтительным, но не настолько,
-        # чтобы подавлять хороший block по точному kind-совпадению.
-        source_bonus = 0.05 if item.source_row_ids else 0.0
-
-        return (
-            kind_bucket,
-            -(self._best_score(item) + source_bonus),
-            -item.kind_confidence,
-            -self._deadline_specificity_score(item.deadline_value),
-            -self._same_kind_source_count(item),
-            len(item.scope_text or ""),
-        )
-
-    def _extract_deadline_value(self, cells: dict[str, Any]) -> Optional[str]:
-        direct_value = self._clean(cells.get("deadline_value"))
-        if direct_value:
-            return direct_value
-
-        for key, value in cells.items():
-            key_norm = self._normalize(key)
-            if "срок" in key_norm or "рабочих дней" in key_norm or "календарных дней" in key_norm:
-                cleaned = self._clean(value)
-                if cleaned:
-                    return cleaned
-        return None
-
-    def _extract_scope_text(self, cells: dict[str, Any]) -> Optional[str]:
-        parts: list[str] = []
-        for key, value in cells.items():
-            if key in self._IGNORED_SCOPE_KEYS:
-                continue
-            cleaned_value = self._clean(value)
-            if not cleaned_value:
-                continue
-            if self._is_service_value(cleaned_value):
-                continue
-            if self._looks_like_deadline_value(cleaned_value):
-                continue
-            pretty_key = self._pretty_label(key)
-            if pretty_key:
-                parts.append(f"{pretty_key}: {cleaned_value}")
-            else:
-                parts.append(cleaned_value)
-        if not parts:
-            return None
-        if len(parts) == 1:
-            return parts[0]
-        return "; ".join(parts[:3])
-
-    def _extract_deadline_value_from_block(self, text: str) -> Optional[str]:
-        for pattern in self._BLOCK_DEADLINE_PATTERNS:
-            match = pattern.search(text)
-            if match:
-                return self._clean(match.group(0))
-        return None
-
-    def _extract_block_scope_text(self, *, text: str, deadline_kind: str) -> Optional[str]:
-        text_norm = self._normalize(text)
-
-        if deadline_kind == "payment":
-            if "едв" in text_norm:
-                return "выплата ЕДВ"
-            return "выплата"
-
-        if deadline_kind == "notification":
-            if "о назначении едв" in text_norm:
-                return "уведомление о назначении ЕДВ"
-            if "о предоставлении едв" in text_norm:
-                return "уведомление о предоставлении ЕДВ"
-            if "уведомление" in text_norm:
-                return "уведомление о решении"
-            return "уведомление"
-
-        if deadline_kind == "decision":
-            if "решение о предоставлении едв" in text_norm:
-                return "принятие решения о предоставлении ЕДВ"
-            if "решение о назначении едв" in text_norm:
-                return "принятие решения о назначении ЕДВ"
-            return "принятие решения"
-
-        if "предоставлении услуги" in text_norm:
-            return "предоставление услуги"
-        return None
-
-    def _detect_question_deadline_kind(self, question_text_normalized: str) -> str:
-        kind, _ = self._classify_deadline_kind(text=question_text_normalized)
-        return kind
-
-    def _classify_deadline_kind(self, *, text: Optional[str]) -> tuple[str, float]:
-        norm = self._normalize(text)
-        if not norm:
-            return ("other", 0.0)
-
-        payment_score = self._score_by_markers(norm, self._PAYMENT_STRONG_MARKERS, 2.3)
-        payment_score += self._score_by_markers(norm, self._PAYMENT_WEAK_MARKERS, 0.7)
-
-        notification_score = self._score_by_markers(norm, self._NOTIFICATION_STRONG_MARKERS, 2.1)
-        notification_score += self._score_by_markers(norm, self._NOTIFICATION_WEAK_MARKERS, 0.6)
-
-        decision_score = self._score_by_markers(norm, self._DECISION_STRONG_MARKERS, 1.6)
-        decision_score += self._score_by_markers(norm, self._DECISION_WEAK_MARKERS, 0.35)
-
-        # Контекстные поправки.
-        # Для payment/question block-а фраза "со дня принятия решения" не делает
-        # срок decision, если в тексте есть явная выплата/перечисление.
-        if payment_score > 0 and "принятия решения" in norm:
-            decision_score *= 0.45
-
-        # Аналогично для уведомления: наличие "принятия решения" - лишь опорная
-        # точка после которой отправляют уведомление.
-        if notification_score > 0 and "принятия решения" in norm:
-            decision_score *= 0.55
-
-        # Если вопрос/текст напрямую содержит "срок выплаты" или "срок уведомления",
-        # усиливаем соответствующий kind.
-        if "срок выплаты" in norm or "срок выплаты едв" in norm:
-            payment_score += 1.5
-        if "срок уведомления" in norm or "срок уведомления о решении" in norm:
-            notification_score += 1.5
-        if "срок принятия решения" in norm:
-            decision_score += 1.5
-
-        scores = {
-            "decision": decision_score,
-            "notification": notification_score,
-            "payment": payment_score,
-        }
-        winner = max(scores, key=scores.get)
-        best_score = scores[winner]
-        if best_score <= 0:
-            return ("other", 0.0)
-
-        total = sum(scores.values()) or 1.0
-        confidence = round(best_score / total, 3)
-
-        # Если различие между лучшим и вторым кандидатом минимально,
-        # не притворяемся уверенными и снижаем confidence.
-        ordered_scores = sorted(scores.values(), reverse=True)
-        if len(ordered_scores) >= 2 and ordered_scores[0] - ordered_scores[1] < 0.35:
-            confidence = round(min(confidence, 0.58), 3)
-
-        return (winner, confidence)
-
-    def _question_scope_bonus(
-        self,
-        *,
-        question_text_normalized: str,
-        question_deadline_kind: str,
-        item_deadline_kind: str,
-        scope_text: Optional[str],
-    ) -> float:
-        bonus = 0.0
-        if question_deadline_kind != "other" and item_deadline_kind == question_deadline_kind:
-            bonus += 0.45
-        elif question_deadline_kind != "other" and item_deadline_kind != "other":
-            bonus -= 0.22
-
-        if not question_text_normalized or not scope_text:
-            return bonus
-
-        scope_norm = self._normalize(scope_text)
-        if not scope_norm:
-            return bonus
-
-        matched_terms = 0
-        for term in question_text_normalized.split():
-            if len(term) < 4:
-                continue
-            if term in scope_norm:
-                matched_terms += 1
-        if matched_terms >= 1:
-            bonus += min(0.12, matched_terms * 0.04)
-        return bonus
-
-    def _deadline_specificity_score(self, value: str) -> int:
+        value: str,
+    ) -> int:
         text = self._normalize(value)
         score = 0
         if "рабоч" in text:
@@ -1127,113 +1095,14 @@ class TableDeadlinesAnswerBuilder:
             score += 1
         return score
 
-    def _best_score(self, item: DeadlineAnswerItem) -> float:
-        if not item.source_scores:
-            return 0.0
-        return max(item.source_scores)
-
-    def _same_kind_source_count(self, item: DeadlineAnswerItem) -> int:
-        return len(item.source_row_ids) + len(item.source_block_ids)
-
-    def _render_bulleted_item(self, item: DeadlineAnswerItem) -> str:
-        label = self._DEADLINE_KIND_LABELS.get(item.deadline_kind, self._DEADLINE_KIND_LABELS["other"])
-        if item.scope_text:
-            return f"— {item.deadline_value} ({label}; {item.scope_text})"
-        return f"— {item.deadline_value} ({label})"
-
-    def _select_visible_alternatives(
+    def _looks_like_deadline_value(
         self,
-        *,
-        primary: DeadlineAnswerItem,
-        alternatives: list[DeadlineAnswerItem],
-        question_deadline_kind: str,
-    ) -> list[DeadlineAnswerItem]:
-        visible: list[DeadlineAnswerItem] = []
-        primary_score = self._best_score(primary)
-
-        for item in alternatives:
-            # При конкретном вопросе показываем только альтернативы того же kind.
-            if question_deadline_kind != "other" and item.deadline_kind != question_deadline_kind:
-                continue
-
-            # Даже для same-kind альтернатив показываем только действительно
-            # близкие варианты, а не весь хвост.
-            if primary_score - self._best_score(item) > 0.18:
-                continue
-
-            # Не плодим почти одинаковые строки с тем же сроком и тем же типом.
-            if (
-                self._normalize(item.deadline_value) == self._normalize(primary.deadline_value)
-                and item.deadline_kind == primary.deadline_kind
-            ):
-                continue
-
-            visible.append(item)
-            if len(visible) >= 2:
-                break
-
-        return visible
-
-    def _should_render_single_primary(
-        self,
-        *,
-        primary: DeadlineAnswerItem,
-        alternatives: list[DeadlineAnswerItem],
-        question_deadline_kind: str,
+        text: str,
     ) -> bool:
-        if question_deadline_kind == "other":
-            return not alternatives
-
-        if primary.deadline_kind != question_deadline_kind:
-            return False
-
-        # Если следующая same-kind альтернатива сильно слабее, не раздуваем ответ.
-        same_kind_alternatives = [
-            item for item in alternatives if item.deadline_kind == question_deadline_kind
-        ]
-        if not same_kind_alternatives:
-            return True
-
-        next_item = same_kind_alternatives[0]
-        if self._best_score(primary) - self._best_score(next_item) >= 0.18:
-            return True
-
-        # Высокая уверенность в kind + нормальный отрыв по score.
-        if primary.kind_confidence >= 0.62 and self._best_score(primary) - self._best_score(next_item) >= 0.10:
-            return True
-
-        return False
-
-    def _extract_candidate_score(self, candidate: Any) -> float:
-        rerank_score = getattr(candidate, "rerank_score", None)
-        if isinstance(rerank_score, (int, float)):
-            return float(rerank_score)
-        score = getattr(candidate, "score", None)
-        if isinstance(score, (int, float)):
-            return float(score)
-        return 0.0
-
-    def _has_block_deadline_marker(self, text: str) -> bool:
-        norm = self._normalize(text)
-        if not norm:
-            return False
-        if any(pattern.search(text) for pattern in self._BLOCK_DEADLINE_PATTERNS):
-            return True
-        return any(
-            marker in norm
-            for marker in (
-                "рабочих дней",
-                "календарных дней",
-                "в течение",
-                "не позднее",
-                "не более",
-            )
-        )
-
-    def _looks_like_deadline_value(self, text: str) -> bool:
         text_norm = self._normalize(text)
         if not text_norm:
             return False
+
         deadline_markers = [
             "дней",
             "дня",
@@ -1241,63 +1110,92 @@ class TableDeadlinesAnswerBuilder:
             "календарных",
             "не позднее",
             "не более",
-            "до",
             "числа",
         ]
         return any(marker in text_norm for marker in deadline_markers) and any(ch.isdigit() for ch in text)
 
-    def _is_service_value(self, text: str) -> bool:
+    def _is_service_value(
+        self,
+        text: str,
+    ) -> bool:
         return self._normalize(text) in {self._normalize(x) for x in self._SERVICE_VALUES}
 
-    def _is_offtopic_deadline_block(self, text: str) -> bool:
+    def _is_offtopic_deadline_block(
+        self,
+        text: str,
+    ) -> bool:
         norm = self._normalize(text)
-        if not norm:
-            return False
-        return any(marker in norm for marker in self._OFFTOPIC_BLOCK_MARKERS)
+        return any(marker in norm for marker in self._OFFTOPIC_MARKERS)
 
-    def _score_by_markers(self, norm: str, markers: tuple[str, ...], weight: float) -> float:
-        score = 0.0
-        for marker in markers:
-            if marker in norm:
-                score += weight
-        return score
+    def _has_exact_notification_decision_marker(
+        self,
+        text: str,
+    ) -> bool:
+        norm = self._normalize(text)
+        return (
+            "уведом" in norm
+            and (
+                "о принятом решении" in norm
+                or "о решении" in norm
+                or "направляется заявителю" in norm
+                or "направляет заявителю" in norm
+                or "заявитель уведомляется" in norm
+            )
+        )
 
-    def _pretty_label(self, key: Any) -> Optional[str]:
-        if key is None:
-            return None
-        text = str(key).strip().replace("_", " ")
-        text = re.sub(r"\s+", " ", text).strip()
-        return text or None
+    def _block_is_service_core(
+        self,
+        text: str,
+        deadline_kind: str,
+    ) -> bool:
+        norm = self._normalize(text)
 
-    def _clean(self, value: Any) -> Optional[str]:
-        if value is None:
-            return None
-        text = str(value).strip()
-        text = re.sub(r"\s+", " ", text).strip()
-        return text or None
+        if deadline_kind == "notification" and self._has_exact_notification_decision_marker(norm):
+            return True
 
-    def _normalize(self, value: Any) -> str:
-        cleaned = self._clean(value)
-        if not cleaned:
-            return ""
-        return cleaned.lower().replace("ё", "е")
-        
+        if deadline_kind == "decision" and (
+            "решение о предоставлении" in norm
+            or "решение о назначении" in norm
+            or "принятия решения" in norm
+        ):
+            return True
+
+        if deadline_kind == "payment" and (
+            "не позднее 26-го числа" in norm
+            or "не позднее 26 числа" in norm
+            or "выплат" in norm
+        ):
+            return True
+
+        if deadline_kind == "registration" and "регистрац" in norm:
+            return True
+
+        if deadline_kind == "correction" and ("опечат" in norm or "ошиб" in norm):
+            return True
+
+        return False
+
     def _table_row_is_service_core(
         self,
         scope_text: str,
     ) -> bool:
-        text = self._clean(scope_text).lower()
+        text = self._normalize(scope_text)
+
+        if self._has_exact_notification_decision_marker(text):
+            return True
 
         if any(
             marker in text
             for marker in (
                 "предоставления государственной услуги",
                 "принятия решения",
-                "о принятом решении",
-                "уведомляется",
-                "выплата",
-                "не позднее 26-го числа",
+                "решение о предоставлении",
+                "решение о назначении",
+                "регистрация заявления",
                 "регистрация запроса",
+                "выплата",
+                "26-го числа",
+                "26 числа",
             )
         ):
             return True
@@ -1311,8 +1209,50 @@ class TableDeadlinesAnswerBuilder:
                 "доработк",
                 "представить лично",
                 "опечаток и ошибок",
+                "об отсутствии ошибок",
             )
         ):
             return False
 
         return False
+
+    def _score_by_markers(
+        self,
+        norm: str,
+        markers: tuple[str, ...],
+        weight: float,
+    ) -> float:
+        score = 0.0
+        for marker in markers:
+            if marker in norm:
+                score += weight
+        return score
+
+    def _pretty_label(
+        self,
+        key: Any,
+    ) -> Optional[str]:
+        if key is None:
+            return None
+        text = str(key).strip().replace("_", " ")
+        text = re.sub(r"\s+", " ", text).strip()
+        return text or None
+
+    def _clean(
+        self,
+        value: Any,
+    ) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        text = re.sub(r"\s+", " ", text).strip()
+        return text or None
+
+    def _normalize(
+        self,
+        value: Any,
+    ) -> str:
+        cleaned = self._clean(value)
+        if not cleaned:
+            return ""
+        return cleaned.lower().replace("ё", "е")
