@@ -322,7 +322,7 @@ class TableDeadlinesAnswerBuilder:
         primary = result.primary_item
         question_kind = result.question_deadline_kind
 
-        render_kind = self._resolve_render_deadline_kind(
+        render_kind = self._render_deadline_kind(
             item=primary,
             question_deadline_kind=question_kind,
         )
@@ -358,9 +358,9 @@ class TableDeadlinesAnswerBuilder:
             return f"Срок {primary_label} по найденным источникам: {primary.deadline_value}."
 
         lines: list[str] = ["По найденным источникам установлены следующие сроки:"]
-        lines.append(self._render_bulleted_item(primary))
+        lines.append(self._render_bulleted_item(primary, question_deadline_kind=question_kind))
         for item in visible_alternatives:
-            lines.append(self._render_bulleted_item(item))
+            lines.append(self._render_bulleted_item(item, question_deadline_kind=question_kind))
         lines.append("")
         lines.append("Конкретный срок зависит от того, о каком действии или этапе процедуры идёт речь.")
         return "\n".join(lines)
@@ -448,13 +448,15 @@ class TableDeadlinesAnswerBuilder:
     def _render_bulleted_item(
         self,
         item: DeadlineAnswerItem,
+        *,
+        question_deadline_kind: str,
     ) -> str:
-        effective_kind = self._resolve_render_deadline_kind(
+        render_kind = self._render_deadline_kind(
             item=item,
-            question_deadline_kind="other",
+            question_deadline_kind=question_deadline_kind,
         )
         label = self._DEADLINE_KIND_LABELS.get(
-            effective_kind,
+            render_kind,
             self._DEADLINE_KIND_LABELS["other"],
         )
 
@@ -523,8 +525,8 @@ class TableDeadlinesAnswerBuilder:
         candidate: Any,
     ) -> DeadlineAnswerItem | None:
         payload = self._candidate_payload(candidate)
-        value_json = payload.get("value_json") or {}
         metadata_json = self._candidate_metadata_json(candidate)
+        value_json = payload.get("value_json") or {}
         condition_json = payload.get("condition_json") or {}
 
         deadline_value = self._clean(
@@ -546,20 +548,22 @@ class TableDeadlinesAnswerBuilder:
             or ""
         ) or ""
 
-        fact_type = (
-            self._candidate_attr(candidate, "fact_type")
-            or payload.get("fact_type")
-            or metadata_json.get("fact_type")
-        )
-        fact_type = self._clean(fact_type)
+        fact_type = self._candidate_fact_type(candidate)
 
-        fact_type_kind = self._deadline_kind_from_fact_type(fact_type)
+        fact_type_kind = self._fact_type_to_deadline_kind(fact_type)
         if fact_type_kind != "other":
             deadline_kind = fact_type_kind
             kind_confidence = 1.0
         else:
             deadline_kind, kind_confidence = self._classify_deadline_kind(
-                text=" ".join([deadline_value, scope_text, fact_type or ""]),
+                text=" ".join(
+                    [
+                        deadline_value,
+                        scope_text,
+                        fact_type or "",
+                        self._clean(self._candidate_attr(candidate, "title", "")) or "",
+                    ]
+                ),
             )
 
         is_service_core_deadline = bool(
@@ -568,6 +572,7 @@ class TableDeadlinesAnswerBuilder:
         )
 
         source_id = str(self._candidate_attr(candidate, "source_id", "") or "")
+        source_score = self._candidate_score(candidate)
 
         return DeadlineAnswerItem(
             deadline_value=deadline_value,
@@ -578,9 +583,9 @@ class TableDeadlinesAnswerBuilder:
             deadline_kind=deadline_kind,
             kind_confidence=kind_confidence,
             is_service_core_deadline=is_service_core_deadline,
-            candidate_score=self._candidate_score(candidate),
+            candidate_score=source_score,
             source_fact_ids=[source_id] if source_id else [],
-            source_scores=[self._candidate_score(candidate)],
+            source_scores=[source_score],
         )
 
     def _build_item_from_table_row_candidate(
@@ -1153,6 +1158,37 @@ class TableDeadlinesAnswerBuilder:
             confidence = round(min(confidence, 0.58), 3)
 
         return (winner, confidence)
+        
+    def _fact_type_to_deadline_kind(
+        self,
+        fact_type: str | None,
+    ) -> str:
+        mapping = {
+            "decision_deadline": "decision",
+            "notification_deadline": "notification",
+            "payment_deadline": "payment",
+            "registration_deadline": "registration",
+            "correction_deadline": "correction",
+        }
+        return mapping.get(self._normalize(fact_type), "other")
+        
+    def _render_deadline_kind(
+        self,
+        *,
+        item: DeadlineAnswerItem,
+        question_deadline_kind: str,
+    ) -> str:
+        fact_type_kind = self._fact_type_to_deadline_kind(item.fact_type)
+        if fact_type_kind != "other":
+            return fact_type_kind
+
+        if item.deadline_kind and item.deadline_kind != "other":
+            return item.deadline_kind
+
+        if question_deadline_kind and question_deadline_kind != "other":
+            return question_deadline_kind
+
+        return "other"
 
     # --------------------------------------------------------
     # Utility helpers
@@ -1212,6 +1248,40 @@ class TableDeadlinesAnswerBuilder:
             or {}
         )
         return citation if isinstance(citation, dict) else {}
+        
+    def _candidate_fact_type(
+        self,
+        candidate: Any,
+    ) -> str | None:
+        payload = self._candidate_payload(candidate)
+        metadata = self._candidate_metadata_json(candidate)
+
+        candidates = [
+            self._candidate_attr(candidate, "fact_type"),
+            payload.get("fact_type"),
+            metadata.get("fact_type"),
+            self._candidate_attr(candidate, "title"),
+            payload.get("title"),
+        ]
+
+        for raw_value in candidates:
+            value = self._clean(raw_value)
+            if not value:
+                continue
+
+            normalized = self._normalize(value)
+            if normalized in {
+                "decision_deadline",
+                "notification_deadline",
+                "payment_deadline",
+                "registration_deadline",
+                "correction_deadline",
+                "applicant_action_deadline",
+                "internal_procedure_deadline",
+            }:
+                return normalized
+
+        return None
 
     def _candidate_text(
         self,
