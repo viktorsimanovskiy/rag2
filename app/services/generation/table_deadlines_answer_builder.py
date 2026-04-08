@@ -337,52 +337,25 @@ class TableDeadlinesAnswerBuilder:
             return None
 
         primary = result.primary_item
-        question_kind = result.question_deadline_kind
 
         render_kind = self._deadline_kind_from_fact_type(primary.fact_type)
         if render_kind == "other":
             render_kind = primary.deadline_kind or "other"
-        if render_kind == "other" and question_kind:
-            render_kind = question_kind
+        if render_kind == "other":
+            render_kind = result.question_deadline_kind or "other"
 
         primary_label = self._DEADLINE_KIND_LABELS.get(
             render_kind,
             self._DEADLINE_KIND_LABELS["other"],
         )
 
-        if self._should_render_single_primary(
-            primary=primary,
-            alternatives=result.alternative_items,
-            question_deadline_kind=question_kind,
-        ):
-            if primary.scope_text:
-                return (
-                    f"Срок {primary_label} по найденным источникам: "
-                    f"{primary.deadline_value} ({primary.scope_text})."
-                )
-            return f"Срок {primary_label} по найденным источникам: {primary.deadline_value}."
+        if primary.scope_text:
+            return (
+                f"Срок {primary_label} по найденным источникам: "
+                f"{primary.deadline_value} ({primary.scope_text})."
+            )
 
-        visible_alternatives = self._select_visible_alternatives(
-            primary=primary,
-            alternatives=result.alternative_items,
-            question_deadline_kind=question_kind,
-        )
-
-        if not visible_alternatives:
-            if primary.scope_text:
-                return (
-                    f"Срок {primary_label} по найденным источникам: "
-                    f"{primary.deadline_value} ({primary.scope_text})."
-                )
-            return f"Срок {primary_label} по найденным источникам: {primary.deadline_value}."
-
-        lines: list[str] = ["По найденным источникам установлены следующие сроки:"]
-        lines.append(self._render_bulleted_item(primary))
-        for item in visible_alternatives:
-            lines.append(self._render_bulleted_item(item))
-        lines.append("")
-        lines.append("Конкретный срок зависит от того, о каком действии или этапе процедуры идёт речь.")
-        return "\n".join(lines)
+        return f"Срок {primary_label} по найденным источникам: {primary.deadline_value}."
         
     def _should_render_single_primary(
         self,
@@ -568,10 +541,6 @@ class TableDeadlinesAnswerBuilder:
         )
         fact_type = self._clean(fact_type)
 
-        # ВАЖНО:
-        # Для legal_fact сначала берём максимально предметный source_text,
-        # а heading_text используем только как fallback. Иначе notification_fact
-        # может превращаться в "принятие решения", если heading общий.
         scope_text = (
             metadata_json.get("deadline_scope_text")
             or condition_json.get("deadline_scope_text")
@@ -589,15 +558,15 @@ class TableDeadlinesAnswerBuilder:
 
         deadline_kind = self._deadline_kind_from_fact_type(fact_type)
         if deadline_kind == "other":
-            deadline_kind = self._classify_deadline_kind(
-                text=" ".join(
+            deadline_kind = self._question_deadline_kind(
+                " ".join(
                     x for x in [
                         deadline_value,
                         scope_text or "",
                         fact_type or "",
                     ] if x
                 )
-            )
+            ) or "other"
 
         return DeadlineAnswerItem(
             deadline_value=deadline_value,
@@ -611,7 +580,7 @@ class TableDeadlinesAnswerBuilder:
             table_title=None,
             table_number=None,
         )
-
+        
     def _build_item_from_table_row_candidate(
         self,
         candidate: Any,
