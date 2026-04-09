@@ -1217,26 +1217,71 @@ class TableDeadlinesAnswerBuilder:
 
     def _question_deadline_kind(
         self,
-        question_text: str,
-    ) -> str | None:
-        text = self._normalize(question_text)
+        text: str,
+    ) -> str:
+        norm = self._normalize(text)
+        if not norm:
+            return "other"
 
-        if any(x in text for x in ("выплат", "перечисл", "деньги", "26-го числа", "26 числа")):
+        payment_exact_markers = (
+            "когда придет",
+            "когда придёт",
+            "когда придут",
+            "когда поступит",
+            "когда поступят",
+            "когда выплатят",
+            "когда перечислят",
+            "когда зачислят",
+            "когда мне придет",
+            "когда мне придёт",
+            "когда мне выплатят",
+            "когда мне перечислят",
+            "когда мне зачислят",
+            "когда я получу",
+            "когда получу",
+            "когда придет едв",
+            "когда придёт едв",
+            "когда мне придет едв",
+            "когда мне придёт едв",
+            "когда будет выплата",
+            "когда поступят деньги",
+            "когда придут деньги",
+        )
+        if any(marker in norm for marker in payment_exact_markers):
             return "payment"
 
-        if any(x in text for x in ("уведом", "сообщ", "извест", "о решении")):
+        if "уведом" in norm or "сообщ" in norm:
             return "notification"
 
-        if any(x in text for x in ("зарегистр", "регистрац")):
+        if "регистрац" in norm or "зарегистрир" in norm:
             return "registration"
 
-        if any(x in text for x in ("опечат", "ошиб")):
+        if "опечат" in norm or "ошиб" in norm or "исправлен" in norm:
             return "correction"
 
-        if any(x in text for x in ("примут решение", "принятия решения", "когда примут", "срок предоставления")):
+        decision_exact_markers = (
+            "срок принятия решения",
+            "когда примут решение",
+            "когда будет решение",
+            "срок рассмотрения",
+            "максимальный срок предоставления",
+            "срок предоставления государственной услуги",
+        )
+        if any(marker in norm for marker in decision_exact_markers):
             return "decision"
 
-        return None
+        if (
+            "выплат" in norm
+            or "перечисл" in norm
+            or "зачисл" in norm
+            or "поступ" in norm
+            or "придет" in norm
+            or "придёт" in norm
+            or "получу" in norm
+        ):
+            return "payment"
+
+        return "other"
 
     def _classify_deadline_kind(
         self,
