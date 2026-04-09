@@ -311,23 +311,6 @@ class TableDeadlinesAnswerBuilder:
             reason=None,
         )
 
-    def _deadline_kind_from_fact_type(
-        self,
-        fact_type: str | None,
-    ) -> str:
-        fact_type_norm = self._clean(fact_type)
-        if not fact_type_norm:
-            return "other"
-
-        mapping = {
-            "decision_deadline": "decision",
-            "notification_deadline": "notification",
-            "payment_deadline": "payment",
-            "registration_deadline": "registration",
-            "correction_deadline": "correction",
-        }
-        return mapping.get(fact_type_norm, "other")
-
     def render_text(
         self,
         *,
@@ -337,12 +320,10 @@ class TableDeadlinesAnswerBuilder:
             return None
 
         primary = result.primary_item
-
-        render_kind = self._deadline_kind_from_fact_type(primary.fact_type)
-        if render_kind == "other":
-            render_kind = primary.deadline_kind or "other"
-        if render_kind == "other":
-            render_kind = result.question_deadline_kind or "other"
+        render_kind = self._resolve_final_deadline_kind(
+            item=primary,
+            question_deadline_kind=result.question_deadline_kind,
+        )
 
         primary_label = self._DEADLINE_KIND_LABELS.get(
             render_kind,
@@ -456,11 +437,10 @@ class TableDeadlinesAnswerBuilder:
             return f"- {item.deadline_value} — срок {label} ({item.scope_text})"
         return f"- {item.deadline_value} — срок {label}"
         
-    def _deadline_kind_from_fact_type(
+    def _fact_type_to_deadline_kind(
         self,
         fact_type: str | None,
     ) -> str:
-        fact_type_norm = self._normalize(fact_type)
         mapping = {
             "decision_deadline": "decision",
             "notification_deadline": "notification",
@@ -468,15 +448,15 @@ class TableDeadlinesAnswerBuilder:
             "registration_deadline": "registration",
             "correction_deadline": "correction",
         }
-        return mapping.get(fact_type_norm, "other")
+        return mapping.get(self._normalize(fact_type), "other")
 
-    def _resolve_render_deadline_kind(
+    def _resolve_final_deadline_kind(
         self,
         *,
         item: DeadlineAnswerItem,
         question_deadline_kind: str,
     ) -> str:
-        fact_type_kind = self._deadline_kind_from_fact_type(item.fact_type)
+        fact_type_kind = self._fact_type_to_deadline_kind(item.fact_type)
         if fact_type_kind != "other":
             return fact_type_kind
 
@@ -533,13 +513,7 @@ class TableDeadlinesAnswerBuilder:
         if not self._looks_like_deadline_value(deadline_value):
             return None
 
-        fact_type = (
-            self._candidate_attr(candidate, "fact_type")
-            or payload.get("fact_type")
-            or metadata_json.get("fact_type")
-            or self._candidate_attr(candidate, "title")
-        )
-        fact_type = self._clean(fact_type)
+        fact_type = self._candidate_fact_type(candidate)
 
         scope_text = (
             metadata_json.get("deadline_scope_text")
@@ -556,7 +530,9 @@ class TableDeadlinesAnswerBuilder:
             or condition_json.get("is_service_core_deadline")
         )
 
-        deadline_kind = self._deadline_kind_from_fact_type(fact_type)
+        deadline_kind = self._fact_type_to_deadline_kind(fact_type)
+        kind_confidence = 1.0 if deadline_kind != "other" else 0.0
+
         if deadline_kind == "other":
             deadline_kind = self._question_deadline_kind(
                 " ".join(
@@ -564,9 +540,15 @@ class TableDeadlinesAnswerBuilder:
                         deadline_value,
                         scope_text or "",
                         fact_type or "",
-                    ] if x
+                    ]
+                    if x
                 )
             ) or "other"
+            if deadline_kind != "other":
+                kind_confidence = 0.70
+
+        source_id = str(self._candidate_attr(candidate, "source_id", "") or "")
+        source_score = self._candidate_score(candidate)
 
         return DeadlineAnswerItem(
             deadline_value=deadline_value,
@@ -575,10 +557,13 @@ class TableDeadlinesAnswerBuilder:
             citation_json=self._candidate_citation_json(candidate),
             fact_type=fact_type,
             deadline_kind=deadline_kind,
+            kind_confidence=kind_confidence,
             is_service_core_deadline=is_service_core_deadline,
-            candidate_score=self._candidate_score(candidate),
+            candidate_score=source_score,
             table_title=None,
             table_number=None,
+            source_fact_ids=[source_id] if source_id else [],
+            source_scores=[source_score],
         )
         
     def _build_item_from_table_row_candidate(
@@ -1171,17 +1156,10 @@ class TableDeadlinesAnswerBuilder:
         item: DeadlineAnswerItem,
         question_deadline_kind: str,
     ) -> str:
-        fact_type_kind = self._fact_type_to_deadline_kind(item.fact_type)
-        if fact_type_kind != "other":
-            return fact_type_kind
-
-        if item.deadline_kind and item.deadline_kind != "other":
-            return item.deadline_kind
-
-        if question_deadline_kind and question_deadline_kind != "other":
-            return question_deadline_kind
-
-        return "other"
+        return self._resolve_final_deadline_kind(
+            item=item,
+            question_deadline_kind=question_deadline_kind,
+        )
 
     # --------------------------------------------------------
     # Utility helpers
