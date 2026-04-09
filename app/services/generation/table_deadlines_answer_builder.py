@@ -507,12 +507,21 @@ class TableDeadlinesAnswerBuilder:
         metadata_json = payload.get("metadata_json") or {}
         condition_json = payload.get("condition_json") or {}
 
-        deadline_value = (
-            value_json.get("deadline_value")
-            or value_json.get("value")
+        source_text = self._clean(
+            value_json.get("source_text")
+            or self._candidate_text(candidate)
             or ""
         )
-        deadline_value = self._clean(deadline_value)
+
+        deadline_value = self._clean(
+            value_json.get("deadline_value")
+            or value_json.get("value")
+            or metadata_json.get("deadline_value")
+            or ""
+        )
+
+        if not deadline_value:
+            deadline_value = self._extract_deadline_value_from_text(source_text)
 
         if not deadline_value:
             return None
@@ -521,15 +530,13 @@ class TableDeadlinesAnswerBuilder:
 
         fact_type = self._candidate_fact_type(candidate)
 
-        scope_text = (
+        scope_text = self._clean(
             metadata_json.get("deadline_scope_text")
             or condition_json.get("deadline_scope_text")
-            or value_json.get("source_text")
-            or self._candidate_text(candidate)
-            or condition_json.get("heading_text")
+            or value_json.get("deadline_scope_text")
+            or self._scope_text_from_fact_type(fact_type)
             or ""
         )
-        scope_text = self._clean(scope_text)
 
         is_service_core_deadline = bool(
             metadata_json.get("is_service_core_deadline")
@@ -544,7 +551,8 @@ class TableDeadlinesAnswerBuilder:
                 " ".join(
                     x for x in [
                         deadline_value,
-                        scope_text or "",
+                        scope_text,
+                        source_text,
                         fact_type or "",
                     ]
                     if x
@@ -1362,34 +1370,56 @@ class TableDeadlinesAnswerBuilder:
         candidate: Any,
     ) -> str | None:
         payload = self._candidate_payload(candidate)
-        metadata = self._candidate_metadata_json(candidate)
+        value_json = payload.get("value_json") or {}
+        metadata_json = payload.get("metadata_json") or {}
+        condition_json = payload.get("condition_json") or {}
 
-        candidates = [
-            self._candidate_attr(candidate, "fact_type"),
-            payload.get("fact_type"),
-            metadata.get("fact_type"),
-            self._candidate_attr(candidate, "title"),
-            payload.get("title"),
+        fact_type = (
+            self._candidate_attr(candidate, "fact_type")
+            or payload.get("fact_type")
+            or value_json.get("fact_type")
+            or metadata_json.get("fact_type")
+            or condition_json.get("fact_type")
+            or self._candidate_attr(candidate, "title")
+        )
+        fact_type = self._clean(fact_type)
+        return fact_type or None
+        
+    def _extract_deadline_value_from_text(
+        self,
+        text: str,
+    ) -> str:
+        source = self._clean(text)
+        if not source:
+            return ""
+
+        patterns = [
+            r"(в течение\s+\d+\s+(?:рабоч(?:их|его)|календарн(?:ых|ого))\s+дн(?:ей|я))",
+            r"(не позднее\s+\d+(?:-го)?\s+числа[^.]*)",
+            r"(не более\s+\d+\s+(?:рабоч(?:их|его)|календарн(?:ых|ого))\s+дн(?:ей|я))",
+            r"(до\s+\d+\s+(?:рабоч(?:их|его)|календарн(?:ых|ого))\s+дн(?:ей|я))",
+            r"(составляет\s+\d+\s+(?:рабоч(?:их|его)|календарн(?:ых|ого))\s+дн(?:ей|я))",
         ]
 
-        for raw_value in candidates:
-            value = self._clean(raw_value)
-            if not value:
-                continue
+        for pattern in patterns:
+            match = re.search(pattern, source, flags=re.IGNORECASE)
+            if match:
+                return self._clean(match.group(1))
 
-            normalized = self._normalize(value)
-            if normalized in {
-                "decision_deadline",
-                "notification_deadline",
-                "payment_deadline",
-                "registration_deadline",
-                "correction_deadline",
-                "applicant_action_deadline",
-                "internal_procedure_deadline",
-            }:
-                return normalized
-
-        return None
+        return ""
+        
+    def _scope_text_from_fact_type(
+        self,
+        fact_type: str | None,
+    ) -> str:
+        mapping = {
+            "decision_deadline": "принятие решения о предоставлении",
+            "notification_deadline": "уведомление о решении",
+            "payment_deadline": "выплата",
+            "registration_deadline": "регистрация заявления",
+            "correction_deadline": "исправление ошибок",
+        }
+        return mapping.get(self._normalize(fact_type), "")
 
     def _candidate_text(
         self,
