@@ -131,7 +131,28 @@ def _result_to_debug_dict(result: object) -> dict:
             continue
         fields[name] = value
     return fields
+    
+def _to_jsonable(value):
+    if value is None:
+        return None
 
+    if isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, dict):
+        return {str(k): _to_jsonable(v) for k, v in value.items()}
+
+    if isinstance(value, (list, tuple, set)):
+        return [_to_jsonable(v) for v in value]
+
+    if hasattr(value, "__dict__"):
+        return {
+            key: _to_jsonable(val)
+            for key, val in vars(value).items()
+            if not key.startswith("_")
+        }
+
+    return repr(value)
 
 def _shorten_text(value: str | None, limit: int = 280) -> str:
     if not value:
@@ -297,39 +318,70 @@ async def _run_one_question(
     elapsed = time.perf_counter() - started_at
 
     if output_format == "debug":
-        debug_result = _result_to_debug_dict(result)
+        evidence_package = getattr(result, "evidence_package", None)
+        generation_result = getattr(result, "generation_result", None)
+        runtime_payload_json = getattr(result, "runtime_payload_json", None) or {}
+
+        generation_answer_payload = (
+            getattr(generation_result, "answer_payload_json", None) or {}
+        )
+        generation_reuse_payload = (
+            getattr(generation_result, "reuse_decision_payload_json", None) or {}
+        )
+        evidence_metrics = getattr(evidence_package, "metrics_json", None) or {}
+        selected_candidates = list(getattr(evidence_package, "selected_candidates", []) or [])
+
+        debug_payload = {
+            "question_text": question_text,
+            "intent": getattr(intent, "value", str(intent)),
+            "elapsed_seconds": round(elapsed, 2),
+            "result_type": type(result).__name__,
+            "answer_text": _get_answer_text(result),
+            "runtime_payload_json": _to_jsonable(runtime_payload_json),
+            "generation_result": {
+                "answer_mode": getattr(generation_result, "answer_mode", None),
+                "confidence_score": getattr(generation_result, "confidence_score", None),
+                "trust_score_at_generation": getattr(generation_result, "trust_score_at_generation", None),
+                "validation_status": getattr(generation_result, "validation_status", None),
+                "answer_payload_json": _to_jsonable(generation_answer_payload),
+                "reuse_decision_payload_json": _to_jsonable(generation_reuse_payload),
+            },
+            "evidence_package": {
+                "strategy_code": getattr(evidence_package, "strategy_code", None),
+                "metrics_json": _to_jsonable(evidence_metrics),
+                "selected_candidates_preview": [
+                    {
+                        "source_type": getattr(candidate, "source_type", None),
+                        "source_id": str(getattr(candidate, "source_id", "")),
+                        "document_id": str(getattr(candidate, "document_id", "")),
+                        "score": getattr(candidate, "score", None),
+                        "rerank_score": getattr(candidate, "rerank_score", None),
+                        "effective_score": getattr(candidate, "effective_score", None),
+                        "document_name": getattr(candidate, "document_name", None),
+                        "title": getattr(candidate, "title", None),
+                        "fact_type": getattr(candidate, "fact_type", None),
+                        "snippet": getattr(candidate, "snippet", None),
+                        "citation_json": _to_jsonable(getattr(candidate, "citation_json", None)),
+                        "metadata_preview": _to_jsonable(getattr(candidate, "metadata_json", None)),
+                    }
+                    for candidate in selected_candidates[:top_candidates_count]
+                ],
+            },
+        }
 
         print("=" * 100)
         print(f"QUESTION {question_index}/{total_questions}")
         print("-" * 100)
-        print(question_text)
-        print()
-        print("INTENT:")
-        print(getattr(intent, "value", str(intent)))
-        print()
-        print("ELAPSED SECONDS:")
-        print(f"{elapsed:.2f}")
-        print()
-        print("RESULT TYPE:")
-        print(type(result).__name__)
-        print()
-        print("KNOWN RESULT FIELDS:")
-        for key in sorted(debug_result.keys()):
-            print(f"- {key}")
-        print()
-        print("RESULT PAYLOAD:")
-        print(debug_result)
+        print(
+            json.dumps(
+                debug_payload,
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+        )
         print("=" * 100)
         print()
-    else:
-        _render_compact_result(
-            question_text=question_text,
-            intent=intent,
-            elapsed=elapsed,
-            result=result,
-            top_candidates_count=top_candidates_count,
-        )
-
 
 async def run(
     *,
