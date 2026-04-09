@@ -267,8 +267,14 @@ class TableDeadlinesAnswerBuilder:
             reverse=True,
         )
 
-        primary_item = ranked_items[0]
-        alternative_items = ranked_items[1:]
+        primary_item = self._select_primary_item(
+            ranked_items=ranked_items,
+            question_deadline_kind=question_deadline_kind,
+        )
+        alternative_items = [
+            item for item in ranked_items
+            if item is not primary_item
+        ]
 
         ambiguity_reason: str | None = None
         if alternative_items and any(
@@ -705,6 +711,134 @@ class TableDeadlinesAnswerBuilder:
             score += self._correction_specificity_bonus(item)
 
         return score
+        
+    def _select_primary_item(
+        self,
+        *,
+        ranked_items: list[DeadlineAnswerItem],
+        question_deadline_kind: str,
+    ) -> DeadlineAnswerItem:
+        if not ranked_items:
+            raise ValueError("ranked_items must not be empty")
+
+        if question_deadline_kind == "other":
+            return ranked_items[0]
+
+        same_kind_items = [
+            item
+            for item in ranked_items
+            if self._render_deadline_kind(
+                item=item,
+                question_deadline_kind=question_deadline_kind,
+            ) == question_deadline_kind
+        ]
+        if not same_kind_items:
+            return ranked_items[0]
+
+        return max(
+            same_kind_items,
+            key=lambda item: self._primary_selection_score(
+                item=item,
+                question_deadline_kind=question_deadline_kind,
+            ),
+        )
+
+    def _primary_selection_score(
+        self,
+        *,
+        item: DeadlineAnswerItem,
+        question_deadline_kind: str,
+    ) -> float:
+        text = self._normalize(
+            " ".join(
+                x for x in [
+                    item.deadline_value,
+                    item.scope_text,
+                    item.fact_type or "",
+                ]
+                if x
+            )
+        )
+
+        score = 0.0
+
+        if item.source_type == "legal_fact":
+            score += 40.0
+        elif item.source_type == "table_row":
+            score += 20.0
+        elif item.source_type == "block":
+            score += 10.0
+
+        if item.is_service_core_deadline:
+            score += 45.0
+
+        score += min(max(item.kind_confidence, 0.0), 1.0) * 25.0
+        score += min(max(item.candidate_score, 0.0), 1.0) * 10.0
+
+        if self._fact_type_to_deadline_kind(item.fact_type) == question_deadline_kind:
+            score += 30.0
+
+        if self._is_suspension_related(text):
+            score -= 120.0
+
+        if question_deadline_kind == "notification":
+            if self._has_exact_notification_decision_marker(text):
+                score += 35.0
+            if "уведом" in text:
+                score += 12.0
+            if "принятия решения" in text and "уведом" not in text:
+                score -= 20.0
+
+        elif question_deadline_kind == "decision":
+            if "максимальный срок предоставления государственной услуги" in text:
+                score += 40.0
+            elif "срок предоставления государственной услуги" in text:
+                score += 30.0
+
+            if "решение о предоставлении" in text or "решение о назначении" in text:
+                score += 18.0
+
+            if "уведом" in text:
+                score -= 20.0
+
+        elif question_deadline_kind == "payment":
+            if "не позднее 26-го числа" in text or "не позднее 26 числа" in text:
+                score += 45.0
+            if "выплат" in text or "перечисл" in text or "зачисл" in text:
+                score += 25.0
+            if "уведом" in text:
+                score -= 40.0
+            if (
+                "принятия решения" in text
+                and not (
+                    "выплат" in text
+                    or "перечисл" in text
+                    or "зачисл" in text
+                    or "26" in text
+                )
+            ):
+                score -= 35.0
+
+        elif question_deadline_kind == "registration":
+            if "регистрац" in text or "регистрир" in text:
+                score += 25.0
+
+        elif question_deadline_kind == "correction":
+            if "опечат" in text or "ошиб" in text:
+                score += 25.0
+
+        return score
+
+    def _is_suspension_related(
+        self,
+        text: str,
+    ) -> bool:
+        norm = self._normalize(text)
+        return (
+            "приостанов" in norm
+            or "приостанавлива" in norm
+            or "приостановлении рассмотрения" in norm
+        )
 
     def _fact_type_bonus(
         self,
@@ -843,6 +977,9 @@ class TableDeadlinesAnswerBuilder:
 
         if "об отсутствии ошибок" in text:
             score -= 60.0
+
+        if self._is_suspension_related(text):
+            score -= 90.0
 
         return score
 
