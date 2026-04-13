@@ -1170,10 +1170,54 @@ class TableDeadlinesAnswerBuilder:
         self,
         text: str,
     ) -> Optional[str]:
-        for pattern in self._BLOCK_DEADLINE_PATTERNS:
-            match = pattern.search(text or "")
+        source = self._clean(text)
+        if not source:
+            return None
+
+        count_token = (
+            r"(?:"
+            r"\d+|"
+            r"один|одна|одно|одного|одной|одни|одних|"
+            r"два|две|двух|"
+            r"три|трех|трёх|"
+            r"четыре|четырех|четырёх|"
+            r"пять|пяти|"
+            r"шесть|шести|"
+            r"семь|семи|"
+            r"восемь|восьми|"
+            r"девять|девяти|"
+            r"десять|десяти"
+            r")"
+        )
+
+        patterns = [
+            re.compile(
+                rf"в течение\s+{count_token}\s+(?:рабоч(?:их|его)|календарн(?:ых|ого))\s+дн(?:я|ей)",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                rf"не более\s+{count_token}\s+(?:рабоч(?:их|его)|календарн(?:ых|ого))\s+дн(?:я|ей)",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                rf"не позднее\s+{count_token}\s+(?:рабоч(?:их|его)|календарн(?:ых|ого))\s+дн(?:я|ей)",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"не позднее\s+26(?:-го)?\s+числа(?:\s+месяца)?",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"не позднее\s+[^.;]{3,140}",
+                re.IGNORECASE,
+            ),
+        ]
+
+        for pattern in patterns:
+            match = pattern.search(source)
             if match:
                 return self._clean(match.group(0))
+
         return None
 
     def _extract_block_scope_text(
@@ -1429,30 +1473,7 @@ class TableDeadlinesAnswerBuilder:
         )
         fact_type = self._clean(fact_type)
         return fact_type or None
-        
-    def _extract_deadline_value_from_text(
-        self,
-        text: str,
-    ) -> str:
-        source = self._clean(text)
-        if not source:
-            return ""
-
-        patterns = [
-            r"(в течение\s+\d+\s+(?:рабоч(?:их|его)|календарн(?:ых|ого))\s+дн(?:ей|я))",
-            r"(не позднее\s+\d+(?:-го)?\s+числа[^.]*)",
-            r"(не более\s+\d+\s+(?:рабоч(?:их|его)|календарн(?:ых|ого))\s+дн(?:ей|я))",
-            r"(до\s+\d+\s+(?:рабоч(?:их|его)|календарн(?:ых|ого))\s+дн(?:ей|я))",
-            r"(составляет\s+\d+\s+(?:рабоч(?:их|его)|календарн(?:ых|ого))\s+дн(?:ей|я))",
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, source, flags=re.IGNORECASE)
-            if match:
-                return self._clean(match.group(1))
-
-        return ""
-        
+       
     def _scope_text_from_fact_type(
         self,
         fact_type: str | None,
