@@ -866,7 +866,7 @@ class DocxStructureExtractor:
         if text:
             return text
 
-    return self._normalize_search_text(row_summary)
+        return self._normalize_search_text(row_summary)
 
     def _normalize_search_text(
         self,
