@@ -609,8 +609,6 @@ class DocxStructureExtractor:
 
         appendix_number = self._detect_appendix_number_from_context(paragraph_context)
 
-        appendix_number = self._detect_appendix_number_from_context(paragraph_context)
-
         current_refusal_scope: Optional[str] = None
 
         for row in preview_rows:
@@ -729,8 +727,10 @@ class DocxStructureExtractor:
         cells_by_header = cells_by_header or {}
         cells_by_header_normalized = cells_by_header_normalized or {}
 
+        # ВАЖНО:
+        # table_title здесь НЕ используем.
+        # Он размазывает service_refusal/intake_refusal на всю таблицу.
         haystack_parts = [
-            table_title,
             row_summary,
             cells_by_semantic_key.get("refusal_reason", ""),
             *cells_by_header.values(),
@@ -782,9 +782,8 @@ class DocxStructureExtractor:
         if any(marker in haystack for marker in service_markers):
             return "service_refusal"
 
-        if "отказ" in haystack:
-            return "service_refusal"
-
+        # Без общего fallback по слову "отказ".
+        # Иначе любая строка будет сбрасывать inherited renewal/service scope.
         return None
 
     def _normalize_search_text(
