@@ -633,9 +633,15 @@ class DocxStructureExtractor:
                 table_type=table_type,
             )
 
+            section_text = self._build_refusal_section_candidate_text(
+                row_summary=row["row_summary"],
+                cells_by_semantic_key=cells_by_semantic_key,
+                cells_by_header=cells_by_header,
+            )
+
             explicit_section_scope = self._detect_refusal_section_scope(
                 table_type=table_type,
-                row_summary=row["row_summary"],
+                section_text=section_text,
             )
 
             explicit_row_scope = self._detect_refusal_row_scope(
@@ -797,12 +803,12 @@ class DocxStructureExtractor:
         self,
         *,
         table_type: str,
-        row_summary: str,
+        section_text: str,
     ) -> Optional[str]:
         if table_type != "refusal_reasons":
             return None
 
-        haystack = self._normalize_search_text(row_summary)
+        haystack = self._normalize_search_text(section_text)
         if not haystack:
             return None
 
@@ -840,6 +846,27 @@ class DocxStructureExtractor:
             return "service_refusal"
 
         return None
+        
+    def _build_refusal_section_candidate_text(
+        self,
+        *,
+        row_summary: str,
+        cells_by_semantic_key: dict[str, str] | None,
+        cells_by_header: dict[str, str] | None,
+    ) -> str:
+        cells_by_semantic_key = cells_by_semantic_key or {}
+        cells_by_header = cells_by_header or {}
+
+        parts = [
+            cells_by_semantic_key.get("refusal_reason", ""),
+            *cells_by_header.values(),
+        ]
+        text = self._normalize_search_text(" ".join(x for x in parts if x))
+
+        if text:
+            return text
+
+    return self._normalize_search_text(row_summary)
 
     def _normalize_search_text(
         self,
@@ -871,7 +898,7 @@ class DocxStructureExtractor:
             [self._normalize_column_key(x) for x in headers]
         )
         return (headers, header_keys)
-
+        
     def _extract_raw_rows(
         self,
         table: Table,
@@ -1396,6 +1423,15 @@ class DocxStructureExtractor:
             "отказа в предоставлении",
             "основания отказа",
         ]
+
+        title_norm = self._normalize_search_text(table_title)
+
+        if (
+            "в случае отказа в приеме" in title_norm
+            or "отказа в приеме к рассмотрению" in title_norm
+        ) and self._looks_like_form_headers(headers):
+            return "form_fields"
+
         if any(marker in combined for marker in refusal_markers):
             return "refusal_reasons"
 
@@ -1446,6 +1482,34 @@ class DocxStructureExtractor:
             return "deadlines"
 
         return "generic"
+        
+    def _looks_like_form_headers(
+        self,
+        headers: list[str],
+    ) -> bool:
+        norm_headers = [self._normalize_search_text(h) for h in headers if h]
+        if not norm_headers:
+            return False
+
+        form_markers = (
+            "фамилия",
+            "имя",
+            "отчество",
+            "дата рождения",
+            "адрес",
+            "виды дохода",
+            "документ",
+            "подпись",
+            "дата",
+            "номер",
+        )
+
+        hits = 0
+        for header in norm_headers:
+            if any(marker in header for marker in form_markers):
+                hits += 1
+
+        return hits >= 2
 
     def _looks_like_form_table(
         self,
