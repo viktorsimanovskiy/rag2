@@ -260,6 +260,10 @@ class DocxStructureExtractor:
         )
 
         measure_definition = get_measure_definition(primary_measure_code)
+        self._attach_measure_code_to_rows(
+            table_rows=table_rows,
+            primary_measure_code=primary_measure_code,
+        )
         service_name_short = None
         if measure_definition is not None:
             service_name_short = (
@@ -626,6 +630,14 @@ class DocxStructureExtractor:
                 row_json=row_json,
                 table_type=table_type,
             )
+            row_scope = self._detect_refusal_row_scope(
+                table_type=table_type,
+                table_title=table_title,
+                row_summary=row["row_summary"],
+                cells_by_semantic_key=cells_by_semantic_key,
+                cells_by_header=cells_by_header,
+                cells_by_header_normalized=cells_by_header_normalized,
+            )
 
             row_payloads.append(
                 {
@@ -650,6 +662,7 @@ class DocxStructureExtractor:
                         # Новые поля контекста строки.
                         # Они не меняют схему БД, потому что уже живут внутри metadata_json.
                         "row_kind": "data_row",
+                        "row_scope": row_scope,
                         "requirement_group": row.get("row_context", {}).get("requirement_group", "unknown"),
                         "requirement_group_label": row.get("row_context", {}).get("requirement_group_label"),
                         "table_section_context": {
@@ -673,6 +686,109 @@ class DocxStructureExtractor:
             )
 
         return row_payloads
+        
+    def _attach_measure_code_to_rows(
+        self,
+        *,
+        table_rows: list[dict[str, Any]],
+        primary_measure_code: Optional[str],
+    ) -> None:
+        if not primary_measure_code:
+            return
+
+        for row in table_rows:
+            metadata = row.get("metadata_json")
+            if not isinstance(metadata, dict):
+                metadata = {}
+                row["metadata_json"] = metadata
+
+            metadata.setdefault("measure_code", primary_measure_code)
+
+    def _detect_refusal_row_scope(
+        self,
+        *,
+        table_type: str,
+        table_title: str,
+        row_summary: str,
+        cells_by_semantic_key: dict[str, str] | None,
+        cells_by_header: dict[str, str] | None,
+        cells_by_header_normalized: dict[str, str] | None,
+    ) -> Optional[str]:
+        if table_type != "refusal_reasons":
+            return None
+
+        cells_by_semantic_key = cells_by_semantic_key or {}
+        cells_by_header = cells_by_header or {}
+        cells_by_header_normalized = cells_by_header_normalized or {}
+
+        haystack_parts = [
+            table_title,
+            row_summary,
+            cells_by_semantic_key.get("refusal_reason", ""),
+            *cells_by_header.values(),
+            *cells_by_header_normalized.values(),
+        ]
+        haystack = self._normalize_search_text(" ".join(x for x in haystack_parts if x))
+
+        if not haystack:
+            return "service_refusal"
+
+        if any(
+            marker in haystack
+            for marker in (
+                "отказ в приеме",
+                "отказа в приеме",
+                "отказ в принятии",
+                "отказа в принятии",
+                "отказ в регистрации",
+                "отказа в регистрации",
+            )
+        ):
+            return "intake_refusal"
+
+        if "приостанов" in haystack:
+            return "suspension"
+
+        if any(
+            marker in haystack
+            for marker in (
+                "отказ в возобновлении",
+                "отказа в возобновлении",
+                "об отказе в возобновлении",
+                "возобновлен",
+                "возобновлении",
+            )
+        ):
+            return "renewal_refusal"
+
+        if any(
+            marker in haystack
+            for marker in (
+                "отказ в предоставлении",
+                "отказа в предоставлении",
+                "об отказе в предоставлении",
+                "отказ в назначении",
+                "отказа в назначении",
+                "об отказе в назначении",
+                "отказ в предоставлении государственной услуги",
+                "отказа в предоставлении государственной услуги",
+            )
+        ):
+            return "service_refusal"
+
+        if "отказ" in haystack:
+            return "service_refusal"
+
+        return "service_refusal"
+
+    def _normalize_search_text(
+        self,
+        value: Any,
+    ) -> str:
+        text = self._clean_text(value)
+        if not text:
+            return ""
+        return text.lower().replace("ё", "е")
 
     def _extract_headers(
         self,
