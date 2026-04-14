@@ -633,6 +633,11 @@ class DocxStructureExtractor:
                 table_type=table_type,
             )
 
+            explicit_section_scope = self._detect_refusal_section_scope(
+                table_type=table_type,
+                row_summary=row["row_summary"],
+            )
+
             explicit_row_scope = self._detect_refusal_row_scope(
                 table_type=table_type,
                 table_title=table_title,
@@ -643,9 +648,17 @@ class DocxStructureExtractor:
             )
 
             if table_type == "refusal_reasons":
-                if explicit_row_scope is not None:
-                    current_refusal_scope = explicit_row_scope
-                row_scope = current_refusal_scope or "service_refusal"
+                if explicit_section_scope is not None:
+                    current_refusal_scope = explicit_section_scope
+
+                if explicit_row_scope in {"renewal_refusal", "suspension", "intake_refusal"}:
+                    row_scope = explicit_row_scope
+                elif current_refusal_scope is not None:
+                    row_scope = current_refusal_scope
+                elif explicit_row_scope is not None:
+                    row_scope = explicit_row_scope
+                else:
+                    row_scope = "service_refusal"
             else:
                 row_scope = None
 
@@ -727,16 +740,12 @@ class DocxStructureExtractor:
         cells_by_header = cells_by_header or {}
         cells_by_header_normalized = cells_by_header_normalized or {}
 
-        # ВАЖНО:
-        # table_title здесь НЕ используем.
-        # Он размазывает service_refusal/intake_refusal на всю таблицу.
-        haystack_parts = [
-            row_summary,
+        local_parts = [
             cells_by_semantic_key.get("refusal_reason", ""),
             *cells_by_header.values(),
             *cells_by_header_normalized.values(),
         ]
-        haystack = self._normalize_search_text(" ".join(x for x in haystack_parts if x))
+        haystack = self._normalize_search_text(" ".join(x for x in local_parts if x))
 
         if not haystack:
             return None
@@ -782,8 +791,54 @@ class DocxStructureExtractor:
         if any(marker in haystack for marker in service_markers):
             return "service_refusal"
 
-        # Без общего fallback по слову "отказ".
-        # Иначе любая строка будет сбрасывать inherited renewal/service scope.
+        return None
+        
+    def _detect_refusal_section_scope(
+        self,
+        *,
+        table_type: str,
+        row_summary: str,
+    ) -> Optional[str]:
+        if table_type != "refusal_reasons":
+            return None
+
+        haystack = self._normalize_search_text(row_summary)
+        if not haystack:
+            return None
+
+        intake_markers = (
+            "исчерпывающий перечень оснований для отказа в приеме",
+            "отказа в приеме заявления и документов",
+            "отказ в приеме заявления и документов",
+            "отказа в приеме к рассмотрению",
+            "отказ в приеме к рассмотрению",
+        )
+        if any(marker in haystack for marker in intake_markers):
+            return "intake_refusal"
+
+        if "исчерпывающий перечень оснований для приостановления" in haystack:
+            return "suspension"
+
+        renewal_markers = (
+            "исчерпывающий перечень оснований для отказа в возобновлении",
+            "отказ в возобновлении",
+            "отказа в возобновлении",
+            "об отказе в возобновлении",
+        )
+        if any(marker in haystack for marker in renewal_markers):
+            return "renewal_refusal"
+
+        service_markers = (
+            "исчерпывающий перечень оснований для отказа в предоставлении",
+            "отказ в предоставлении",
+            "отказа в предоставлении",
+            "об отказе в предоставлении",
+            "отказ в назначении",
+            "отказа в назначении",
+        )
+        if any(marker in haystack for marker in service_markers):
+            return "service_refusal"
+
         return None
 
     def _normalize_search_text(
