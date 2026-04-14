@@ -609,6 +609,10 @@ class DocxStructureExtractor:
 
         appendix_number = self._detect_appendix_number_from_context(paragraph_context)
 
+        appendix_number = self._detect_appendix_number_from_context(paragraph_context)
+
+        current_refusal_scope: Optional[str] = None
+
         for row in preview_rows:
             row_json = row["row_json"]
             normalized_row_json = row["normalized_row_json"]
@@ -630,7 +634,8 @@ class DocxStructureExtractor:
                 row_json=row_json,
                 table_type=table_type,
             )
-            row_scope = self._detect_refusal_row_scope(
+
+            explicit_row_scope = self._detect_refusal_row_scope(
                 table_type=table_type,
                 table_title=table_title,
                 row_summary=row["row_summary"],
@@ -638,6 +643,13 @@ class DocxStructureExtractor:
                 cells_by_header=cells_by_header,
                 cells_by_header_normalized=cells_by_header_normalized,
             )
+
+            if table_type == "refusal_reasons":
+                if explicit_row_scope is not None:
+                    current_refusal_scope = explicit_row_scope
+                row_scope = current_refusal_scope or "service_refusal"
+            else:
+                row_scope = None
 
             row_payloads.append(
                 {
@@ -658,9 +670,6 @@ class DocxStructureExtractor:
                         "table_title": table_title,
                         "appendix_number": appendix_number,
                         "table_semantic_type": table_type,
-
-                        # Новые поля контекста строки.
-                        # Они не меняют схему БД, потому что уже живут внутри metadata_json.
                         "row_kind": "data_row",
                         "row_scope": row_scope,
                         "requirement_group": row.get("row_context", {}).get("requirement_group", "unknown"),
@@ -669,7 +678,6 @@ class DocxStructureExtractor:
                             "requirement_group": row.get("row_context", {}).get("requirement_group", "unknown"),
                             "requirement_group_label": row.get("row_context", {}).get("requirement_group_label"),
                         },
-
                         "column_headers": headers,
                         "header_keys": header_keys,
                         "cells_text": [v for v in row_json.values() if self._clean_text(v)],
@@ -731,55 +739,53 @@ class DocxStructureExtractor:
         haystack = self._normalize_search_text(" ".join(x for x in haystack_parts if x))
 
         if not haystack:
-            return "service_refusal"
+            return None
 
-        if any(
-            marker in haystack
-            for marker in (
-                "отказ в приеме",
-                "отказа в приеме",
-                "отказ в принятии",
-                "отказа в принятии",
-                "отказ в регистрации",
-                "отказа в регистрации",
-            )
-        ):
+        intake_markers = (
+            "отказ в приеме запроса",
+            "отказа в приеме запроса",
+            "отказ в приеме заявления",
+            "отказа в приеме заявления",
+            "отказ в приеме документов",
+            "отказа в приеме документов",
+            "отказ в приеме к рассмотрению",
+            "отказа в приеме к рассмотрению",
+            "отказ в принятии документов",
+            "отказа в принятии документов",
+        )
+        if any(marker in haystack for marker in intake_markers):
             return "intake_refusal"
 
         if "приостанов" in haystack:
             return "suspension"
 
-        if any(
-            marker in haystack
-            for marker in (
-                "отказ в возобновлении",
-                "отказа в возобновлении",
-                "об отказе в возобновлении",
-                "возобновлен",
-                "возобновлении",
-            )
-        ):
+        renewal_markers = (
+            "отказ в возобновлении",
+            "отказа в возобновлении",
+            "об отказе в возобновлении",
+            "возобновлении едв",
+            "возобновлении выплаты",
+        )
+        if any(marker in haystack for marker in renewal_markers):
             return "renewal_refusal"
 
-        if any(
-            marker in haystack
-            for marker in (
-                "отказ в предоставлении",
-                "отказа в предоставлении",
-                "об отказе в предоставлении",
-                "отказ в назначении",
-                "отказа в назначении",
-                "об отказе в назначении",
-                "отказ в предоставлении государственной услуги",
-                "отказа в предоставлении государственной услуги",
-            )
-        ):
+        service_markers = (
+            "отказ в предоставлении",
+            "отказа в предоставлении",
+            "об отказе в предоставлении",
+            "отказ в назначении",
+            "отказа в назначении",
+            "об отказе в назначении",
+            "отказ в предоставлении государственной услуги",
+            "отказа в предоставлении государственной услуги",
+        )
+        if any(marker in haystack for marker in service_markers):
             return "service_refusal"
 
         if "отказ" in haystack:
             return "service_refusal"
 
-        return "service_refusal"
+        return None
 
     def _normalize_search_text(
         self,
