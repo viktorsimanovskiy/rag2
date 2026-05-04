@@ -634,6 +634,7 @@ class DocxStructureExtractor:
             )
 
             section_text = self._build_refusal_section_candidate_text(
+                table_title=table_title,
                 row_summary=row["row_summary"],
                 cells_by_semantic_key=cells_by_semantic_key,
                 cells_by_header=cells_by_header,
@@ -653,20 +654,27 @@ class DocxStructureExtractor:
                 cells_by_header_normalized=cells_by_header_normalized,
             )
 
+            row_scope_source: Optional[str] = None
+
             if table_type == "refusal_reasons":
                 if explicit_section_scope is not None:
                     current_refusal_scope = explicit_section_scope
 
-                if explicit_row_scope in {"renewal_refusal", "suspension", "intake_refusal"}:
+                if explicit_row_scope in {"renewal_refusal", "suspension", "intake_refusal", "service_refusal"}:
                     row_scope = explicit_row_scope
+                    row_scope_source = "row_text"
                 elif current_refusal_scope is not None:
                     row_scope = current_refusal_scope
+                    row_scope_source = "section_context"
                 elif explicit_row_scope is not None:
                     row_scope = explicit_row_scope
+                    row_scope_source = "row_text_fallback"
                 else:
                     row_scope = "service_refusal"
+                    row_scope_source = "default_service_fallback"
             else:
                 row_scope = None
+                row_scope_source = None
 
             row_payloads.append(
                 {
@@ -689,6 +697,7 @@ class DocxStructureExtractor:
                         "table_semantic_type": table_type,
                         "row_kind": "data_row",
                         "row_scope": row_scope,
+                        "row_scope_source": row_scope_source,
                         "requirement_group": row.get("row_context", {}).get("requirement_group", "unknown"),
                         "requirement_group_label": row.get("row_context", {}).get("requirement_group_label"),
                         "table_section_context": {
@@ -747,6 +756,8 @@ class DocxStructureExtractor:
         cells_by_header_normalized = cells_by_header_normalized or {}
 
         local_parts = [
+            table_title,
+            row_summary,
             cells_by_semantic_key.get("refusal_reason", ""),
             *cells_by_header.values(),
             *cells_by_header_normalized.values(),
@@ -850,6 +861,7 @@ class DocxStructureExtractor:
     def _build_refusal_section_candidate_text(
         self,
         *,
+        table_title: str,
         row_summary: str,
         cells_by_semantic_key: dict[str, str] | None,
         cells_by_header: dict[str, str] | None,
@@ -858,8 +870,10 @@ class DocxStructureExtractor:
         cells_by_header = cells_by_header or {}
 
         parts = [
+            table_title,
             cells_by_semantic_key.get("refusal_reason", ""),
             *cells_by_header.values(),
+            row_summary,
         ]
         text = self._normalize_search_text(" ".join(x for x in parts if x))
 
