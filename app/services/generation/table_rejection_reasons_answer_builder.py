@@ -134,7 +134,9 @@ class TableRejectionReasonsAnswerBuilder:
                 )
                 continue
 
-            row_scope = self._classify_reason_scope(reason_text)
+            row_scope = self._normalize_text(metadata.get("row_scope"))
+            if not row_scope or row_scope == "other":
+                row_scope = self._classify_reason_scope(reason_text)
 
             if question_scope != "other" and row_scope not in {question_scope, "other"}:
                 dropped_rows_debug.append(

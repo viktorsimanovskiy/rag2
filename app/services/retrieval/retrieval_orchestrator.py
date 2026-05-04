@@ -503,6 +503,10 @@ class RetrievalOrchestrator:
 
         question_measure_family = resolved_measure_code
 
+        question_rejection_scope = None
+        if payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION:
+            question_rejection_scope = self._detect_rejection_question_scope(normalized_text)
+
         requested_column_hints = self._build_requested_column_hints(
             table_question_profile=table_question_profile,
             submission_channel=submission_channel,
@@ -521,6 +525,7 @@ class RetrievalOrchestrator:
             submission_channel=submission_channel,
             requested_column_hints=requested_column_hints,
             question_deadline_kind=question_deadline_kind,
+            question_rejection_scope=question_rejection_scope,
         )
 
         query_terms = self._deduplicate_preserve_order(
@@ -543,6 +548,7 @@ class RetrievalOrchestrator:
             "requested_column_hints": requested_column_hints,
             "table_scope_hints": table_scope_hints,
             "question_deadline_kind": question_deadline_kind,
+            "question_rejection_scope": question_rejection_scope,
             "question_measure_family": question_measure_family,
             "wants_full_documents_list": wants_full_documents_list,
         }
@@ -572,6 +578,7 @@ class RetrievalOrchestrator:
         submission_channel: Optional[str] = None,
         requested_column_hints: Optional[list[str]] = None,
         question_deadline_kind: Optional[str] = None,
+        question_rejection_scope: Optional[str] = None,
     ) -> list[str]:
         terms: list[str] = []
 
@@ -681,6 +688,39 @@ class RetrievalOrchestrator:
                     "отказа в приеме",
                 ]
             )
+
+            if question_rejection_scope == "service_refusal":
+                terms.extend(
+                    [
+                        "отказ в предоставлении",
+                        "отказ в назначении",
+                        "отказа в предоставлении государственной услуги",
+                    ]
+                )
+            elif question_rejection_scope == "intake_refusal":
+                terms.extend(
+                    [
+                        "отказ в приеме",
+                        "отказ в приеме документов",
+                        "отказ в приеме заявления",
+                    ]
+                )
+            elif question_rejection_scope == "suspension":
+                terms.extend(
+                    [
+                        "приостановление",
+                        "основания для приостановления",
+                    ]
+                )
+            elif question_rejection_scope == "renewal_refusal":
+                terms.extend(
+                    [
+                        "отказ в возобновлении",
+                        "отказа в возобновлении",
+                        "возобновлении едв",
+                        "возобновлении выплаты",
+                    ]
+                )
 
         if submission_channel == "epgu":
             terms.extend(["епгу", "единый портал", "госуслуги"])
@@ -948,6 +988,33 @@ class RetrievalOrchestrator:
 
         if any(marker in text_norm for marker in decision_markers):
             return "decision"
+
+        return "other"
+
+    def _detect_rejection_question_scope(
+        self,
+        text: str,
+    ) -> str:
+        text_norm = self._normalize_text(text)
+        if not text_norm:
+            return "service_refusal"
+
+        if "приостанов" in text_norm:
+            return "suspension"
+
+        if "отказ" in text_norm and "возобнов" in text_norm:
+            return "renewal_refusal"
+
+        if (
+            "отказа в приеме" in text_norm
+            or "отказ в приеме" in text_norm
+            or "приеме документов" in text_norm
+            or "приеме заявления" in text_norm
+        ):
+            return "intake_refusal"
+
+        if "отказ" in text_norm or "почему могут отказать" in text_norm:
+            return "service_refusal"
 
         return "other"
 
@@ -1557,6 +1624,21 @@ class RetrievalOrchestrator:
 
         wants_full_documents_list = bool(query_bundle.get("wants_full_documents_list"))
         is_documents_question = payload.intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION
+        question_rejection_scope = query_bundle.get("question_rejection_scope")
+
+        row_score_expr = self._row_match_score_expr(text_terms=text_terms) * strategy.rows_weight
+        if (
+            payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION
+            and question_rejection_scope
+            and question_rejection_scope != "other"
+        ):
+            row_score_expr = row_score_expr + case(
+                (
+                    DocumentTableRow.metadata_json["row_scope"].astext == question_rejection_scope,
+                    0.55,
+                ),
+                else_=0.0,
+            )
 
         stmt = (
             select(
@@ -1571,9 +1653,7 @@ class RetrievalOrchestrator:
                 DocumentTableRow.row_summary.label("snippet"),
                 DocumentTableRow.citation_json.label("citation_json"),
                 DocumentTableRow.metadata_json.label("metadata_json"),
-                (
-                    self._row_match_score_expr(text_terms=text_terms) * strategy.rows_weight
-                ).label("score"),
+                row_score_expr.label("score"),
             )
             .join(DocumentRegistry, DocumentRegistry.document_id == DocumentTableRow.document_id)
             .where(DocumentRegistry.status == "active")
@@ -2184,129 +2264,243 @@ class RetrievalOrchestrator:
         document_stats: dict[UUID, dict[str, Any]],
         priority_document_ids: list[UUID],
     ) -> list[RetrievedCandidate]:
-            """
-            Select final balanced evidence set.
+        """
+        Select final balanced evidence set.
 
-            Специальное правило для DEADLINE_QUESTION:
-            - первыми берём реальные temporal blocks и deadline rows;
-            - режем deadline-noise из таблиц отказов/сокращений;
-            - не заставляем builder жить только на table_row, потому что
-              в текущем документе сроки часто лежат в list_item блоках.
-            """
-            if not candidates:
-                return []
+        Специальное правило для DEADLINE_QUESTION:
+        - первыми берём реальные temporal blocks и deadline rows;
+        - режем deadline-noise из таблиц отказов/сокращений;
+        - не заставляем builder жить только на table_row, потому что
+          в текущем документе сроки часто лежат в list_item блоках.
+        """
+        if not candidates:
+            return []
 
-            is_documents_question = payload.intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION
-            is_deadline_question = payload.intent_type == QuestionIntentEnum.DEADLINE_QUESTION
-            wants_full_documents_list = bool(query_bundle.get("wants_full_documents_list"))
+        is_documents_question = payload.intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION
+        is_deadline_question = payload.intent_type == QuestionIntentEnum.DEADLINE_QUESTION
+        is_rejection_question = payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION
+        wants_full_documents_list = bool(query_bundle.get("wants_full_documents_list"))
 
-            if is_documents_question:
-                if wants_full_documents_list:
-                    type_caps = {
-                        "legal_fact": 0,
-                        "table": 1,
-                        "table_row": max(30, payload.final_top_k),
-                        "block": 0,
-                    }
-                else:
-                    type_caps = {
-                        "legal_fact": 1,
-                        "table": min(2, payload.final_top_k),
-                        "table_row": min(max(10, payload.final_top_k), 14),
-                        "block": 1,
-                    }
-            elif is_deadline_question:
+        if is_documents_question:
+            if wants_full_documents_list:
                 type_caps = {
-                    "legal_fact": 1,
+                    "legal_fact": 0,
                     "table": 1,
-                    "table_row": min(5, payload.final_top_k),
-                    "block": min(8, payload.final_top_k),
+                    "table_row": max(30, payload.final_top_k),
+                    "block": 0,
                 }
             else:
                 type_caps = {
-                    "legal_fact": max(2, min(5, payload.final_top_k)),
-                    "table": max(2, min(4, payload.final_top_k)),
-                    "table_row": max(2, min(5, payload.final_top_k)),
-                    "block": max(2, min(5, payload.final_top_k)),
+                    "legal_fact": 1,
+                    "table": min(2, payload.final_top_k),
+                    "table_row": min(max(10, payload.final_top_k), 14),
+                    "block": 1,
                 }
+        elif is_deadline_question:
+            type_caps = {
+                "legal_fact": 1,
+                "table": 1,
+                "table_row": min(5, payload.final_top_k),
+                "block": min(8, payload.final_top_k),
+            }
+        elif is_rejection_question:
+            type_caps = {
+                "legal_fact": 2,
+                "table": 1,
+                "table_row": min(max(8, payload.final_top_k), 12),
+                "block": 2,
+            }
+        else:
+            type_caps = {
+                "legal_fact": max(2, min(5, payload.final_top_k)),
+                "table": max(2, min(4, payload.final_top_k)),
+                "table_row": max(2, min(5, payload.final_top_k)),
+                "block": max(2, min(5, payload.final_top_k)),
+            }
 
-            priority_document_set = set(priority_document_ids)
-            min_score_threshold = self._get_min_candidate_score_threshold(
-                payload=payload,
-                strategy=strategy,
-                document_stats=document_stats,
+        priority_document_set = set(priority_document_ids)
+        min_score_threshold = self._get_min_candidate_score_threshold(
+            payload=payload,
+            strategy=strategy,
+            document_stats=document_stats,
+        )
+
+        ordered_candidates = list(candidates)
+
+        if is_deadline_question:
+            question_deadline_kind = str(
+                query_bundle.get("question_deadline_kind") or "other"
+            )
+            ordered_candidates.sort(
+                key=lambda candidate: (
+                    self._deadline_candidate_priority_bucket(
+                        candidate,
+                        question_deadline_kind=question_deadline_kind,
+                        priority_document_set=priority_document_set,
+                    ),
+                    -self._candidate_effective_score(candidate),
+                )
+            )
+        elif is_rejection_question:
+            question_rejection_scope = str(
+                query_bundle.get("question_rejection_scope") or "service_refusal"
+            )
+            ordered_candidates.sort(
+                key=lambda candidate: (
+                    self._rejection_candidate_priority_bucket(
+                        candidate,
+                        question_rejection_scope=question_rejection_scope,
+                        priority_document_set=priority_document_set,
+                    ),
+                    -self._candidate_effective_score(candidate),
+                )
             )
 
-            ordered_candidates = list(candidates)
-
-            if is_deadline_question:
-                question_deadline_kind = str(
-                    query_bundle.get("question_deadline_kind") or "other"
-                )
+        if is_documents_question:
+            if wants_full_documents_list:
                 ordered_candidates.sort(
                     key=lambda candidate: (
-                        self._deadline_candidate_priority_bucket(
-                            candidate,
-                            question_deadline_kind=question_deadline_kind,
-                            priority_document_set=priority_document_set,
-                        ),
+                        0 if (
+                            candidate.document_id in priority_document_set
+                            and candidate.source_type == "table_row"
+                            and self._has_table_semantic_type(candidate, "documents")
+                        ) else 1 if (
+                            candidate.document_id in priority_document_set
+                            and candidate.source_type == "table"
+                            and self._has_table_semantic_type(candidate, "documents")
+                        ) else 2,
+                        0 if str((candidate.metadata_json or {}).get("requirement_group") or "").strip().lower() == "required"
+                        else 1 if str((candidate.metadata_json or {}).get("requirement_group") or "").strip().lower() == "optional"
+                        else 2,
+                        int((candidate.metadata_json or {}).get("row_order") or 10**9),
+                        -self._candidate_effective_score(candidate),
+                    )
+                )
+            else:
+                ordered_candidates.sort(
+                    key=lambda candidate: (
+                        0 if (
+                            candidate.document_id in priority_document_set
+                            and candidate.source_type == "table_row"
+                            and self._has_table_semantic_type(candidate, "documents")
+                        ) else 1 if (
+                            candidate.document_id in priority_document_set
+                            and candidate.source_type == "table"
+                            and self._has_table_semantic_type(candidate, "documents")
+                        ) else 2 if candidate.document_id in priority_document_set else 3,
                         -self._candidate_effective_score(candidate),
                     )
                 )
 
+        selected: list[RetrievedCandidate] = []
+        selected_keys: set[tuple[str, UUID]] = set()
+        type_counts: dict[str, int] = {}
+        document_counts: dict[UUID, int] = {}
+
+        for candidate in ordered_candidates:
+            candidate_key = (candidate.source_type, candidate.source_id)
+            if candidate_key in selected_keys:
+                continue
+
+            effective_score = self._candidate_effective_score(candidate)
+            if effective_score < min_score_threshold:
+                continue
+
+            if is_deadline_question and self._is_deadline_noise_candidate(candidate):
+                continue
+
+            if is_rejection_question:
+                candidate_row_scope = self._candidate_row_scope(candidate)
+                question_rejection_scope = str(
+                    query_bundle.get("question_rejection_scope") or "service_refusal"
+                )
+                if (
+                    candidate.source_type == "table_row"
+                    and candidate_row_scope
+                    and question_rejection_scope != "other"
+                    and candidate_row_scope != question_rejection_scope
+                ):
+                    continue
+
+            if is_deadline_question:
+                has_temporal_markers = self._has_temporal_deadline_markers(candidate)
+                is_deadline_table = self._has_table_semantic_type(candidate, "deadline") or self._has_table_semantic_type(candidate, "deadlines")
+                if candidate.source_type == "block" and not has_temporal_markers:
+                    continue
+                if candidate.source_type == "table_row" and not has_temporal_markers:
+                    continue
+                if candidate.source_type == "table" and not is_deadline_table:
+                    continue
+
+            current_type_count = type_counts.get(candidate.source_type, 0)
+            if current_type_count >= type_caps.get(candidate.source_type, payload.final_top_k):
+                continue
+
+            current_doc_count = document_counts.get(candidate.document_id, 0)
             if is_documents_question:
                 if wants_full_documents_list:
-                    ordered_candidates.sort(
-                        key=lambda candidate: (
-                            0 if (
-                                candidate.document_id in priority_document_set
-                                and candidate.source_type == "table_row"
-                                and self._has_table_semantic_type(candidate, "documents")
-                            ) else 1 if (
-                                candidate.document_id in priority_document_set
-                                and candidate.source_type == "table"
-                                and self._has_table_semantic_type(candidate, "documents")
-                            ) else 2,
-                            0 if str((candidate.metadata_json or {}).get("requirement_group") or "").strip().lower() == "required"
-                            else 1 if str((candidate.metadata_json or {}).get("requirement_group") or "").strip().lower() == "optional"
-                            else 2,
-                            int((candidate.metadata_json or {}).get("row_order") or 10**9),
-                            -self._candidate_effective_score(candidate),
-                        )
-                    )
+                    max_per_document = 40 if candidate.document_id in priority_document_set else 12
                 else:
-                    ordered_candidates.sort(
-                        key=lambda candidate: (
-                            0 if (
-                                candidate.document_id in priority_document_set
-                                and candidate.source_type == "table_row"
-                                and self._has_table_semantic_type(candidate, "documents")
-                            ) else 1 if (
-                                candidate.document_id in priority_document_set
-                                and candidate.source_type == "table"
-                                and self._has_table_semantic_type(candidate, "documents")
-                            ) else 2 if candidate.document_id in priority_document_set else 3,
-                            -self._candidate_effective_score(candidate),
-                        )
-                    )
+                    max_per_document = 12 if candidate.document_id in priority_document_set else 4
+            elif is_deadline_question:
+                max_per_document = 8 if candidate.document_id in priority_document_set else 1
+            elif is_rejection_question:
+                max_per_document = 10 if candidate.document_id in priority_document_set else 3
+            else:
+                max_per_document = 6 if candidate.document_id in priority_document_set else 3
 
-            selected: list[RetrievedCandidate] = []
-            selected_keys: set[tuple[str, UUID]] = set()
-            type_counts: dict[str, int] = {}
-            document_counts: dict[UUID, int] = {}
+            if current_doc_count >= max_per_document:
+                continue
 
+            if (
+                is_deadline_question
+                and priority_document_set
+                and candidate.document_id not in priority_document_set
+                and len(selected) >= 4
+            ):
+                continue
+
+            if (
+                is_rejection_question
+                and priority_document_set
+                and candidate.document_id not in priority_document_set
+                and len(selected) >= 6
+            ):
+                continue
+
+            selected.append(candidate)
+            selected_keys.add(candidate_key)
+            type_counts[candidate.source_type] = current_type_count + 1
+            document_counts[candidate.document_id] = current_doc_count + 1
+
+            target_final_top_k = payload.final_top_k
+            if is_documents_question and wants_full_documents_list:
+                target_final_top_k = max(payload.final_top_k, 32)
+
+            if len(selected) >= target_final_top_k:
+                break
+
+        if len(selected) < min(3, target_final_top_k):
             for candidate in ordered_candidates:
+                if len(selected) >= target_final_top_k:
+                    break
                 candidate_key = (candidate.source_type, candidate.source_id)
                 if candidate_key in selected_keys:
                     continue
-
-                effective_score = self._candidate_effective_score(candidate)
-                if effective_score < min_score_threshold:
-                    continue
-
                 if is_deadline_question and self._is_deadline_noise_candidate(candidate):
                     continue
-
+                if is_rejection_question:
+                    candidate_row_scope = self._candidate_row_scope(candidate)
+                    question_rejection_scope = str(
+                        query_bundle.get("question_rejection_scope") or "service_refusal"
+                    )
+                    if (
+                        candidate.source_type == "table_row"
+                        and candidate_row_scope
+                        and question_rejection_scope != "other"
+                        and candidate_row_scope != question_rejection_scope
+                    ):
+                        continue
                 if is_deadline_question:
                     has_temporal_markers = self._has_temporal_deadline_markers(candidate)
                     is_deadline_table = self._has_table_semantic_type(candidate, "deadline") or self._has_table_semantic_type(candidate, "deadlines")
@@ -2316,69 +2510,13 @@ class RetrievalOrchestrator:
                         continue
                     if candidate.source_type == "table" and not is_deadline_table:
                         continue
-
-                current_type_count = type_counts.get(candidate.source_type, 0)
-                if current_type_count >= type_caps.get(candidate.source_type, payload.final_top_k):
-                    continue
-
-                current_doc_count = document_counts.get(candidate.document_id, 0)
-                if is_documents_question:
-                    if wants_full_documents_list:
-                        max_per_document = 40 if candidate.document_id in priority_document_set else 12
-                    else:
-                        max_per_document = 12 if candidate.document_id in priority_document_set else 4
-                elif is_deadline_question:
-                    max_per_document = 8 if candidate.document_id in priority_document_set else 1
-                else:
-                    max_per_document = 6 if candidate.document_id in priority_document_set else 3
-
-                if current_doc_count >= max_per_document:
-                    continue
-
-                if (
-                    is_deadline_question
-                    and priority_document_set
-                    and candidate.document_id not in priority_document_set
-                    and len(selected) >= 4
-                ):
-                    continue
-
+                    if priority_document_set and candidate.document_id not in priority_document_set and len(selected) >= 4:
+                        continue
                 selected.append(candidate)
                 selected_keys.add(candidate_key)
-                type_counts[candidate.source_type] = current_type_count + 1
-                document_counts[candidate.document_id] = current_doc_count + 1
 
-                target_final_top_k = payload.final_top_k
-                if is_documents_question and wants_full_documents_list:
-                    target_final_top_k = max(payload.final_top_k, 32)
-
-                if len(selected) >= target_final_top_k:
-                    break
-
-            if len(selected) < min(3, target_final_top_k):
-                for candidate in ordered_candidates:
-                    if len(selected) >= target_final_top_k:
-                        break
-                    candidate_key = (candidate.source_type, candidate.source_id)
-                    if candidate_key in selected_keys:
-                        continue
-                    if is_deadline_question and self._is_deadline_noise_candidate(candidate):
-                        continue
-                    if is_deadline_question:
-                        has_temporal_markers = self._has_temporal_deadline_markers(candidate)
-                        is_deadline_table = self._has_table_semantic_type(candidate, "deadline") or self._has_table_semantic_type(candidate, "deadlines")
-                        if candidate.source_type == "block" and not has_temporal_markers:
-                            continue
-                        if candidate.source_type == "table_row" and not has_temporal_markers:
-                            continue
-                        if candidate.source_type == "table" and not is_deadline_table:
-                            continue
-                        if priority_document_set and candidate.document_id not in priority_document_set and len(selected) >= 4:
-                            continue
-                    selected.append(candidate)
-                    selected_keys.add(candidate_key)
-
-            return selected
+        return selected
+            
     def _build_evidence_package(
         self,
         *,
@@ -2732,6 +2870,11 @@ class RetrievalOrchestrator:
         requested_column_hints = query_bundle.get("requested_column_hints") or []
         question_norm = self._normalize_text(payload.question_text_normalized or payload.question_text_raw)
         question_deadline_kind = self._detect_deadline_question_kind(question_norm)
+        question_rejection_scope = str(
+            query_bundle.get("question_rejection_scope")
+            or self._detect_rejection_question_scope(question_norm)
+            or "service_refusal"
+        )
         resolved_measure_code = self._normalize_text(
             query_bundle.get("measure_code")
             or payload.measure_code
@@ -2919,6 +3062,29 @@ class RetrievalOrchestrator:
                     score += 0.16
 
             elif intent_type == QuestionIntentEnum.REJECTION_QUESTION:
+                table_semantic_type = self._normalize_text(metadata.get("table_semantic_type"))
+                candidate_row_scope = self._candidate_row_scope(candidate)
+
+                if table_semantic_type in {"refusal_reasons", "rejection_reasons"}:
+                    if candidate.source_type == "table_row":
+                        score += 0.40
+                    elif candidate.source_type == "table":
+                        score += 0.18
+
+                if question_rejection_scope != "other":
+                    if candidate_row_scope == question_rejection_scope:
+                        if candidate.source_type == "table_row":
+                            score += 0.75
+                        elif candidate.source_type == "table":
+                            score += 0.20
+                        else:
+                            score += 0.10
+                    elif candidate_row_scope and candidate_row_scope != question_rejection_scope:
+                        if candidate.source_type == "table_row":
+                            score -= 1.10
+                        else:
+                            score -= 0.35
+
                 if any(marker in text for marker in [
                     "основания отказа",
                     "отказа в предоставлении",
@@ -2950,6 +3116,50 @@ class RetrievalOrchestrator:
             reverse=True,
         )
         return reranked
+
+    def _candidate_row_scope(
+        self,
+        candidate: RetrievedCandidate,
+    ) -> Optional[str]:
+        metadata = candidate.metadata_json or {}
+        value = self._normalize_text(metadata.get("row_scope"))
+        return value or None
+
+
+    def _rejection_candidate_priority_bucket(
+        self,
+        candidate: RetrievedCandidate,
+        *,
+        question_rejection_scope: str,
+        priority_document_set: set[UUID],
+    ) -> int:
+        table_semantic_type = self._normalize_text((candidate.metadata_json or {}).get("table_semantic_type"))
+        candidate_row_scope = self._candidate_row_scope(candidate)
+        in_priority_doc = candidate.document_id in priority_document_set
+
+        if candidate.source_type == "table_row" and table_semantic_type in {"refusal_reasons", "rejection_reasons"}:
+            if in_priority_doc and candidate_row_scope == question_rejection_scope:
+                return 0
+            if in_priority_doc and candidate_row_scope is None:
+                return 1
+            if candidate_row_scope == question_rejection_scope:
+                return 2
+            if candidate_row_scope is None:
+                return 3
+            return 20
+
+        if candidate.source_type == "legal_fact":
+            if in_priority_doc:
+                return 4
+            return 8
+
+        if candidate.source_type == "table" and table_semantic_type in {"refusal_reasons", "rejection_reasons"}:
+            return 5 if in_priority_doc else 9
+
+        if candidate.source_type == "block":
+            return 6 if in_priority_doc else 10
+
+        return 30
         
     def _classify_deadline_candidate_kind(
         self,
