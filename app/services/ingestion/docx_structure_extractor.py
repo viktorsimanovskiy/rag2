@@ -754,8 +754,6 @@ class DocxStructureExtractor:
             )
 
             section_text = self._build_refusal_section_candidate_text(
-                table_title=effective_table_title,
-                row_summary=effective_row_summary,
                 cells_by_semantic_key=cells_by_semantic_key,
                 cells_by_header=cells_by_header,
             )
@@ -765,10 +763,15 @@ class DocxStructureExtractor:
                 section_text=section_text,
             )
 
+            if table_type == "refusal_reasons" and self._is_refusal_section_heading_row(
+                explicit_section_scope=explicit_section_scope,
+                cells_by_header=cells_by_header,
+            ):
+                current_refusal_scope = explicit_section_scope
+                continue
+
             explicit_row_scope = self._detect_refusal_row_scope(
                 table_type=table_type,
-                table_title=effective_table_title,
-                row_summary=effective_row_summary,
                 cells_by_semantic_key=cells_by_semantic_key,
                 cells_by_header=cells_by_header,
                 cells_by_header_normalized=cells_by_header_normalized,
@@ -777,15 +780,12 @@ class DocxStructureExtractor:
             row_scope_source: Optional[str] = None
 
             if table_type == "refusal_reasons":
-                if explicit_section_scope is not None:
-                    current_refusal_scope = explicit_section_scope
-
-                if explicit_row_scope in {"renewal_refusal", "suspension", "intake_refusal", "service_refusal"}:
-                    row_scope = explicit_row_scope
-                    row_scope_source = "row_text"
-                elif current_refusal_scope is not None:
+                if current_refusal_scope is not None:
                     row_scope = current_refusal_scope
                     row_scope_source = "section_context"
+                elif explicit_row_scope in {"renewal_refusal", "suspension", "intake_refusal", "service_refusal"}:
+                    row_scope = explicit_row_scope
+                    row_scope_source = "row_text"
                 elif explicit_row_scope is not None:
                     row_scope = explicit_row_scope
                     row_scope_source = "row_text_fallback"
@@ -869,8 +869,6 @@ class DocxStructureExtractor:
         self,
         *,
         table_type: str,
-        table_title: str,
-        row_summary: str,
         cells_by_semantic_key: dict[str, str] | None,
         cells_by_header: dict[str, str] | None,
         cells_by_header_normalized: dict[str, str] | None,
@@ -882,9 +880,11 @@ class DocxStructureExtractor:
         cells_by_header = cells_by_header or {}
         cells_by_header_normalized = cells_by_header_normalized or {}
 
+        # Важно: не используем table_title и row_summary для row-level scope.
+        # В объединённых таблицах отказов общий заголовок содержит сразу
+        # "отказ в приёме / приостановление / отказ в предоставлении".
+        # Если учитывать его в каждой строке, все строки ошибочно становятся intake_refusal.
         local_parts = [
-            table_title,
-            row_summary,
             cells_by_semantic_key.get("refusal_reason", ""),
             *cells_by_header.values(),
             *cells_by_header_normalized.values(),
@@ -988,26 +988,59 @@ class DocxStructureExtractor:
     def _build_refusal_section_candidate_text(
         self,
         *,
-        table_title: str,
-        row_summary: str,
         cells_by_semantic_key: dict[str, str] | None,
         cells_by_header: dict[str, str] | None,
     ) -> str:
         cells_by_semantic_key = cells_by_semantic_key or {}
         cells_by_header = cells_by_header or {}
 
+        # Для section-scope берём только содержимое текущей строки.
+        # Общий table_title намеренно исключён: он часто перечисляет все виды отказов
+        # и ломает классификацию каждой отдельной строки.
         parts = [
-            table_title,
             cells_by_semantic_key.get("refusal_reason", ""),
             *cells_by_header.values(),
-            row_summary,
         ]
-        text = self._normalize_search_text(" ".join(x for x in parts if x))
+        return self._normalize_search_text(" ".join(x for x in parts if x))
 
-        if text:
-            return text
+    def _is_refusal_section_heading_row(
+        self,
+        *,
+        explicit_section_scope: Optional[str],
+        cells_by_header: dict[str, str] | None,
+    ) -> bool:
+        if explicit_section_scope not in {
+            "renewal_refusal",
+            "suspension",
+            "intake_refusal",
+            "service_refusal",
+        }:
+            return False
 
-        return self._normalize_search_text(row_summary)
+        cells_by_header = cells_by_header or {}
+        values = [self._clean_text(str(value)) for value in cells_by_header.values()]
+        values = [value for value in values if value]
+        if not values:
+            return False
+
+        combined = self._normalize_search_text(" ".join(values))
+        if "исчерпывающий перечень оснований" not in combined:
+            return False
+
+        # В DOCX merged cells часто приходят как несколько одинаковых значений.
+        # Секционный заголовок обычно занимает всю строку, а не является причиной отказа.
+        unique_values = {self._normalize_search_text(value) for value in values if value}
+        has_row_number = any(re.fullmatch(r"\d+(?:\.\d+)?", value.strip()) for value in values)
+        if len(unique_values) <= 2 and not has_row_number:
+            return True
+
+        first_value = self._normalize_search_text(values[0])
+        if not re.fullmatch(r"\d+(?:\.\d+)?", values[0].strip()):
+            if first_value.startswith("исчерпывающий перечень оснований"):
+                return True
+
+        return False
+
 
     def _normalize_search_text(
         self,
