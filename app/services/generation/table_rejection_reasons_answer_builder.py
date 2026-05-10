@@ -134,6 +134,16 @@ class TableRejectionReasonsAnswerBuilder:
                 )
                 continue
 
+            if self._is_correction_error_reason(reason_text) and not self._question_about_correction(question_text):
+                dropped_rows_debug.append(
+                    {
+                        "row_id": row_id,
+                        "reason": "correction_error_reason_out_of_scope",
+                        "reason_text": reason_text,
+                    }
+                )
+                continue
+
             row_scope = self._normalize_text(metadata.get("row_scope"))
             if not row_scope or row_scope == "other":
                 row_scope = self._classify_reason_scope(reason_text)
@@ -316,6 +326,46 @@ class TableRejectionReasonsAnswerBuilder:
 
     def _is_service_value(self, value: str) -> bool:
         return self._normalize_text(value) in self._SERVICE_VALUES
+
+    def _is_correction_error_reason(self, value: str) -> bool:
+        text = self._normalize_text(value)
+        if not text:
+            return False
+
+        # В таблицах отказов некоторых регламентов рядом с основными основаниями
+        # встречаются строки про отказ в исправлении опечаток и ошибок в выданном
+        # документе. Для обычного вопроса "почему могут отказать в услуге" это
+        # другой предмет ответа, поэтому такие строки не должны попадать в общий
+        # список оснований отказа в предоставлении услуги.
+        correction_markers = (
+            "опечат",
+            "ошибк",
+            "выданном документе",
+            "исправлен",
+            "исправлении",
+            "исправления",
+        )
+        if not any(marker in text for marker in correction_markers):
+            return False
+
+        return (
+            "выданном документе" in text
+            or "исправ" in text
+            or "опечат" in text and "ошиб" in text
+        )
+
+    def _question_about_correction(self, question_text: str) -> bool:
+        text = self._normalize_text(question_text)
+        return any(
+            marker in text
+            for marker in (
+                "опечат",
+                "ошибк",
+                "исправ",
+                "выданн",
+                "документе",
+            )
+        )
 
     def _clean(self, value: Any) -> str:
         if value is None:
