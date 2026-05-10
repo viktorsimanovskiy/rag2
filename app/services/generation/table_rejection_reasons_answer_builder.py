@@ -271,6 +271,15 @@ class TableRejectionReasonsAnswerBuilder:
             "отказа в приеме" in text
             or "отказ в приеме" in text
             or "приеме документов" in text
+            or "прием документов" in text
+            or "не принять документы" in text
+            or "не примут документы" in text
+            or "не принимают документы" in text
+            or "не приняли документы" in text
+            or "откажут принять документы" in text
+            or "заявление не примут" in text
+            or "не принять заявление" in text
+            or "не примут заявление" in text
         ):
             return "intake_refusal"
 

@@ -1577,6 +1577,13 @@ class RetrievalOrchestrator:
             .where(DocumentRegistry.status == "active")
         )
 
+        if payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION:
+            stmt = stmt.where(
+                DocumentTable.metadata_json["table_semantic_type"].astext.in_(
+                    ["refusal_reasons", "rejection_reasons"]
+                )
+            )
+
         if measure_code:
             stmt = stmt.where(
                 or_(
@@ -1659,6 +1666,18 @@ class RetrievalOrchestrator:
             .join(DocumentRegistry, DocumentRegistry.document_id == DocumentTableRow.document_id)
             .where(DocumentRegistry.status == "active")
         )
+
+        if payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION:
+            stmt = stmt.where(
+                DocumentTableRow.metadata_json["table_semantic_type"].astext.in_(
+                    ["refusal_reasons", "rejection_reasons"]
+                )
+            )
+
+            if question_rejection_scope and question_rejection_scope != "other":
+                stmt = stmt.where(
+                    DocumentTableRow.metadata_json["row_scope"].astext == question_rejection_scope
+                )
 
         if measure_code:
             stmt = stmt.where(
