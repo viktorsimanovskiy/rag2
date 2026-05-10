@@ -690,6 +690,7 @@ class GenerationPipeline:
             QuestionIntentEnum.DOCUMENTS_QUESTION,
             QuestionIntentEnum.DEADLINE_QUESTION,
             QuestionIntentEnum.FORM_QUESTION,
+            QuestionIntentEnum.REJECTION_QUESTION,
         } and ("legal_fact" in top_types or "table_row" in top_types or "table" in top_types):
             return AnswerModeEnum.DIRECT_STRUCTURED
 
@@ -697,7 +698,6 @@ class GenerationPipeline:
             QuestionIntentEnum.PROCEDURE_QUESTION,
             QuestionIntentEnum.APPEAL_QUESTION,
             QuestionIntentEnum.MIXED_QUESTION,
-            QuestionIntentEnum.REJECTION_QUESTION,
             QuestionIntentEnum.ELIGIBILITY_QUESTION,
         }:
             return AnswerModeEnum.GROUNDED_NARRATIVE
