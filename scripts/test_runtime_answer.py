@@ -155,11 +155,39 @@ def _to_jsonable(value):
     return repr(value)
 
 def _shorten_text(value: str | None, limit: int = 280) -> str:
+    """Однострочное сокращение для технических полей и preview источников."""
     if not value:
         return "—"
     text = " ".join(str(value).split())
     if len(text) <= limit:
         return text
+    return text[:limit].rstrip() + "..."
+
+
+def _shorten_multiline_text(value: str | None, limit: int = 1400) -> str:
+    """
+    Сокращение ответа без уничтожения переносов строк.
+
+    Важно для deterministic-ответов по спискам документов/сроков/отказов:
+    прежний compact-вывод схлопывал все пробелы и переносы, из-за чего пункты
+    списка выглядели как одна длинная строка.
+    """
+    if not value:
+        return "—"
+
+    raw = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    lines: list[str] = []
+    for line in raw.split("\n"):
+        cleaned = " ".join(line.split())
+        if cleaned:
+            lines.append(cleaned)
+        elif lines and lines[-1] != "":
+            lines.append("")
+
+    text = "\n".join(lines).strip()
+    if len(text) <= limit:
+        return text
+
     return text[:limit].rstrip() + "..."
 
 
@@ -275,7 +303,7 @@ def _render_compact_result(
 
     print("-" * 100)
     print("ОТВЕТ:")
-    print(_shorten_text(answer_text, limit=1400))
+    print(_shorten_multiline_text(answer_text, limit=1400))
 
     print("-" * 100)
     print("ЛУЧШИЕ ИСТОЧНИКИ:")
