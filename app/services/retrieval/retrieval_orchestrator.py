@@ -407,14 +407,17 @@ class RetrievalOrchestrator:
         if intent == QuestionIntentEnum.REJECTION_QUESTION:
             return RetrievalStrategy(
                 strategy_code="rejection_priority",
-                use_facts=True,
+                # Для отказного пути источник истины — строки таблицы 3.
+                # legal_fact и обычные block-и здесь дают шум: например, сроки выплат
+                # могут выигрывать у строки отказа только из-за слова "принятия".
+                use_facts=False,
                 use_tables=True,
                 use_rows=True,
-                use_blocks=True,
-                facts_weight=1.25,
+                use_blocks=False,
+                facts_weight=0.00,
                 tables_weight=1.00,
-                rows_weight=1.00,
-                blocks_weight=1.10,
+                rows_weight=1.25,
+                blocks_weight=0.00,
             )
 
         if intent == QuestionIntentEnum.FORM_QUESTION:
@@ -683,9 +686,10 @@ class RetrievalOrchestrator:
             terms.extend(
                 [
                     "основания отказа",
-                    "отказ в предоставлении",
+                    "перечень оснований",
                     "причины отказа",
-                    "отказа в приеме",
+                    "таблица 3",
+                    "приложение 2",
                 ]
             )
 
@@ -1010,6 +1014,15 @@ class RetrievalOrchestrator:
             or "отказ в приеме" in text_norm
             or "приеме документов" in text_norm
             or "приеме заявления" in text_norm
+            or "не принять документы" in text_norm
+            or "не примут документы" in text_norm
+            or "не принимают документы" in text_norm
+            or "не приняли документы" in text_norm
+            or "откажут принять документы" in text_norm
+            or "отказали принять документы" in text_norm
+            or "вернут документы" in text_norm
+            or "заявление не примут" in text_norm
+            or "заявление не приняли" in text_norm
         ):
             return "intake_refusal"
 
@@ -1491,13 +1504,7 @@ class RetrievalOrchestrator:
             stmt = stmt.where(
                 or_(
                     DocumentRegistry.primary_measure_code == measure_code,
-                    and_(
-                        DocumentRegistry.primary_measure_code.is_(None),
-                        or_(
-                            LegalFact.measure_code == measure_code,
-                            LegalFact.measure_code.is_(None),
-                        ),
-                    ),
+                    LegalFact.measure_code == measure_code,
                 )
             )
 
@@ -1574,13 +1581,7 @@ class RetrievalOrchestrator:
             stmt = stmt.where(
                 or_(
                     DocumentRegistry.primary_measure_code == measure_code,
-                    and_(
-                        DocumentRegistry.primary_measure_code.is_(None),
-                        or_(
-                            DocumentTable.metadata_json["measure_code"].astext == measure_code,
-                            DocumentTable.metadata_json["measure_code"].astext.is_(None),
-                        ),
-                    ),
+                    DocumentTable.metadata_json["measure_code"].astext == measure_code,
                 )
             )
 
@@ -1663,13 +1664,7 @@ class RetrievalOrchestrator:
             stmt = stmt.where(
                 or_(
                     DocumentRegistry.primary_measure_code == measure_code,
-                    and_(
-                        DocumentRegistry.primary_measure_code.is_(None),
-                        or_(
-                            DocumentTableRow.metadata_json["measure_code"].astext == measure_code,
-                            DocumentTableRow.metadata_json["measure_code"].astext.is_(None),
-                        ),
-                    ),
+                    DocumentTableRow.metadata_json["measure_code"].astext == measure_code,
                 )
             )
 
@@ -1741,12 +1736,7 @@ class RetrievalOrchestrator:
         )
 
         if measure_code:
-            stmt = stmt.where(
-                or_(
-                    DocumentRegistry.primary_measure_code == measure_code,
-                    DocumentRegistry.primary_measure_code.is_(None),
-                )
-            )
+            stmt = stmt.where(DocumentRegistry.primary_measure_code == measure_code)
 
         stmt = stmt.order_by(desc("score")).limit(payload.top_k_blocks)
 
@@ -2305,10 +2295,10 @@ class RetrievalOrchestrator:
             }
         elif is_rejection_question:
             type_caps = {
-                "legal_fact": 2,
+                "legal_fact": 0,
                 "table": 1,
                 "table_row": min(max(8, payload.final_top_k), 12),
-                "block": 2,
+                "block": 0,
             }
         else:
             type_caps = {
@@ -2620,6 +2610,8 @@ class RetrievalOrchestrator:
                 "submission_channel": query_bundle.get("submission_channel"),
                 "requested_column_hints": query_bundle.get("requested_column_hints"),
                 "table_scope_hints": query_bundle.get("table_scope_hints"),
+                "measure_code": query_bundle.get("measure_code"),
+                "question_rejection_scope": query_bundle.get("question_rejection_scope"),
             },
             "selected_candidates_preview": [
                 {
@@ -2639,6 +2631,9 @@ class RetrievalOrchestrator:
                         "table_number": (c.metadata_json or {}).get("table_number"),
                         "appendix_number": (c.metadata_json or {}).get("appendix_number"),
                         "row_summary": (c.metadata_json or {}).get("row_summary"),
+                        "row_scope": (c.metadata_json or {}).get("row_scope"),
+                        "row_scope_source": (c.metadata_json or {}).get("row_scope_source"),
+                        "measure_code": (c.metadata_json or {}).get("measure_code"),
                         "table_semantic_type": (c.metadata_json or {}).get("table_semantic_type"),
                         "column_headers": (c.metadata_json or {}).get("column_headers"),
                         "cells_text": (c.metadata_json or {}).get("cells_text"),

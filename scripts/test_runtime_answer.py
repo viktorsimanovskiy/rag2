@@ -382,6 +382,16 @@ async def _run_one_question(
         )
         print("=" * 100)
         print()
+    elif output_format == "compact":
+        _render_compact_result(
+            question_text=question_text,
+            intent=intent,
+            elapsed=elapsed,
+            result=result,
+            top_candidates_count=top_candidates_count,
+        )
+    else:
+        raise ValueError(f"Unsupported output format: {output_format}")
 
 async def run(
     *,
