@@ -572,12 +572,16 @@ class DocxStructureExtractor:
     ) -> dict[str, Any]:
         headers, header_keys = self._extract_headers(table)
         appendix_number = self._detect_appendix_number_from_context(paragraph_context)
-        normative_table_number = self._detect_normative_table_number_from_context(paragraph_context)
+        explicit_normative_table_number = self._detect_normative_table_number_from_context(paragraph_context)
         table_type = self._detect_table_type(
             table_title=table_title,
             headers=headers,
             row_payloads=row_payloads,
-            normative_table_number=normative_table_number,
+            normative_table_number=explicit_normative_table_number,
+        )
+        normative_table_number, normative_table_number_source = self._resolve_normative_table_number(
+            explicit_normative_table_number=explicit_normative_table_number,
+            table_type=table_type,
         )
         effective_table_title = self._repair_table_title(
             table_title=table_title,
@@ -590,6 +594,7 @@ class DocxStructureExtractor:
         metadata_json = {
             "docx_table_index": int(table_number),
             "normative_table_number": normative_table_number,
+            "normative_table_number_source": normative_table_number_source,
             "table_semantic_type": table_type,
             "preceding_paragraphs": [
                 x.get("content_clean")
@@ -672,7 +677,15 @@ class DocxStructureExtractor:
             ):
                 continue
 
-            if self._is_service_section_row(
+            table_title_for_section_guard = self._normalize_detection_text(table_title)
+            is_refusal_table_title = (
+                "ОСНОВАН" in table_title_for_section_guard
+                and (
+                    "ОТКАЗ" in table_title_for_section_guard
+                    or "ПРИОСТАНОВ" in table_title_for_section_guard
+                )
+            )
+            if (not is_refusal_table_title) and self._is_service_section_row(
                 row_json=row_json,
                 normalized_row_json=normalized_row_json,
             ):
@@ -709,12 +722,16 @@ class DocxStructureExtractor:
             return []
 
         appendix_number = self._detect_appendix_number_from_context(paragraph_context)
-        normative_table_number = self._detect_normative_table_number_from_context(paragraph_context)
+        explicit_normative_table_number = self._detect_normative_table_number_from_context(paragraph_context)
         table_type = self._detect_table_type(
             table_title=table_title,
             headers=headers,
             row_payloads=preview_rows,
-            normative_table_number=normative_table_number,
+            normative_table_number=explicit_normative_table_number,
+        )
+        normative_table_number, normative_table_number_source = self._resolve_normative_table_number(
+            explicit_normative_table_number=explicit_normative_table_number,
+            table_type=table_type,
         )
         effective_table_title = self._repair_table_title(
             table_title=table_title,
@@ -796,9 +813,25 @@ class DocxStructureExtractor:
                 row_scope = None
                 row_scope_source = None
 
+            requirement_group = row.get("row_context", {}).get("requirement_group", "unknown")
+            requirement_group_label = row.get("row_context", {}).get("requirement_group_label")
+            requirement_group_source = "section_context" if requirement_group in {"required", "optional"} else None
+            if table_type == "documents" and requirement_group not in {"required", "optional"}:
+                inferred_group = self._infer_document_requirement_group_from_row(
+                    row_json=row_json,
+                    normalized_row_json=normalized_row_json,
+                )
+                if inferred_group is not None:
+                    requirement_group = inferred_group
+                    requirement_group_source = "row_text"
+                else:
+                    requirement_group = "required"
+                    requirement_group_source = "default_required_for_documents"
+
             metadata_json = {
                 "docx_table_index": int(table_number),
                 "normative_table_number": normative_table_number,
+                "normative_table_number_source": normative_table_number_source,
                 "table_number": table_number,
                 "table_title": effective_table_title,
                 "appendix_number": appendix_number,
@@ -806,11 +839,13 @@ class DocxStructureExtractor:
                 "row_kind": "data_row",
                 "row_scope": row_scope,
                 "row_scope_source": row_scope_source,
-                "requirement_group": row.get("row_context", {}).get("requirement_group", "unknown"),
-                "requirement_group_label": row.get("row_context", {}).get("requirement_group_label"),
+                "requirement_group": requirement_group,
+                "requirement_group_label": requirement_group_label,
+                "requirement_group_source": requirement_group_source,
                 "table_section_context": {
-                    "requirement_group": row.get("row_context", {}).get("requirement_group", "unknown"),
-                    "requirement_group_label": row.get("row_context", {}).get("requirement_group_label"),
+                    "requirement_group": requirement_group,
+                    "requirement_group_label": requirement_group_label,
+                    "requirement_group_source": requirement_group_source,
                 },
                 "column_headers": headers,
                 "header_keys": header_keys,
@@ -952,6 +987,10 @@ class DocxStructureExtractor:
 
         intake_markers = (
             "исчерпывающий перечень оснований для отказа в приеме",
+            "перечень оснований для отказа в приеме",
+            "оснований для отказа в приеме запроса",
+            "оснований для отказа в приеме заявления",
+            "оснований для отказа в приеме документов",
             "отказа в приеме заявления и документов",
             "отказ в приеме заявления и документов",
             "отказа в приеме к рассмотрению",
@@ -960,11 +999,19 @@ class DocxStructureExtractor:
         if any(marker in haystack for marker in intake_markers):
             return "intake_refusal"
 
-        if "исчерпывающий перечень оснований для приостановления" in haystack:
+        suspension_markers = (
+            "исчерпывающий перечень оснований для приостановления",
+            "перечень оснований для приостановления",
+            "оснований для приостановления предоставления",
+            "приостановления предоставления государственной услуги",
+        )
+        if any(marker in haystack for marker in suspension_markers):
             return "suspension"
 
         renewal_markers = (
             "исчерпывающий перечень оснований для отказа в возобновлении",
+            "перечень оснований для отказа в возобновлении",
+            "оснований для отказа в возобновлении",
             "отказ в возобновлении",
             "отказа в возобновлении",
             "об отказе в возобновлении",
@@ -974,11 +1021,14 @@ class DocxStructureExtractor:
 
         service_markers = (
             "исчерпывающий перечень оснований для отказа в предоставлении",
+            "перечень оснований для отказа в предоставлении",
+            "оснований для отказа в предоставлении государственной услуги",
             "отказ в предоставлении",
             "отказа в предоставлении",
             "об отказе в предоставлении",
             "отказ в назначении",
             "отказа в назначении",
+            "оснований для отказа в назначении",
         )
         if any(marker in haystack for marker in service_markers):
             return "service_refusal"
@@ -1024,7 +1074,7 @@ class DocxStructureExtractor:
             return False
 
         combined = self._normalize_search_text(" ".join(values))
-        if "исчерпывающий перечень оснований" not in combined:
+        if "перечень оснований" not in combined and "оснований для" not in combined:
             return False
 
         # В DOCX merged cells часто приходят как несколько одинаковых значений.
@@ -1036,7 +1086,10 @@ class DocxStructureExtractor:
 
         first_value = self._normalize_search_text(values[0])
         if not re.fullmatch(r"\d+(?:\.\d+)?", values[0].strip()):
-            if first_value.startswith("исчерпывающий перечень оснований"):
+            normalized_first = re.sub(r"^\s*\d+(?:\.\d+)*[\.)]?\s+", "", first_value)
+            if normalized_first.startswith("исчерпывающий перечень оснований"):
+                return True
+            if normalized_first.startswith("перечень оснований"):
                 return True
 
         return False
@@ -1166,21 +1219,64 @@ class DocxStructureExtractor:
         if not values:
             return False
 
-        joined = " ".join(values).lower()
+        joined = " ".join(values).lower().replace("ё", "е")
+        joined = " ".join(joined.split())
+
+        # Строки таблицы оснований отказа не должны отбрасываться как
+        # service-section строки таблицы документов только из-за фразы
+        # "документы, необходимые для предоставления...".
+        if (
+            "перечень оснований" in joined
+            or "оснований для отказа" in joined
+            or "отказа в приеме" in joined
+            or "отказ в приеме" in joined
+            or "приостановления предоставления" in joined
+            or "отказа в предоставлении" in joined
+            or "отказ в предоставлении" in joined
+        ):
+            return False
+
+        # Повторные многострочные заголовки внутри таблицы документов не являются
+        # строками документов. Они часто идут второй строкой после верхнего header.
+        if (
+            "наименование документа" in joined
+            and ("идентификаторы категорий" in joined or "n п/п" in joined or "№ п/п" in joined)
+            and ("способ подачи" in joined or "способы подачи" in joined or "с использованием" in joined)
+        ):
+            return True
+
+        # Строки-результаты/разделители вроде "Предоставление (отказ в предоставлении)..."
+        # тоже не являются документами.
+        unique_values = {" ".join(v.lower().replace("ё", "е").split()) for v in values if v}
+        if len(unique_values) == 1:
+            only_value = next(iter(unique_values))
+            if "предоставление (отказ в предоставлении" in only_value:
+                return True
+            if "отказ в предоставлении" in only_value and len(only_value) < 220:
+                return True
 
         service_markers = [
             "документы (информация), необходимые",
             "документы информация необходимые",
             "способы подачи запроса",
             "документы, необходимые для предоставления",
+            "документов, необходимых для предоставления",
+            "сведения, необходимые для предоставления государственной услуги",
             "исчерпывающий перечень документов",
+            "обязательных для предоставления заявителем",
+            "обязательные для предоставления заявителем",
+            "представляемые заявителем самостоятельно",
+            "представляемые заявителем или представителем самостоятельно",
+            "представляемые заявителем (представителем) самостоятельно",
+            "представляемые по собственной инициативе",
+            "по собственной инициативе",
+            "подлежат представлению в рамках межведомственного",
         ]
 
         # Strong marker-based exclusion
         if any(marker in joined for marker in service_markers):
-            # But avoid excluding real row if it also clearly contains an actual document entry
-            if "наименование документа" in joined:
-                return False
+            # But avoid excluding real row if it also clearly contains an actual document entry.
+            # Секции часто содержат слово "заявитель", но не конкретный документ.
             if "паспорт" in joined or "заявление" in joined or "документ, подтверждающий" in joined:
                 return False
             return True
@@ -1253,11 +1349,17 @@ class DocxStructureExtractor:
         # и он не должен случайно пересечься с "самостоятельно".
         optional_markers = (
             "по собственной инициативе",
+            "вправе представить",
+            "вправе предоставить",
             "вправе представить по собственной инициативе",
             "вправе представить самостоятельно по собственной инициативе",
             "документы, представляемые по собственной инициативе",
             "документы и информация, которые заявитель вправе представить по собственной инициативе",
             "документы и информация, которые заявитель или представитель вправе представить по собственной инициативе",
+            "подлежат представлению в рамках межведомственного информационного взаимодействия",
+            "представляются в рамках межведомственного информационного взаимодействия",
+            "могут быть получены в порядке межведомственного информационного взаимодействия",
+            "находящиеся в распоряжении органов",
         )
         if any(marker in compact for marker in optional_markers):
             return {
@@ -1272,13 +1374,21 @@ class DocxStructureExtractor:
             "заявитель должен представить самостоятельно",
             "заявитель или представитель должен представить самостоятельно",
             "заявителем самостоятельно",
+            "заявителем представителем самостоятельно",
             "заявителем или представителем самостоятельно",
             "представляемые заявителем самостоятельно",
+            "представляемые заявителем представителем самостоятельно",
             "представляемые заявителем или представителем самостоятельно",
+            "представляемые заявителем (представителем) самостоятельно",
             "документы, представляемые заявителем самостоятельно",
             "документы, представляемые заявителем или представителем самостоятельно",
+            "сведения, необходимые для предоставления государственной услуги и представляемые заявителем самостоятельно",
+            "сведения, необходимые для предоставления государственной услуги и представляемые заявителем представителем самостоятельно",
             "документы и информация, которые заявитель должен представить самостоятельно",
             "документы и информация, которые заявитель или представитель должен представить самостоятельно",
+            "обязательных для предоставления заявителем",
+            "обязательные для предоставления заявителем",
+            "обязательны для предоставления заявителем",
         )
         if any(marker in compact for marker in required_markers):
             return {
@@ -1297,6 +1407,52 @@ class DocxStructureExtractor:
 
         return None
         
+    def _infer_document_requirement_group_from_row(
+        self,
+        *,
+        row_json: dict[str, Any],
+        normalized_row_json: dict[str, Any],
+    ) -> Optional[str]:
+        """Пытается определить required/optional по тексту самой строки документа."""
+        values = [
+            self._clean_text(str(v))
+            for v in row_json.values()
+            if self._clean_text(str(v))
+        ]
+        if not values:
+            return None
+
+        compact = self._normalize_search_text(" ".join(values))
+        compact = compact.replace("(", " ").replace(")", " ")
+        compact = " ".join(compact.split())
+
+        optional_markers = (
+            "по собственной инициативе",
+            "вправе представить",
+            "вправе предоставить",
+            "подлежат представлению в рамках межведомственного",
+            "представляются в рамках межведомственного",
+            "могут быть получены в порядке межведомственного",
+            "находящиеся в распоряжении органов",
+        )
+        if any(marker in compact for marker in optional_markers):
+            return "optional"
+
+        required_markers = (
+            "представляемые заявителем самостоятельно",
+            "представляемые заявителем представителем самостоятельно",
+            "представляемые заявителем или представителем самостоятельно",
+            "заявитель должен представить",
+            "заявитель или представитель должен представить",
+            "обязательных для предоставления заявителем",
+            "обязательные для предоставления заявителем",
+            "обязательны для предоставления заявителем",
+        )
+        if any(marker in compact for marker in required_markers):
+            return "required"
+
+        return None
+
     def _build_cells_by_header(
         self,
         *,
@@ -1553,6 +1709,32 @@ class DocxStructureExtractor:
                 except ValueError:
                     return None
         return None
+
+    def _resolve_normative_table_number(
+        self,
+        *,
+        explicit_normative_table_number: Optional[int],
+        table_type: str,
+    ) -> tuple[Optional[int], Optional[str]]:
+        """
+        Возвращает номер нормативной таблицы и источник его определения.
+
+        Если в регламенте нет явного абзаца "Таблица 1/2/3",
+        номер безопасно восстанавливается по уверенно определённому типу
+        ключевой таблицы и помечается как inferred_by_table_type.
+        """
+        if explicit_normative_table_number is not None:
+            return explicit_normative_table_number, "explicit_context"
+
+        inferred_by_type = {
+            "identifiers": 1,
+            "documents": 2,
+            "refusal_reasons": 3,
+        }.get(table_type)
+        if inferred_by_type is not None:
+            return inferred_by_type, "inferred_by_table_type"
+
+        return None, None
 
     def _detect_table_title(
         self,
