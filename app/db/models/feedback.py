@@ -269,7 +269,6 @@ class QuestionEvent(Base):
     __table_args__ = (
         Index("idx_question_events_session", "session_id", "created_at"),
         Index("idx_question_events_intent", "intent_type"),
-        Index("idx_question_events_measure_code", "measure_code"),
         Index("idx_question_events_created_at", "created_at"),
     )
 
@@ -308,11 +307,6 @@ class QuestionEvent(Base):
         nullable=False,
         default=QuestionIntentEnum.OTHER,
         server_default=text("'other'"),
-    )
-
-    measure_code: Mapped[Optional[str]] = mapped_column(
-        Text,
-        nullable=True,
     )
 
     subject_category_code: Mapped[Optional[str]] = mapped_column(
@@ -916,11 +910,9 @@ class QualityAggregateDaily(Base):
             "aggregate_date",
             "channel_code",
             "intent_type",
-            "measure_code",
             name="uq_quality_aggregates_daily",
         ),
         Index("idx_quality_aggregates_daily_date", "aggregate_date"),
-        Index("idx_quality_aggregates_daily_measure", "measure_code"),
     )
 
     quality_aggregate_id: Mapped[int] = mapped_column(
@@ -946,11 +938,6 @@ class QualityAggregateDaily(Base):
         nullable=False,
         default=QuestionIntentEnum.OTHER,
         server_default=text("'other'"),
-    )
-
-    measure_code: Mapped[Optional[str]] = mapped_column(
-        Text,
-        nullable=True,
     )
 
     total_answers: Mapped[int] = mapped_column(

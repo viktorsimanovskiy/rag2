@@ -182,7 +182,6 @@ class ExtractionResult:
     document_date: Optional[datetime] = None
     service_name_full: Optional[str] = None
     service_name_short: Optional[str] = None
-    primary_measure_code: Optional[str] = None
 
     blocks: list[dict[str, Any]] = field(default_factory=list)
     tables: list[dict[str, Any]] = field(default_factory=list)
@@ -208,9 +207,7 @@ class SemanticEnrichmentResult:
     """
     source_authority: Optional[str]
     document_type: Optional[str]
-    measure_codes: list[str] = field(default_factory=list)
     legal_facts: list[dict[str, Any]] = field(default_factory=list)
-    aliases: list[dict[str, Any]] = field(default_factory=list)
     enrichment_payload_json: dict[str, Any] = field(default_factory=dict)
 
 
@@ -486,7 +483,6 @@ class DocumentIngestionPipeline:
                     "revision_date": extraction_result.revision_date,
                     "service_name_full": extraction_result.service_name_full,
                     "service_name_short": extraction_result.service_name_short,
-                    "primary_measure_code": extraction_result.primary_measure_code,
                 },
             )
 

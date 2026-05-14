@@ -20,10 +20,6 @@ from app.services.ingestion.document_ingestion_pipeline import (
     ExtractionResult,
 )
 
-from app.config.measure_registry import (
-    detect_primary_measure_code,
-    get_measure_definition,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -348,24 +344,9 @@ class DocxStructureExtractor:
             blocks=blocks,
         )
 
-        primary_measure_code = detect_primary_measure_code(
-            service_name_full
-            or document_title
-            or payload.normalized_text[:4000]
-        )
-
-        measure_definition = get_measure_definition(primary_measure_code)
-        self._attach_measure_code_to_rows(
-            table_rows=table_rows,
-            primary_measure_code=primary_measure_code,
-        )
+        # Конкретная услуга будет определяться отдельным service_registry.
+        # Старую грубую группировку мер здесь больше не используем.
         service_name_short = None
-        if measure_definition is not None:
-            service_name_short = (
-                measure_definition.aliases[0]
-                if measure_definition.aliases
-                else measure_definition.canonical_name
-            )
 
         revision_date = self._detect_revision_date(
             original_filename=payload.original_filename,
@@ -405,7 +386,6 @@ class DocxStructureExtractor:
             ),
             "service_name_full": service_name_full,
             "service_name_short": service_name_short,
-            "primary_measure_code": primary_measure_code,
         }
 
         logger.info(
@@ -416,7 +396,6 @@ class DocxStructureExtractor:
                 "tables_count": len(tables),
                 "table_rows_count": len(table_rows),
                 "doc_uid_base": doc_uid_base,
-                "primary_measure_code": primary_measure_code,
             },
         )
 
@@ -428,7 +407,6 @@ class DocxStructureExtractor:
             document_date=document_date,
             service_name_full=service_name_full,
             service_name_short=service_name_short,
-            primary_measure_code=primary_measure_code,
             blocks=blocks,
             tables=tables,
             table_rows=table_rows,
@@ -817,16 +795,24 @@ class DocxStructureExtractor:
             requirement_group_label = row.get("row_context", {}).get("requirement_group_label")
             requirement_group_source = "section_context" if requirement_group in {"required", "optional"} else None
             if table_type == "documents" and requirement_group not in {"required", "optional"}:
-                inferred_group = self._infer_document_requirement_group_from_row(
+                inferred_group = self._infer_document_requirement_group_from_row_number_prefix(
                     row_json=row_json,
                     normalized_row_json=normalized_row_json,
                 )
                 if inferred_group is not None:
                     requirement_group = inferred_group
-                    requirement_group_source = "row_text"
+                    requirement_group_source = "row_number_prefix"
                 else:
-                    requirement_group = "required"
-                    requirement_group_source = "default_required_for_documents"
+                    inferred_group = self._infer_document_requirement_group_from_row(
+                        row_json=row_json,
+                        normalized_row_json=normalized_row_json,
+                    )
+                    if inferred_group is not None:
+                        requirement_group = inferred_group
+                        requirement_group_source = "row_text"
+                    else:
+                        requirement_group = "required"
+                        requirement_group_source = "default_required_for_documents"
 
             metadata_json = {
                 "docx_table_index": int(table_number),
@@ -883,23 +869,6 @@ class DocxStructureExtractor:
 
         return row_payloads
         
-    def _attach_measure_code_to_rows(
-        self,
-        *,
-        table_rows: list[dict[str, Any]],
-        primary_measure_code: Optional[str],
-    ) -> None:
-        if not primary_measure_code:
-            return
-
-        for row in table_rows:
-            metadata = row.get("metadata_json")
-            if not isinstance(metadata, dict):
-                metadata = {}
-                row["metadata_json"] = metadata
-
-            metadata.setdefault("measure_code", primary_measure_code)
-
     def _detect_refusal_row_scope(
         self,
         *,
@@ -1407,6 +1376,49 @@ class DocxStructureExtractor:
 
         return None
         
+    def _infer_document_requirement_group_from_row_number_prefix(
+        self,
+        *,
+        row_json: dict[str, Any],
+        normalized_row_json: dict[str, Any],
+    ) -> Optional[str]:
+        """
+        Старые и нестандартные таблицы документов часто нумеруют строки так:
+        - 1.1, 1.2, 1.x — документы/сведения, которые заявитель представляет сам;
+        - 2.1, 2.2, 2.x — документы/сведения, которые заявитель вправе представить
+          по собственной инициативе или которые запрашиваются межведомственно.
+
+        Это не пользовательская категория, а служебный способ восстановить одну
+        из двух целевых групп: required / optional.
+        """
+        values = [
+            self._clean_text(str(v))
+            for v in row_json.values()
+            if self._clean_text(str(v))
+        ]
+        if not values:
+            return None
+
+        # Берём первый осмысленный токен. Обычно это колонка "N п/п".
+        first_value = values[0].strip()
+        if re.fullmatch(r"1(?:\.\d+)+", first_value):
+            return "required"
+        if re.fullmatch(r"2(?:\.\d+)+", first_value):
+            return "optional"
+
+        # Иногда номер слипается с названием документа в первой ячейке.
+        combined = self._normalize_search_text(" ".join(values))
+        match = re.match(r"^\s*([12](?:\.\d+)+)[\.)]?\s+", combined)
+        if not match:
+            return None
+
+        prefix = match.group(1)
+        if prefix.startswith("1."):
+            return "required"
+        if prefix.startswith("2."):
+            return "optional"
+        return None
+
     def _infer_document_requirement_group_from_row(
         self,
         *,

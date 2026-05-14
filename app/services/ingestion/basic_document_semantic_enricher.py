@@ -3,10 +3,6 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from app.config.measure_registry import (
-    build_measure_alias_records,
-    detect_measure_codes as detect_registered_measure_codes,
-)
 from app.services.ingestion.document_ingestion_pipeline import (
     ExtractionResult,
     SemanticEnrichmentInput,
@@ -52,28 +48,15 @@ class BasicDocumentSemanticEnricher:
         source_authority = self._detect_source_authority(haystack)
         document_type = self._detect_document_type(haystack)
 
-        measure_codes: list[str] = []
-        if extraction.primary_measure_code:
-            measure_codes.append(extraction.primary_measure_code)
-
-        for detected_code in self._detect_measure_codes(haystack):
-            if detected_code not in measure_codes:
-                measure_codes.append(detected_code)
-
-        aliases = self._build_aliases(measure_codes)
-        
         legal_facts = self._extract_deadline_facts(
             extraction=extraction,
-            measure_codes=measure_codes,
         )
 
         enrichment_payload_json: dict[str, Any] = {
             "enricher": "basic_document_semantic_enricher",
             "is_temporary_test_stage": True,
             "source_authority": source_authority,
-            "document_type": document_type,
-            "measure_codes": measure_codes,
-            "document_title": extraction.document_title,
+            "document_type": document_type,            "document_title": extraction.document_title,
             "doc_uid_base": extraction.doc_uid_base,
             "legal_facts_count": len(legal_facts),
             "revision_date": (
@@ -88,9 +71,7 @@ class BasicDocumentSemanticEnricher:
                 else None
             ),
             "service_name_full": extraction.service_name_full,
-            "service_name_short": extraction.service_name_short,
-            "primary_measure_code": extraction.primary_measure_code,            
-            "warning": (
+            "service_name_short": extraction.service_name_short,            "warning": (
                 "Temporary deterministic enrichment. "
                 "Must be replaced later with a more scalable approach."
             ),
@@ -99,9 +80,7 @@ class BasicDocumentSemanticEnricher:
         return SemanticEnrichmentResult(
             source_authority=source_authority,
             document_type=document_type,
-            measure_codes=measure_codes,
             legal_facts=legal_facts,
-            aliases=aliases,
             enrichment_payload_json=enrichment_payload_json,
         )
 
@@ -126,24 +105,12 @@ class BasicDocumentSemanticEnricher:
             return "law"
         return "normative_document"
 
-    def _detect_measure_codes(self, haystack: str) -> list[str]:
-        return detect_registered_measure_codes(haystack)
-
-    def _build_aliases(self, measure_codes: list[str]) -> list[dict[str, Any]]:
-        return build_measure_alias_records(
-            measure_codes,
-            source="deterministic_enricher",
-            temporary=True,
-        )
-        
     def _extract_deadline_facts(
         self,
         *,
         extraction: ExtractionResult,
-        measure_codes: list[str],
     ) -> list[dict[str, Any]]:
         facts: list[dict[str, Any]] = []
-        measure_code = measure_codes[0] if measure_codes else None
 
         for block in extraction.blocks:
             text = (block.get("content_clean") or "").strip()
@@ -201,7 +168,6 @@ class BasicDocumentSemanticEnricher:
             facts.append(
                 {
                     "fact_type": fact_type,
-                    "measure_code": measure_code,
                     "subject_category": None,
                     "condition_json": {
                         "heading_text": heading_text or None,

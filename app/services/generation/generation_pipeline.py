@@ -81,7 +81,6 @@ class GenerationRequest:
     language_code: str
 
     intent_type: QuestionIntentEnum
-    measure_code: Optional[str]
     subject_category_code: Optional[str]
 
     routing_payload_json: dict[str, Any] = field(default_factory=dict)

@@ -43,7 +43,6 @@ try:
         DocumentTable,
         DocumentTableRow,
         LegalFact,
-        MeasureAlias,
     )  # pragma: no cover
 except Exception:  # pragma: no cover
     DocumentRegistry = None  # type: ignore
@@ -51,7 +50,6 @@ except Exception:  # pragma: no cover
     DocumentTable = None  # type: ignore
     DocumentTableRow = None  # type: ignore
     LegalFact = None  # type: ignore
-    MeasureAlias = None  # type: ignore
 
 
 # ============================================================
@@ -86,7 +84,6 @@ class ExtractionResult:
     document_date: Optional[datetime] = None
     service_name_full: Optional[str] = None
     service_name_short: Optional[str] = None
-    primary_measure_code: Optional[str] = None
 
     blocks: list[dict[str, Any]] = field(default_factory=list)
     tables: list[dict[str, Any]] = field(default_factory=list)
@@ -99,9 +96,7 @@ class ExtractionResult:
 class SemanticEnrichmentResult:
     source_authority: Optional[str]
     document_type: Optional[str]
-    measure_codes: list[str] = field(default_factory=list)
     legal_facts: list[dict[str, Any]] = field(default_factory=list)
-    aliases: list[dict[str, Any]] = field(default_factory=list)
     enrichment_payload_json: dict[str, Any] = field(default_factory=dict)
 
 
@@ -278,7 +273,6 @@ class DocumentPublisher:
             DocumentTable,
             DocumentTableRow,
             LegalFact,
-            MeasureAlias,
         ]
         if any(model is None for model in required):
             raise DocumentPublisherDependencyError(
@@ -394,14 +388,6 @@ class DocumentPublisher:
             document_date=payload.extraction_result.document_date,
             service_name_full=payload.extraction_result.service_name_full,
             service_name_short=payload.extraction_result.service_name_short,
-            primary_measure_code=(
-                payload.extraction_result.primary_measure_code
-                or (
-                    payload.enrichment_result.measure_codes[0]
-                    if payload.enrichment_result.measure_codes
-                    else None
-                )
-            ),
 
             document_name=payload.extraction_result.document_title,
             document_type=payload.enrichment_result.document_type,
@@ -445,7 +431,6 @@ class DocumentPublisher:
                     ),
                     "service_name_full": payload.extraction_result.service_name_full,
                     "service_name_short": payload.extraction_result.service_name_short,
-                    "primary_measure_code": payload.extraction_result.primary_measure_code,
                 },
             },
 
@@ -490,11 +475,6 @@ class DocumentPublisher:
         await self._write_legal_facts(
             document_id=document_id,
             legal_facts=payload.enrichment_result.legal_facts or [],
-        )
-
-        await self._write_aliases(
-            document_id=document_id,
-            aliases=payload.enrichment_result.aliases or [],
         )
 
     async def _write_blocks(
@@ -610,7 +590,6 @@ class DocumentPublisher:
                 document_id=document_id,
 
                 fact_type=self._str_or_none(fact.get("fact_type")) or "other",
-                measure_code=self._str_or_none(fact.get("measure_code")),
                 subject_category=self._str_or_none(fact.get("subject_category")),
 
                 condition_json=self._dict_or_empty(fact.get("condition_json")),
@@ -619,29 +598,6 @@ class DocumentPublisher:
 
                 citation_json=self._dict_or_empty(fact.get("citation_json")),
                 metadata_json=self._dict_or_empty(fact.get("metadata_json")),
-            )
-            self.db.add(model)
-
-        await self.db.flush()
-
-    async def _write_aliases(
-        self,
-        *,
-        document_id: UUID,
-        aliases: list[dict[str, Any]],
-    ) -> None:
-        """
-        For current stage we store aliases bound to document.
-        Later alias governance can be centralized if needed.
-        """
-        for alias in aliases:
-            model = MeasureAlias(
-                alias_id=uuid4(),
-                document_id=document_id,
-                alias=self._str_or_none(alias.get("alias")) or "",
-                measure_code=self._str_or_none(alias.get("measure_code")),
-                canonical_name=self._str_or_none(alias.get("canonical_name")),
-                metadata_json=self._dict_or_empty(alias.get("metadata_json")),
             )
             self.db.add(model)
 

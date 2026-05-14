@@ -31,11 +31,6 @@ from uuid import UUID
 from sqlalchemy import and_, case, desc, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config.measure_registry import (
-    get_measure_search_terms,
-    resolve_measure_code,
-)
-
 from app.db.models.documents import (
     DocumentBlock,
     DocumentRegistry,
@@ -99,7 +94,6 @@ class RetrievalInput:
     question_text_normalized: str
 
     intent_type: QuestionIntentEnum
-    measure_code: Optional[str] = None
     subject_category_code: Optional[str] = None
 
     query_terms: list[str] = field(default_factory=list)
@@ -128,7 +122,6 @@ class RetrievedCandidate:
     doc_uid_base: Optional[str] = None
     revision_date: Optional[str] = None
 
-    measure_code: Optional[str] = None
     subject_category: Optional[str] = None
 
     title: Optional[str] = None
@@ -485,11 +478,6 @@ class RetrievalOrchestrator:
             if self._normalize_text(x)
         ]
 
-        resolved_measure_code = self._resolve_measure_code(
-            payload=payload,
-            normalized_text=normalized_text,
-        )
-
         table_question_profile = self._detect_table_question_profile(
             question_text=normalized_text,
             intent_type=payload.intent_type,
@@ -503,8 +491,6 @@ class RetrievalOrchestrator:
         question_deadline_kind = None
         if payload.intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
             question_deadline_kind = self._detect_deadline_question_kind(normalized_text)
-
-        question_measure_family = resolved_measure_code
 
         question_rejection_scope = None
         if payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION:
@@ -524,7 +510,6 @@ class RetrievalOrchestrator:
         expanded_terms = self._expand_query_terms(
             question_text=normalized_text,
             intent_type=payload.intent_type,
-            measure_code=resolved_measure_code,
             submission_channel=submission_channel,
             requested_column_hints=requested_column_hints,
             question_deadline_kind=question_deadline_kind,
@@ -543,8 +528,6 @@ class RetrievalOrchestrator:
         return {
             "normalized_text": normalized_text,
             "query_terms": query_terms,
-            "measure_code": resolved_measure_code,
-            "requested_measure_code": payload.measure_code,
             "subject_category_code": payload.subject_category_code,
             "table_question_profile": table_question_profile,
             "submission_channel": submission_channel,
@@ -552,32 +535,14 @@ class RetrievalOrchestrator:
             "table_scope_hints": table_scope_hints,
             "question_deadline_kind": question_deadline_kind,
             "question_rejection_scope": question_rejection_scope,
-            "question_measure_family": question_measure_family,
             "wants_full_documents_list": wants_full_documents_list,
         }
         
-    def _resolve_measure_code(
-        self,
-        *,
-        payload: RetrievalInput,
-        normalized_text: str,
-    ) -> Optional[str]:
-        constraints = payload.constraints_json or {}
-
-        return resolve_measure_code(
-            payload.measure_code,
-            constraints.get("resolved_measure_code"),
-            constraints.get("measure_code"),
-            normalized_text,
-            payload.question_text_raw,
-        )
-
     def _expand_query_terms(
         self,
         *,
         question_text: str,
         intent_type: QuestionIntentEnum,
-        measure_code: Optional[str],
         submission_channel: Optional[str] = None,
         requested_column_hints: Optional[list[str]] = None,
         question_deadline_kind: Optional[str] = None,
@@ -587,11 +552,6 @@ class RetrievalOrchestrator:
 
         base_tokens = self._extract_meaningful_terms(question_text)
         terms.extend(base_tokens)
-
-        resolved_measure_code = resolve_measure_code(measure_code, question_text)
-        if resolved_measure_code:
-            terms.append(resolved_measure_code)
-            terms.extend(get_measure_search_terms(resolved_measure_code))
 
         if intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
             terms.extend(
@@ -880,7 +840,6 @@ class RetrievalOrchestrator:
             candidate.title or "",
             candidate.snippet or "",
             candidate.document_name or "",
-            candidate.measure_code or "",
             candidate.subject_category or "",
         ]
 
@@ -930,12 +889,6 @@ class RetrievalOrchestrator:
 
         return self._normalize_text(" ".join(parts))
 
-    def _detect_measure_family(
-        self,
-        text: str,
-    ) -> Optional[str]:
-        return resolve_measure_code(text)
-        
     def _detect_deadline_question_kind(
         self,
         text: str,
@@ -1030,23 +983,6 @@ class RetrievalOrchestrator:
             return "service_refusal"
 
         return "other"
-
-    def _candidate_measure_family(
-        self,
-        candidate: RetrievedCandidate,
-    ) -> Optional[str]:
-        metadata = candidate.metadata_json or {}
-
-        return resolve_measure_code(
-            candidate.measure_code,
-            metadata.get("measure_code"),
-            metadata.get("service_name_short"),
-            metadata.get("service_name_full"),
-            candidate.document_name,
-            candidate.title,
-            candidate.snippet,
-            self._candidate_text_blob(candidate),
-        )
 
     def _detect_submission_channel(self, text: str) -> Optional[str]:
         """
@@ -1471,7 +1407,6 @@ class RetrievalOrchestrator:
         query_bundle: dict[str, Any],
     ) -> list[RetrievedCandidate]:
         text_terms = query_bundle["query_terms"]
-        measure_code = query_bundle["measure_code"]
         subject_category = query_bundle["subject_category_code"]
 
         stmt = (
@@ -1481,7 +1416,6 @@ class RetrievalOrchestrator:
                 DocumentRegistry.document_name.label("document_name"),
                 DocumentRegistry.doc_uid_base.label("doc_uid_base"),
                 DocumentRegistry.revision_date.label("revision_date"),
-                LegalFact.measure_code.label("measure_code"),
                 LegalFact.subject_category.label("subject_category"),
                 LegalFact.fact_type.label("title"),
                 LegalFact.validity_note.label("snippet"),
@@ -1490,7 +1424,6 @@ class RetrievalOrchestrator:
                 (
                     self._fact_match_score_expr(
                         text_terms=text_terms,
-                        measure_code=measure_code,
                         subject_category=subject_category,
                         intent_type=payload.intent_type,
                     ) * strategy.facts_weight
@@ -1499,14 +1432,6 @@ class RetrievalOrchestrator:
             .join(DocumentRegistry, DocumentRegistry.document_id == LegalFact.document_id)
             .where(DocumentRegistry.status == "active")
         )
-
-        if measure_code:
-            stmt = stmt.where(
-                or_(
-                    DocumentRegistry.primary_measure_code == measure_code,
-                    LegalFact.measure_code == measure_code,
-                )
-            )
 
         if subject_category:
             stmt = stmt.where(
@@ -1536,7 +1461,6 @@ class RetrievalOrchestrator:
                     document_name=row["document_name"],
                     doc_uid_base=row["doc_uid_base"],
                     revision_date=self._datetime_to_iso(row["revision_date"]),
-                    measure_code=row["measure_code"],
                     subject_category=row["subject_category"],
                     title=row["title"],
                     snippet=row["snippet"],
@@ -1554,7 +1478,6 @@ class RetrievalOrchestrator:
         query_bundle: dict[str, Any],
     ) -> list[RetrievedCandidate]:
         text_terms = query_bundle["query_terms"]
-        measure_code = query_bundle["measure_code"]
 
         stmt = (
             select(
@@ -1563,7 +1486,6 @@ class RetrievalOrchestrator:
                 DocumentRegistry.document_name.label("document_name"),
                 DocumentRegistry.doc_uid_base.label("doc_uid_base"),
                 DocumentRegistry.revision_date.label("revision_date"),
-                literal(None).label("measure_code"),
                 literal(None).label("subject_category"),
                 DocumentTable.table_title.label("title"),
                 DocumentTable.summary.label("snippet"),
@@ -1581,14 +1503,6 @@ class RetrievalOrchestrator:
             stmt = stmt.where(
                 DocumentTable.metadata_json["table_semantic_type"].astext.in_(
                     ["refusal_reasons", "rejection_reasons"]
-                )
-            )
-
-        if measure_code:
-            stmt = stmt.where(
-                or_(
-                    DocumentRegistry.primary_measure_code == measure_code,
-                    DocumentTable.metadata_json["measure_code"].astext == measure_code,
                 )
             )
 
@@ -1628,7 +1542,6 @@ class RetrievalOrchestrator:
         query_bundle: dict[str, Any],
     ) -> list[RetrievedCandidate]:
         text_terms = query_bundle["query_terms"]
-        measure_code = query_bundle["measure_code"]
 
         wants_full_documents_list = bool(query_bundle.get("wants_full_documents_list"))
         is_documents_question = payload.intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION
@@ -1655,7 +1568,6 @@ class RetrievalOrchestrator:
                 DocumentRegistry.document_name.label("document_name"),
                 DocumentRegistry.doc_uid_base.label("doc_uid_base"),
                 DocumentRegistry.revision_date.label("revision_date"),
-                literal(None).label("measure_code"),
                 literal(None).label("subject_category"),
                 literal("table_row").label("title"),
                 DocumentTableRow.row_summary.label("snippet"),
@@ -1678,14 +1590,6 @@ class RetrievalOrchestrator:
                 stmt = stmt.where(
                     DocumentTableRow.metadata_json["row_scope"].astext == question_rejection_scope
                 )
-
-        if measure_code:
-            stmt = stmt.where(
-                or_(
-                    DocumentRegistry.primary_measure_code == measure_code,
-                    DocumentTableRow.metadata_json["measure_code"].astext == measure_code,
-                )
-            )
 
         rows_limit = payload.top_k_rows
 
@@ -1728,7 +1632,6 @@ class RetrievalOrchestrator:
         query_bundle: dict[str, Any],
     ) -> list[RetrievedCandidate]:
         text_terms = query_bundle["query_terms"]
-        measure_code = query_bundle["measure_code"]
 
         stmt = (
             select(
@@ -1737,7 +1640,6 @@ class RetrievalOrchestrator:
                 DocumentRegistry.document_name.label("document_name"),
                 DocumentRegistry.doc_uid_base.label("doc_uid_base"),
                 DocumentRegistry.revision_date.label("revision_date"),
-                literal(None).label("measure_code"),
                 literal(None).label("subject_category"),
                 DocumentBlock.block_type.label("title"),
                 DocumentBlock.content_clean.label("snippet"),
@@ -1753,9 +1655,6 @@ class RetrievalOrchestrator:
             .join(DocumentRegistry, DocumentRegistry.document_id == DocumentBlock.document_id)
             .where(DocumentRegistry.status == "active")
         )
-
-        if measure_code:
-            stmt = stmt.where(DocumentRegistry.primary_measure_code == measure_code)
 
         stmt = stmt.order_by(desc("score")).limit(payload.top_k_blocks)
 
@@ -1795,7 +1694,6 @@ class RetrievalOrchestrator:
         self,
         *,
         text_terms: list[str],
-        measure_code: Optional[str],
         subject_category: Optional[str],
         intent_type: QuestionIntentEnum,
     ):
@@ -1809,12 +1707,6 @@ class RetrievalOrchestrator:
         - FTS ranking
         """
         score = literal(0.0)
-
-        if measure_code:
-            score = score + case(
-                (LegalFact.measure_code == measure_code, 1.0),
-                else_=0.0,
-            )
 
         if subject_category:
             score = score + case(
@@ -2629,7 +2521,6 @@ class RetrievalOrchestrator:
                 "submission_channel": query_bundle.get("submission_channel"),
                 "requested_column_hints": query_bundle.get("requested_column_hints"),
                 "table_scope_hints": query_bundle.get("table_scope_hints"),
-                "measure_code": query_bundle.get("measure_code"),
                 "question_rejection_scope": query_bundle.get("question_rejection_scope"),
             },
             "selected_candidates_preview": [
@@ -2652,7 +2543,6 @@ class RetrievalOrchestrator:
                         "row_summary": (c.metadata_json or {}).get("row_summary"),
                         "row_scope": (c.metadata_json or {}).get("row_scope"),
                         "row_scope_source": (c.metadata_json or {}).get("row_scope_source"),
-                        "measure_code": (c.metadata_json or {}).get("measure_code"),
                         "table_semantic_type": (c.metadata_json or {}).get("table_semantic_type"),
                         "column_headers": (c.metadata_json or {}).get("column_headers"),
                         "cells_text": (c.metadata_json or {}).get("cells_text"),
@@ -2889,17 +2779,6 @@ class RetrievalOrchestrator:
             or self._detect_rejection_question_scope(question_norm)
             or "service_refusal"
         )
-        resolved_measure_code = self._normalize_text(
-            query_bundle.get("measure_code")
-            or payload.measure_code
-            or ""
-        )
-        question_measure_family = (
-            resolved_measure_code
-            or query_bundle.get("question_measure_family")
-            or self._detect_measure_family(question_norm)
-        )
-
         reranked: list[RetrievedCandidate] = []
 
         for candidate in candidates:
@@ -2907,20 +2786,6 @@ class RetrievalOrchestrator:
             text = self._candidate_text_blob(candidate)
             text_norm = self._normalize_text(text)
             metadata = candidate.metadata_json or {}
-            candidate_measure_family = self._candidate_measure_family(candidate)
-            candidate_measure_code = self._normalize_text(candidate.measure_code or metadata.get("measure_code") or "")
-
-            if question_measure_family and candidate_measure_family == question_measure_family:
-                score += 0.58 if intent_type == QuestionIntentEnum.DEADLINE_QUESTION else 0.30
-            elif question_measure_family and candidate_measure_family and candidate_measure_family != question_measure_family:
-                score -= 1.05 if intent_type == QuestionIntentEnum.DEADLINE_QUESTION else 0.55
-
-            if resolved_measure_code and candidate_measure_code:
-                if candidate_measure_code == resolved_measure_code:
-                    score += 0.30
-                else:
-                    score -= 0.90
-
             if candidate.source_type == "table_row":
                 score += 0.05
             elif candidate.source_type == "table":

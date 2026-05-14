@@ -82,7 +82,6 @@ class DefaultIntentClassifier(IntentClassifierProtocol):
 
         return {
             "intent_type": QuestionIntentEnum.OTHER,
-            "measure_code": None,
             "subject_category_code": None,
             "classifier_version": "default_intent_classifier_v1",
             "routing_payload_json": {

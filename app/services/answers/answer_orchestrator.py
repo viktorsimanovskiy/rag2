@@ -132,7 +132,6 @@ class QuestionRoutingResult:
     """
     question_text_normalized: str
     intent_type: QuestionIntentEnum
-    measure_code: Optional[str]
     subject_category_code: Optional[str]
     classifier_version: Optional[str]
     embedding_model_name: Optional[str]
@@ -152,7 +151,6 @@ class SamplingDecisionInput:
     answer_event_id: UUID
     answer_mode: AnswerModeEnum
     intent_type: QuestionIntentEnum
-    measure_code: Optional[str]
     confidence_score: Optional[float]
     request_metadata_json: dict[str, Any] = field(default_factory=dict)
 
@@ -250,7 +248,6 @@ class AnswerOrchestrator:
                 question_event_id=question_event.question_event_id,
                 similarity_threshold=0.90,
                 max_candidates=20,
-                allow_measure_mismatch=False,
                 allow_subject_category_mismatch=False,
             )
         )
@@ -281,7 +278,6 @@ class AnswerOrchestrator:
                 answer_event_id=answer_event.answer_event_id,
                 answer_mode=answer_event.answer_mode,
                 intent_type=question_event.intent_type,
-                measure_code=question_event.measure_code,
                 confidence_score=float(answer_event.confidence_score) if answer_event.confidence_score is not None else None,
                 request_metadata_json=payload.request_metadata_json,
             )
@@ -380,7 +376,6 @@ class AnswerOrchestrator:
         return QuestionRoutingResult(
             question_text_normalized=normalized_text,
             intent_type=intent_type,
-            measure_code=classification.get("measure_code"),
             subject_category_code=classification.get("subject_category_code"),
             classifier_version=classification.get("classifier_version"),
             embedding_model_name=embedding_model_name,
@@ -404,7 +399,6 @@ class AnswerOrchestrator:
             question_text_normalized=routing.question_text_normalized,
             question_language_code=language_code,
             intent_type=routing.intent_type,
-            measure_code=routing.measure_code,
             subject_category_code=routing.subject_category_code,
             query_constraints_json=routing.query_constraints_json,
             routing_payload_json=routing.routing_payload_json,
@@ -523,7 +517,6 @@ class AnswerOrchestrator:
             question_text_normalized=routing.question_text_normalized,
             language_code=payload.language_code,
             intent_type=routing.intent_type,
-            measure_code=routing.measure_code,
             subject_category_code=routing.subject_category_code,
             routing_payload_json=routing.routing_payload_json,
             query_constraints_json=routing.query_constraints_json,
@@ -539,11 +532,6 @@ class AnswerOrchestrator:
             query_terms=[
                 question_event.question_text_raw,
                 routing.question_text_normalized,
-                *(
-                    [routing.measure_code]
-                    if routing.measure_code
-                    else []
-                ),
                 *(
                     [routing.subject_category_code]
                     if routing.subject_category_code

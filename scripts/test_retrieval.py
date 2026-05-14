@@ -243,7 +243,6 @@ async def run(
                 question_text_raw=question_text,
                 question_text_normalized=question_text,
                 intent_type=intent,
-                measure_code="edv" if "едв" in question_text.lower() else None,
                 query_terms=[],
                 constraints_json={},
                 top_k_facts=max(8, top_k),

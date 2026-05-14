@@ -11,7 +11,6 @@ from app.db.models.documents import (
     DocumentTable,
     DocumentTableRow,
     LegalFact,
-    MeasureAlias,
 )
 
 from app.db.models.feedback import (
@@ -32,7 +31,6 @@ __all__ = [
     "DocumentTable",
     "DocumentTableRow",
     "LegalFact",
-    "MeasureAlias",
     "Channel",
     "ConversationSession",
     "QuestionEvent",

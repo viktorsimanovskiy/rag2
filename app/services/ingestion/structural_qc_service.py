@@ -45,7 +45,6 @@ class ExtractionResult:
     document_date: Optional[Any] = None
     service_name_full: Optional[str] = None
     service_name_short: Optional[str] = None
-    primary_measure_code: Optional[str] = None
 
     blocks: list[dict[str, Any]] = field(default_factory=list)
     tables: list[dict[str, Any]] = field(default_factory=list)
@@ -58,9 +57,7 @@ class ExtractionResult:
 class SemanticEnrichmentResult:
     source_authority: Optional[str]
     document_type: Optional[str]
-    measure_codes: list[str] = field(default_factory=list)
     legal_facts: list[dict[str, Any]] = field(default_factory=list)
-    aliases: list[dict[str, Any]] = field(default_factory=list)
     enrichment_payload_json: dict[str, Any] = field(default_factory=dict)
 
 
@@ -234,7 +231,6 @@ class StructuralQcService:
             "document_date_present": payload.extraction_result.document_date is not None,
             "service_name_full_present": bool((payload.extraction_result.service_name_full or "").strip()),
             "service_name_short_present": bool((payload.extraction_result.service_name_short or "").strip()),
-            "primary_measure_code_present": bool((payload.extraction_result.primary_measure_code or "").strip()),
         }
 
     # ---------------------------------------------------------
@@ -293,9 +289,6 @@ class StructuralQcService:
 
         if not service_name_full_present:
             warnings.append("service_name_full_missing")
-
-        if not (payload.extraction_result.primary_measure_code or "").strip():
-            warnings.append("primary_measure_code_missing")
 
     # ---------------------------------------------------------
     # Blocks checks
@@ -530,11 +523,6 @@ class StructuralQcService:
     ) -> None:
         enrichment = payload.enrichment_result
         legal_facts = enrichment.legal_facts or []
-        aliases = enrichment.aliases or []
-        measure_codes = enrichment.measure_codes or []
-
-        metrics["aliases_count"] = len(aliases)
-        metrics["measure_codes_count"] = len(measure_codes)
 
         if not enrichment.document_type:
             warnings.append("document_type_missing")
@@ -544,9 +532,6 @@ class StructuralQcService:
 
         if self.config.warn_on_zero_legal_facts and len(legal_facts) == 0:
             warnings.append("legal_facts_missing")
-
-        if len(measure_codes) == 0:
-            warnings.append("measure_codes_missing")
 
     # ---------------------------------------------------------
     # Retrievability / usability

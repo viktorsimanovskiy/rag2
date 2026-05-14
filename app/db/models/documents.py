@@ -10,7 +10,6 @@
 #   - DocumentTable
 #   - DocumentTableRow
 #   - LegalFact
-#   - MeasureAlias
 #
 # Notes:
 #   - SQLAlchemy 2.x style
@@ -162,7 +161,6 @@ class DocumentRegistry(Base):
         Index("idx_document_registry_revision_date", "revision_date"),
         Index("idx_document_registry_document_number", "document_number"),
         Index("idx_document_registry_document_date", "document_date"),
-        Index("idx_document_registry_primary_measure_code", "primary_measure_code"),
         Index("idx_document_registry_file_hash", "file_hash"),
         Index("idx_document_registry_content_hash", "content_hash"),
         Index("idx_document_registry_document_type", "document_type"),
@@ -214,11 +212,6 @@ class DocumentRegistry(Base):
     )
 
     service_name_short: Mapped[Optional[str]] = mapped_column(
-        Text,
-        nullable=True,
-    )
-
-    primary_measure_code: Mapped[Optional[str]] = mapped_column(
         Text,
         nullable=True,
     )
@@ -348,14 +341,6 @@ class DocumentRegistry(Base):
 
     legal_facts: Mapped[list["LegalFact"]] = relationship(
         "LegalFact",
-        back_populates="document",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-        lazy="selectin",
-    )
-
-    aliases: Mapped[list["MeasureAlias"]] = relationship(
-        "MeasureAlias",
         back_populates="document",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -679,7 +664,6 @@ class LegalFact(Base):
     __table_args__ = (
         Index("idx_legal_facts_document_id", "document_id"),
         Index("idx_legal_facts_fact_type", "fact_type"),
-        Index("idx_legal_facts_measure_code", "measure_code"),
         Index("idx_legal_facts_subject_category", "subject_category"),
     )
 
@@ -699,11 +683,6 @@ class LegalFact(Base):
     fact_type: Mapped[str] = mapped_column(
         Text,
         nullable=False,
-    )
-
-    measure_code: Mapped[Optional[str]] = mapped_column(
-        Text,
-        nullable=True,
     )
 
     subject_category: Mapped[Optional[str]] = mapped_column(
@@ -747,61 +726,5 @@ class LegalFact(Base):
     document: Mapped["DocumentRegistry"] = relationship(
         "DocumentRegistry",
         back_populates="legal_facts",
-        lazy="joined",
-    )
-
-
-# ============================================================
-# Measure aliases
-# ============================================================
-
-class MeasureAlias(Base):
-    __tablename__ = "measure_aliases"
-    __table_args__ = (
-        CheckConstraint("alias <> ''", name="chk_measure_aliases_alias_not_empty"),
-        Index("idx_measure_aliases_document_id", "document_id"),
-        Index("idx_measure_aliases_alias", "alias"),
-        Index("idx_measure_aliases_measure_code", "measure_code"),
-        UniqueConstraint("document_id", "alias", name="uq_measure_aliases_document_alias"),
-    )
-
-    alias_id: Mapped[UUID] = mapped_column(
-        PGUUID(as_uuid=True),
-        primary_key=True,
-        default=uuid4,
-        server_default=text("gen_random_uuid()"),
-    )
-
-    document_id: Mapped[UUID] = mapped_column(
-        PGUUID(as_uuid=True),
-        ForeignKey("document_registry.document_id", ondelete="CASCADE"),
-        nullable=False,
-    )
-
-    alias: Mapped[str] = mapped_column(
-        Text,
-        nullable=False,
-    )
-
-    measure_code: Mapped[Optional[str]] = mapped_column(
-        Text,
-        nullable=True,
-    )
-
-    canonical_name: Mapped[Optional[str]] = mapped_column(
-        Text,
-        nullable=True,
-    )
-
-    metadata_json: Mapped[dict] = mapped_column(
-        JSONB,
-        nullable=False,
-        default=dict,
-        server_default=text("'{}'::jsonb"),
-    )
-
-    document: Mapped["DocumentRegistry"] = relationship(
-        "DocumentRegistry",
-        back_populates="aliases",
         lazy="joined",
     )
