@@ -166,6 +166,9 @@ class DocumentRegistry(Base):
         Index("idx_document_registry_document_type", "document_type"),
         Index("idx_document_registry_source_type", "source_type"),
         Index("idx_document_registry_source_authority", "source_authority"),
+        Index("idx_document_registry_service_key", "service_key"),
+        Index("idx_document_registry_service_frgu_1", "service_frgu_1"),
+        Index("idx_document_registry_service_frgu_3", "service_frgu_3"),
     )
 
     document_id: Mapped[UUID] = mapped_column(
@@ -212,6 +215,22 @@ class DocumentRegistry(Base):
     )
 
     service_name_short: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    service_key: Mapped[Optional[str]] = mapped_column(
+        Text,
+        ForeignKey("service_registry.service_key", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    service_frgu_1: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    service_frgu_3: Mapped[Optional[str]] = mapped_column(
         Text,
         nullable=True,
     )
@@ -310,6 +329,12 @@ class DocumentRegistry(Base):
 
     ingestion_job: Mapped[Optional["IngestionJob"]] = relationship(
         "IngestionJob",
+        back_populates="documents",
+        lazy="joined",
+    )
+
+    service: Mapped[Optional["ServiceRegistry"]] = relationship(
+        "ServiceRegistry",
         back_populates="documents",
         lazy="joined",
     )
