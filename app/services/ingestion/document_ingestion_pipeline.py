@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
-from sqlalchemy import Select, select
+from sqlalchemy import Select, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
@@ -331,9 +331,12 @@ class DocumentIngestionPipeline:
             payload=payload,
             file_info=file_info,
         )
+        job_id = job.job_id
+        current_stage = "received"
 
         try:
-            await self._mark_job_stage(job, status="running", stage="idempotency_check")
+            current_stage = "idempotency_check"
+            await self._mark_job_stage(job, status="running", stage=current_stage)
 
             duplicate_document = await self._find_duplicate_document(file_info.file_hash)
             if duplicate_document is not None and not payload.force_reingest:
@@ -347,7 +350,7 @@ class DocumentIngestionPipeline:
                     },
                 )
                 return DocumentIngestionResult(
-                    ingestion_job_id=job.job_id,
+                    ingestion_job_id=job_id,
                     document_id=getattr(duplicate_document, "document_id", None),
                     status="skipped_duplicate",
                     file_hash=file_info.file_hash,
@@ -356,7 +359,8 @@ class DocumentIngestionPipeline:
                     payload_json={"reason": "duplicate"},
                 )
 
-            await self._mark_job_stage(job, status="running", stage="normalization")
+            current_stage = "normalization"
+            await self._mark_job_stage(job, status="running", stage=current_stage)
 
             normalized_result = await self.normalizer.normalize(
                 NormalizationInput(
@@ -369,10 +373,11 @@ class DocumentIngestionPipeline:
                 )
             )
 
+            current_stage = "structure_extraction"
             await self._mark_job_stage(
                 job,
                 status="running",
-                stage="structure_extraction",
+                stage=current_stage,
                 payload_json={
                     "content_hash": normalized_result.normalized_content_hash,
                 },
@@ -388,7 +393,8 @@ class DocumentIngestionPipeline:
                 )
             )
 
-            await self._mark_job_stage(job, status="running", stage="semantic_enrichment")
+            current_stage = "semantic_enrichment"
+            await self._mark_job_stage(job, status="running", stage=current_stage)
 
             enrichment_result = await self.enricher.enrich(
                 SemanticEnrichmentInput(
@@ -398,7 +404,8 @@ class DocumentIngestionPipeline:
                 )
             )
 
-            await self._mark_job_stage(job, status="running", stage="quality_control")
+            current_stage = "quality_control"
+            await self._mark_job_stage(job, status="running", stage=current_stage)
 
             qc_result = await self.qc.run_checks(
                 QcInput(
@@ -419,7 +426,7 @@ class DocumentIngestionPipeline:
                     },
                 )
                 return DocumentIngestionResult(
-                    ingestion_job_id=job.job_id,
+                    ingestion_job_id=job_id,
                     document_id=None,
                     status="failed_qc",
                     file_hash=file_info.file_hash,
@@ -431,11 +438,12 @@ class DocumentIngestionPipeline:
                     },
                 )
 
-            await self._mark_job_stage(job, status="running", stage="publish")
+            current_stage = "publish"
+            await self._mark_job_stage(job, status="running", stage=current_stage)
 
             publish_result = await self.publisher.publish(
                 PublishInput(
-                    ingestion_job_id=job.job_id,
+                    ingestion_job_id=job_id,
                     file_info=file_info,
                     normalized_result=normalized_result,
                     extraction_result=extraction_result,
@@ -459,7 +467,7 @@ class DocumentIngestionPipeline:
             logger.info(
                 "Document ingestion completed",
                 extra={
-                    "ingestion_job_id": str(job.job_id),
+                    "ingestion_job_id": str(job_id),
                     "document_id": str(publish_result.document_id),
                     "file_hash": file_info.file_hash,
                     "content_hash": normalized_result.normalized_content_hash,
@@ -467,7 +475,7 @@ class DocumentIngestionPipeline:
             )
 
             return DocumentIngestionResult(
-                ingestion_job_id=job.job_id,
+                ingestion_job_id=job_id,
                 document_id=publish_result.document_id,
                 status="completed",
                 file_hash=file_info.file_hash,
@@ -490,14 +498,16 @@ class DocumentIngestionPipeline:
             logger.exception(
                 "Document ingestion failed",
                 extra={
-                    "ingestion_job_id": str(job.job_id),
+                    "ingestion_job_id": str(job_id),
                     "file_path": payload.file_path,
                     "original_filename": payload.original_filename,
+                    "stage": current_stage,
                 },
             )
-            await self._mark_job_failed(
-                job=job,
-                stage=getattr(job, "stage", "unknown"),
+            await self.db.rollback()
+            await self._mark_job_failed_by_id(
+                job_id=job_id,
+                stage=current_stage,
                 error_message=str(exc),
                 payload_json={"exception_type": exc.__class__.__name__},
             )
@@ -648,6 +658,35 @@ class DocumentIngestionPipeline:
 
         await self.db.commit()
         await self.db.refresh(job)
+
+    async def _mark_job_failed_by_id(
+        self,
+        *,
+        job_id: UUID,
+        stage: str,
+        error_message: str,
+        payload_json: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """
+        Mark an ingestion job as failed without touching a possibly expired ORM object.
+
+        This is important after a nested publish failure/rollback: SQLAlchemy may expire
+        attributes on the original job instance, and reading them can trigger async IO
+        from a non-greenlet context.
+        """
+        stmt = (
+            update(IngestionJob)
+            .where(IngestionJob.job_id == job_id)
+            .values(
+                status="failed",
+                stage=stage,
+                error_message=error_message,
+                finished_at=self._utcnow(),
+                payload_json=payload_json or {},
+            )
+        )
+        await self.db.execute(stmt)
+        await self.db.commit()
 
     # --------------------------------------------------------
     # Idempotency / duplicate checks

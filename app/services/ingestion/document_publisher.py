@@ -6,7 +6,7 @@
 #
 # Responsibilities:
 #   - create/update document registry entry
-#   - write blocks, tables, rows, legal facts, aliases
+#   - write blocks, tables, rows, legal facts
 #   - ensure publication is atomic
 #   - replace old active revision when business rules require it
 #   - prevent partial publication
@@ -227,7 +227,6 @@ class DocumentPublisher:
                 "tables_count": len(payload.extraction_result.tables or []),
                 "table_rows_count": len(payload.extraction_result.table_rows or []),
                 "legal_facts_count": len(payload.enrichment_result.legal_facts or []),
-                "aliases_count": len(payload.enrichment_result.aliases or []),
                 "file_hash": payload.file_info.file_hash,
                 "content_hash": payload.normalized_result.normalized_content_hash,
             }
