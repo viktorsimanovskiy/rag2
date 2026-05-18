@@ -1538,6 +1538,17 @@ class RetrievalOrchestrator:
         )
         stmt = self._apply_service_key_filter(stmt, payload)
 
+        if payload.intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION:
+            # Для вопросов о документах источник истины — таблица перечня документов.
+            # Без этого в evidence попадают таблицы категорий заявителей только потому,
+            # что в них встречаются слова из вопроса: «ветеран», «край», «труд».
+            stmt = stmt.where(
+                or_(
+                    DocumentTable.metadata_json["table_semantic_type"].astext == "documents",
+                    DocumentTable.table_type == "documents_table",
+                )
+            )
+
         if payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION:
             stmt = stmt.where(
                 DocumentTable.metadata_json["table_semantic_type"].astext.in_(
@@ -1587,6 +1598,20 @@ class RetrievalOrchestrator:
         question_rejection_scope = query_bundle.get("question_rejection_scope")
 
         row_score_expr = self._row_match_score_expr(text_terms=text_terms) * strategy.rows_weight
+
+        if is_documents_question:
+            # Для service-aware documents-path важно не потерять базовые строки таблицы 2,
+            # даже если в них нет слов из вопроса («ветеран труда края», «ЕДВ»).
+            # Лексика пользователя помогает ранжировать, но принадлежность строке
+            # перечня документов должна давать ненулевой базовый вес.
+            row_score_expr = row_score_expr + case(
+                (
+                    DocumentTableRow.metadata_json["table_semantic_type"].astext == "documents",
+                    0.75,
+                ),
+                else_=0.0,
+            )
+
         if (
             payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION
             and question_rejection_scope
@@ -1619,6 +1644,11 @@ class RetrievalOrchestrator:
         )
         stmt = self._apply_service_key_filter(stmt, payload)
 
+        if is_documents_question:
+            stmt = stmt.where(
+                DocumentTableRow.metadata_json["table_semantic_type"].astext == "documents"
+            )
+
         if payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION:
             stmt = stmt.where(
                 DocumentTableRow.metadata_json["table_semantic_type"].astext.in_(
@@ -1633,7 +1663,7 @@ class RetrievalOrchestrator:
 
         rows_limit = payload.top_k_rows
 
-        if is_documents_question and wants_full_documents_list:
+        if is_documents_question and (wants_full_documents_list or self._get_resolved_service_key(payload)):
             rows_limit = max(payload.top_k_rows, 48)
 
         stmt = stmt.order_by(desc("score")).limit(rows_limit)
@@ -2222,6 +2252,7 @@ class RetrievalOrchestrator:
         is_deadline_question = payload.intent_type == QuestionIntentEnum.DEADLINE_QUESTION
         is_rejection_question = payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION
         wants_full_documents_list = bool(query_bundle.get("wants_full_documents_list"))
+        resolved_service_key = self._get_resolved_service_key(payload)
 
         if is_documents_question:
             if wants_full_documents_list:
@@ -2229,6 +2260,13 @@ class RetrievalOrchestrator:
                     "legal_fact": 0,
                     "table": 1,
                     "table_row": max(30, payload.final_top_k),
+                    "block": 0,
+                }
+            elif resolved_service_key:
+                type_caps = {
+                    "legal_fact": 0,
+                    "table": 1,
+                    "table_row": max(18, payload.final_top_k),
                     "block": 0,
                 }
             else:
@@ -2339,6 +2377,12 @@ class RetrievalOrchestrator:
         type_counts: dict[str, int] = {}
         document_counts: dict[UUID, int] = {}
 
+        target_final_top_k = payload.final_top_k
+        if is_documents_question and wants_full_documents_list:
+            target_final_top_k = max(payload.final_top_k, 32)
+        elif is_documents_question and resolved_service_key:
+            target_final_top_k = max(payload.final_top_k, 18)
+
         for candidate in ordered_candidates:
             candidate_key = (candidate.source_type, candidate.source_id)
             if candidate_key in selected_keys:
@@ -2364,6 +2408,14 @@ class RetrievalOrchestrator:
                 ):
                     continue
 
+            if is_documents_question:
+                if candidate.source_type == "table_row" and not self._has_table_semantic_type(candidate, "documents"):
+                    continue
+                if candidate.source_type == "table" and not self._has_table_semantic_type(candidate, "documents"):
+                    continue
+                if candidate.source_type in {"block", "legal_fact"} and resolved_service_key:
+                    continue
+
             if is_deadline_question:
                 has_temporal_markers = self._has_temporal_deadline_markers(candidate)
                 is_deadline_table = self._has_table_semantic_type(candidate, "deadline") or self._has_table_semantic_type(candidate, "deadlines")
@@ -2382,6 +2434,8 @@ class RetrievalOrchestrator:
             if is_documents_question:
                 if wants_full_documents_list:
                     max_per_document = 40 if candidate.document_id in priority_document_set else 12
+                elif resolved_service_key:
+                    max_per_document = 20 if candidate.document_id in priority_document_set else 4
                 else:
                     max_per_document = 12 if candidate.document_id in priority_document_set else 4
             elif is_deadline_question:
@@ -2415,10 +2469,6 @@ class RetrievalOrchestrator:
             type_counts[candidate.source_type] = current_type_count + 1
             document_counts[candidate.document_id] = current_doc_count + 1
 
-            target_final_top_k = payload.final_top_k
-            if is_documents_question and wants_full_documents_list:
-                target_final_top_k = max(payload.final_top_k, 32)
-
             if len(selected) >= target_final_top_k:
                 break
 
@@ -2443,6 +2493,14 @@ class RetrievalOrchestrator:
                         and candidate_row_scope != question_rejection_scope
                     ):
                         continue
+                if is_documents_question:
+                    if candidate.source_type == "table_row" and not self._has_table_semantic_type(candidate, "documents"):
+                        continue
+                    if candidate.source_type == "table" and not self._has_table_semantic_type(candidate, "documents"):
+                        continue
+                    if candidate.source_type in {"block", "legal_fact"} and resolved_service_key:
+                        continue
+
                 if is_deadline_question:
                     has_temporal_markers = self._has_temporal_deadline_markers(candidate)
                     is_deadline_table = self._has_table_semantic_type(candidate, "deadline") or self._has_table_semantic_type(candidate, "deadlines")
