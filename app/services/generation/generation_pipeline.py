@@ -124,6 +124,7 @@ class AnswerPlan:
     direct_answer_points: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     no_answer_reason_code: Optional[str] = None
+    context_json: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -396,6 +397,8 @@ class GenerationPipeline:
             answer_payload_json={
                 "strategy_code": plan.strategy_code,
                 "plan_warnings": plan.warnings,
+                "plan_no_answer_reason_code": plan.no_answer_reason_code,
+                "plan_context_json": plan.context_json,
                 "deterministic_validation_issues": det_validation.issues,
                 "semantic_validation_issues": sem_validation.issues,
                 "evidence_metrics": evidence_package.metrics_json,
@@ -749,6 +752,23 @@ class GenerationPipeline:
         primary_candidates = candidates[: min(5, len(candidates))]
         supporting_candidates = candidates[min(5, len(candidates)): min(10, len(candidates))]
 
+        ambiguous_rejection_context = self._ambiguous_rejection_context(
+            payload=payload,
+            evidence_package=evidence_package,
+        )
+        if ambiguous_rejection_context is not None:
+            return AnswerPlan(
+                answer_mode=AnswerModeEnum.SAFE_NO_ANSWER,
+                strategy_code=evidence_package.strategy_code,
+                primary_candidates=primary_candidates,
+                supporting_candidates=supporting_candidates,
+                no_answer_reason_code="ambiguous_rejection_service",
+                warnings=[
+                    "Вопрос об основаниях отказа не привязан к одной конкретной услуге."
+                ],
+                context_json=ambiguous_rejection_context,
+            )
+
         if self._should_force_safe_no_answer_for_eligibility(
             payload=payload,
             evidence_package=evidence_package,
@@ -822,6 +842,66 @@ class GenerationPipeline:
             return True
 
         return False
+
+    def _ambiguous_rejection_context(
+        self,
+        *,
+        payload: GenerationRequest,
+        evidence_package: EvidencePackage,
+    ) -> Optional[dict[str, Any]]:
+        """
+        Guard for broad rejection questions like "причины отказа в ЕДВ".
+
+        If the resolver cannot choose one concrete service, answering from
+        several refusal tables is misleading: different ЕДВ services have
+        different refusal grounds. In that case generation should ask for a
+        clarification instead of merging multiple services into one answer.
+        """
+        if payload.intent_type != QuestionIntentEnum.REJECTION_QUESTION:
+            return None
+
+        metrics = evidence_package.metrics_json or {}
+        debug_payload = evidence_package.debug_payload_json or {}
+        service_resolution = debug_payload.get("service_resolution") or {}
+        if not isinstance(service_resolution, dict):
+            return None
+
+        resolution_status = str(service_resolution.get("resolution_status") or "").strip().lower()
+        service_filter_applied = bool(metrics.get("service_filter_applied"))
+        selected_document_count = int(metrics.get("selected_document_ids_count") or 0)
+        evidence_quality = str(metrics.get("evidence_quality") or "").strip().lower()
+
+        if resolution_status != "ambiguous" or service_filter_applied:
+            return None
+
+        if selected_document_count <= 1 and evidence_quality != "weak":
+            return None
+
+        candidates_payload = service_resolution.get("candidates")
+        service_candidates: list[dict[str, Any]] = []
+        if isinstance(candidates_payload, list):
+            for candidate in candidates_payload[:5]:
+                if not isinstance(candidate, dict):
+                    continue
+                service_name_short = str(candidate.get("service_name_short") or "").strip()
+                service_key = str(candidate.get("service_key") or "").strip()
+                if not service_name_short:
+                    continue
+                service_candidates.append(
+                    {
+                        "service_key": service_key or None,
+                        "service_name_short": service_name_short,
+                        "score": candidate.get("score"),
+                        "confidence": candidate.get("confidence"),
+                    }
+                )
+
+        return {
+            "resolution_status": resolution_status,
+            "selected_document_count": selected_document_count,
+            "evidence_quality": evidence_quality,
+            "service_candidates": service_candidates,
+        }
 
     def _select_answer_mode(
         self,
@@ -1073,6 +1153,9 @@ class GenerationPipeline:
         payload: GenerationRequest,
         plan: AnswerPlan,
     ) -> str:
+        if plan.no_answer_reason_code == "ambiguous_rejection_service":
+            return self._compose_ambiguous_rejection_safe_answer(plan)
+
         base = (
             "Я не могу надёжно ответить на этот вопрос только по найденным источникам. "
             "В доступной выборке недостаточно подтверждённых данных для точного ответа."
@@ -1082,6 +1165,34 @@ class GenerationPipeline:
         if hint:
             return f"{base} {hint}"
         return base
+
+    def _compose_ambiguous_rejection_safe_answer(
+        self,
+        plan: AnswerPlan,
+    ) -> str:
+        context = plan.context_json or {}
+        service_candidates = context.get("service_candidates")
+        if not isinstance(service_candidates, list):
+            service_candidates = []
+
+        lines = [
+            "Не могу надёжно перечислить основания отказа: вопрос не привязан к одной конкретной услуге.",
+            "Уточни, по какой именно выплате или услуге нужен ответ.",
+        ]
+
+        candidate_names: list[str] = []
+        for candidate in service_candidates[:5]:
+            if not isinstance(candidate, dict):
+                continue
+            name = str(candidate.get("service_name_short") or "").strip()
+            if name and name not in candidate_names:
+                candidate_names.append(name)
+
+        if candidate_names:
+            lines.append("Похожие варианты, которые нашлись по вопросу:")
+            lines.extend(f"— {name}" for name in candidate_names)
+
+        return "\n".join(lines)
 
     def _select_intro_by_intent(
         self,

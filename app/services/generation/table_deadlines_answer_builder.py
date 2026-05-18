@@ -17,6 +17,7 @@ class DeadlineAnswerItem:
     kind_confidence: float = 0.0
     is_service_core_deadline: bool = False
     candidate_score: float = 0.0
+    context_text: str = ""
 
     table_title: str | None = None
     table_number: str | None = None
@@ -70,6 +71,7 @@ class DeadlinesAnswerBuildResult:
             "kind_confidence": item.kind_confidence,
             "is_service_core_deadline": item.is_service_core_deadline,
             "candidate_score": item.candidate_score,
+            "context_text": item.context_text,
             "table_title": item.table_title,
             "table_number": item.table_number,
             "citation_json": item.citation_json,
@@ -185,6 +187,9 @@ class TableDeadlinesAnswerBuilder:
         "рассмотрение заявления",
         "назначении едв",
         "назначение едв",
+        "максимальный срок предоставления государственной услуги",
+        "срок предоставления государственной услуги",
+        "составляет",
     )
 
     _REGISTRATION_MARKERS = (
@@ -226,6 +231,22 @@ class TableDeadlinesAnswerBuilder:
                     }
                 )
                 continue
+
+            if (
+                self._is_emergency_or_no_application_deadline_context(item.context_text)
+                and not self._question_mentions_emergency_or_no_application(normalized_question)
+            ):
+                dropped_rows_debug.append(
+                    {
+                        "source_type": self._candidate_source_type(candidate),
+                        "source_id": str(self._candidate_attr(candidate, "source_id", "") or ""),
+                        "reason": "context_specific_emergency_or_no_application_deadline",
+                        "deadline_value": item.deadline_value,
+                        "deadline_kind": item.deadline_kind,
+                    }
+                )
+                continue
+
             raw_items.append(item)
 
         if not raw_items:
@@ -288,6 +309,7 @@ class TableDeadlinesAnswerBuilder:
                             "kind_confidence": item.kind_confidence,
                             "is_service_core_deadline": item.is_service_core_deadline,
                             "candidate_score": item.candidate_score,
+                            "context_text": self._shorten_debug_text(item.context_text),
                             "rank_score": self._rank_item(
                                 item=item,
                                 question_kind=question_deadline_kind,
@@ -344,6 +366,8 @@ class TableDeadlinesAnswerBuilder:
             lines.append(self._render_single_deadline_line(decision_item, "decision"))
         if payment_item is not None:
             lines.append(self._render_single_deadline_line(payment_item, "payment"))
+        else:
+            lines.append("Срок выплаты по выбранным источникам надёжно не определён.")
 
         if lines:
             return "\n".join(lines)
@@ -478,6 +502,7 @@ class TableDeadlinesAnswerBuilder:
             kind_confidence=kind_confidence,
             is_service_core_deadline=is_service_core_deadline,
             candidate_score=source_score,
+            context_text=source_text,
             table_title=None,
             table_number=None,
             source_fact_ids=[source_id] if source_id else [],
@@ -539,6 +564,7 @@ class TableDeadlinesAnswerBuilder:
                 or self._table_row_is_service_core(scope_text)
             ),
             candidate_score=source_score,
+            context_text=scope_text,
             table_title=self._clean(
                 self._candidate_attr(candidate, "title")
                 or metadata_json.get("table_title")
@@ -589,6 +615,7 @@ class TableDeadlinesAnswerBuilder:
                 deadline_kind=deadline_kind,
             ),
             candidate_score=source_score,
+            context_text=text,
             table_title=None,
             table_number=None,
             source_block_ids=[block_id] if block_id else [],
@@ -641,6 +668,7 @@ class TableDeadlinesAnswerBuilder:
                     item.deadline_value,
                     item.scope_text,
                     item.fact_type or "",
+                    item.context_text,
                 ]
                 if x
             )
@@ -847,6 +875,7 @@ class TableDeadlinesAnswerBuilder:
                     kind_confidence=item.kind_confidence,
                     is_service_core_deadline=item.is_service_core_deadline,
                     candidate_score=item.candidate_score,
+                    context_text=item.context_text,
                     table_title=item.table_title,
                     table_number=item.table_number,
                     source_row_ids=list(item.source_row_ids),
@@ -879,6 +908,9 @@ class TableDeadlinesAnswerBuilder:
 
             if item.scope_text and len(item.scope_text) > len(existing.scope_text or ""):
                 existing.scope_text = item.scope_text
+
+            if item.context_text and len(item.context_text) > len(existing.context_text or ""):
+                existing.context_text = item.context_text
 
             if not existing.table_title and item.table_title:
                 existing.table_title = item.table_title
@@ -1558,6 +1590,68 @@ class TableDeadlinesAnswerBuilder:
             if marker in norm:
                 score += weight
         return score
+
+    def _is_emergency_or_no_application_deadline_context(
+        self,
+        text: str,
+    ) -> bool:
+        norm = self._normalize(text)
+        if not norm:
+            return False
+
+        emergency_markers = (
+            "чрезвычайной ситуации",
+            "чрезвычайная ситуация",
+            "чс",
+            "пострадавшим в результате",
+            "утрате имущества",
+        )
+        no_application_markers = (
+            "беззаявительном порядке",
+            "беззаявительный порядок",
+            "без заявления",
+        )
+
+        return any(marker in norm for marker in emergency_markers) or any(
+            marker in norm for marker in no_application_markers
+        )
+
+    def _question_mentions_emergency_or_no_application(
+        self,
+        text: str,
+    ) -> bool:
+        norm = self._normalize(text)
+        if not norm:
+            return False
+
+        return any(
+            marker in norm
+            for marker in (
+                "чрезвычай",
+                " чс",
+                "чс ",
+                "пожар",
+                "сгорел",
+                "сгорела",
+                "затоп",
+                "наводнен",
+                "утрат",
+                "имущество",
+                "без заяв",
+                "беззаяв",
+            )
+        )
+
+    def _shorten_debug_text(
+        self,
+        text: str,
+        *,
+        limit: int = 260,
+    ) -> str:
+        cleaned = self._clean(text) or ""
+        if len(cleaned) <= limit:
+            return cleaned
+        return cleaned[: limit - 1].rstrip() + "…"
 
     def _pretty_label(
         self,
