@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+from time import perf_counter
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from uuid import UUID
@@ -122,34 +123,65 @@ class RuntimeAnswerService:
         self,
         payload: RuntimeAnswerInput,
     ) -> RuntimeAnswerResult:
+        total_started_at = perf_counter()
+
+        validation_started_at = perf_counter()
         self._validate_input(payload)
+        validation_elapsed = perf_counter() - validation_started_at
 
+        terms_started_at = perf_counter()
         resolved_query_terms = self._deduplicate_terms(list(payload.query_terms or []))
+        terms_elapsed = perf_counter() - terms_started_at
 
+        service_resolution_started_at = perf_counter()
         service_resolution = await self._resolve_service_context(payload)
+        service_resolution_elapsed = perf_counter() - service_resolution_started_at
 
+        retrieval_input_started_at = perf_counter()
         retrieval_input = self._build_retrieval_input(
             payload,
             resolved_query_terms=resolved_query_terms,
             service_resolution=service_resolution,
         )
+        retrieval_input_elapsed = perf_counter() - retrieval_input_started_at
 
+        retrieval_started_at = perf_counter()
         evidence_package = await self.retrieval_orchestrator.retrieve(
             retrieval_input
         )
+        retrieval_elapsed = perf_counter() - retrieval_started_at
 
+        generation_request_started_at = perf_counter()
         generation_request = self._build_generation_request(payload)
+        generation_request_elapsed = perf_counter() - generation_request_started_at
 
+        generation_started_at = perf_counter()
         generation_result = await self.generation_pipeline.generate_answer(
             payload=generation_request,
             evidence_package=evidence_package,
         )
+        generation_elapsed = perf_counter() - generation_started_at
 
+        enrich_started_at = perf_counter()
         enriched_generation_result = self._enrich_generation_result(
             generation_result=generation_result,
             evidence_package=evidence_package,
             payload=payload,
         )
+        enrich_elapsed = perf_counter() - enrich_started_at
+
+        total_elapsed = perf_counter() - total_started_at
+        timings_json = {
+            "validation_sec": round(validation_elapsed, 6),
+            "query_terms_sec": round(terms_elapsed, 6),
+            "service_resolution_sec": round(service_resolution_elapsed, 6),
+            "build_retrieval_input_sec": round(retrieval_input_elapsed, 6),
+            "retrieval_sec": round(retrieval_elapsed, 6),
+            "build_generation_request_sec": round(generation_request_elapsed, 6),
+            "generation_sec": round(generation_elapsed, 6),
+            "enrich_generation_result_sec": round(enrich_elapsed, 6),
+            "total_sec": round(total_elapsed, 6),
+        }
 
         runtime_payload_json = {
             "question_event_id": str(payload.question_event_id),
@@ -161,6 +193,7 @@ class RuntimeAnswerService:
             "selected_row_ids_count": len(evidence_package.selected_row_ids),
             "selected_block_ids_count": len(evidence_package.selected_block_ids),
             "service_resolution": self._service_resolution_to_json(service_resolution),
+            "timings_sec": timings_json,
         }
 
         logger.info(
@@ -308,7 +341,9 @@ class RuntimeAnswerService:
         payload: RuntimeAnswerInput,
     ) -> GenerationResult:
         answer_payload_json = dict(generation_result.answer_payload_json or {})
+        existing_runtime_debug = dict(answer_payload_json.get("runtime_answer_service") or {})
         answer_payload_json["runtime_answer_service"] = {
+            **existing_runtime_debug,
             "question_event_id": str(payload.question_event_id),
             "strategy_code": evidence_package.strategy_code,
             "evidence_metrics": evidence_package.metrics_json,

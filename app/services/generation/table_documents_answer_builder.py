@@ -265,19 +265,25 @@ class TableDocumentsAnswerBuilder:
         has_channel = bool(submission_channel)
         channel_label = self._channel_label(submission_channel) if submission_channel else None
 
-        if has_channel:
-            lines = [
-                f"Для предоставления услуги при подаче {channel_label} обычно требуются следующие документы:"
-            ]
-        else:
-            lines = [
-                "Для предоставления услуги обычно требуются следующие документы:"
-            ]
+        lines: list[str] = []
 
-        counter = 1
-        for item in result.base_items:
-            lines.append(self._render_numbered_item(counter, item, has_channel=has_channel))
-            counter += 1
+        if result.base_items:
+            if has_channel:
+                lines.append(
+                    f"Для предоставления услуги при подаче {channel_label} обычно требуются следующие документы:"
+                )
+            else:
+                lines.append("Для предоставления услуги обычно требуются следующие документы:")
+
+            counter = 1
+            for item in result.base_items:
+                lines.append(self._render_numbered_item(counter, item, has_channel=has_channel))
+                counter += 1
+        else:
+            lines.append(
+                "По найденным строкам перечня нет отдельного документа, "
+                "который требуется всем заявителям безусловно."
+            )
 
         if result.conditional_items:
             lines.append("")
