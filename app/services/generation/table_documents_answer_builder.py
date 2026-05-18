@@ -567,15 +567,18 @@ class TableDocumentsAnswerBuilder:
             "status_certificate",
             "court_decision",
             "employment_proof",
+            "pension_proof",
             "other",
         }:
             return "general_document"
 
         # Страховка на случай, если family не распознался, но текст явно про представителя.
         if any(marker in text for marker in [
-            "полномоч",
             "доверенн",
-            "представител",
+            "полномоч",
+            "документ удостоверяющий личность представителя",
+            "личность представителя",
+            "представителя заявителя",
         ]):
             return "representative_only"
 
@@ -642,10 +645,15 @@ class TableDocumentsAnswerBuilder:
         ]):
             return "identity_document"
 
+        # Представительские документы выделяем только по самому документу.
+        # Служебные хвосты вида "заявителю (представителю)" в способах подачи
+        # не должны превращать обычный документ в доверенность.
         if any(marker in text for marker in [
-            "полномоч",
             "доверенн",
-            "представител",
+            "полномоч",
+            "документ удостоверяющий личность представителя",
+            "личность представителя",
+            "представителя заявителя",
         ]):
             return "authority_document"
 
@@ -654,6 +662,8 @@ class TableDocumentsAnswerBuilder:
             "проживани",
             "место жительства",
             "место пребывания",
+            "медицинском наблюдени",
+            "медицинское наблюдение",
         ]):
             return "residency_proof"
 
@@ -663,6 +673,21 @@ class TableDocumentsAnswerBuilder:
             return "court_decision"
 
         if any(marker in text for marker in [
+            "трудов",
+            "работ",
+            "служб",
+            "занятост",
+            "стаж",
+        ]):
+            return "employment_proof"
+
+        if any(marker in text for marker in [
+            "пенсион",
+            "пенсия",
+        ]):
+            return "pension_proof"
+
+        if any(marker in text for marker in [
             "справк",
             "удостоверени",
             "свидетельств",
@@ -670,15 +695,6 @@ class TableDocumentsAnswerBuilder:
             "категори",
         ]):
             return "status_certificate"
-
-        if any(marker in text for marker in [
-            "трудов",
-            "работ",
-            "служб",
-            "занятост",
-            "доход",
-        ]):
-            return "employment_proof"
 
         return "other"
 

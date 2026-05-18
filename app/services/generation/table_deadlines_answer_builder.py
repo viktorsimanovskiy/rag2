@@ -115,6 +115,14 @@ class TableDeadlinesAnswerBuilder:
         "other": "срока",
     }
 
+    _CONCRETE_DEADLINE_KINDS = {
+        "decision",
+        "notification",
+        "payment",
+        "registration",
+        "correction",
+    }
+
     _OFFTOPIC_MARKERS = (
         "исправлении опечаток",
         "опечаток и ошибок",
@@ -302,6 +310,9 @@ class TableDeadlinesAnswerBuilder:
         if not result.can_answer or result.primary_item is None:
             return None
 
+        if result.question_deadline_kind == "decision_payment":
+            return self._render_decision_payment_text(result)
+
         primary = result.primary_item
         render_kind = self._render_deadline_kind(
             item=primary,
@@ -319,6 +330,57 @@ class TableDeadlinesAnswerBuilder:
             )
 
         return f"Срок {primary_label} по найденным источникам: {primary.deadline_value}."
+
+    def _render_decision_payment_text(
+        self,
+        result: DeadlinesAnswerBuildResult,
+    ) -> Optional[str]:
+        items = [result.primary_item, *result.alternative_items]
+        decision_item = self._first_item_by_kind(items, "decision")
+        payment_item = self._first_item_by_kind(items, "payment")
+
+        lines: list[str] = []
+        if decision_item is not None:
+            lines.append(self._render_single_deadline_line(decision_item, "decision"))
+        if payment_item is not None:
+            lines.append(self._render_single_deadline_line(payment_item, "payment"))
+
+        if lines:
+            return "\n".join(lines)
+
+        return None
+
+    def _first_item_by_kind(
+        self,
+        items: list[DeadlineAnswerItem | None],
+        deadline_kind: str,
+    ) -> DeadlineAnswerItem | None:
+        for item in items:
+            if item is None:
+                continue
+            item_kind = self._render_deadline_kind(
+                item=item,
+                question_deadline_kind="other",
+            )
+            if item_kind == deadline_kind:
+                return item
+        return None
+
+    def _render_single_deadline_line(
+        self,
+        item: DeadlineAnswerItem,
+        deadline_kind: str,
+    ) -> str:
+        label = self._DEADLINE_KIND_LABELS.get(
+            deadline_kind,
+            self._DEADLINE_KIND_LABELS["other"],
+        )
+        if item.scope_text:
+            return (
+                f"Срок {label} по найденным источникам: "
+                f"{item.deadline_value} ({item.scope_text})."
+            )
+        return f"Срок {label} по найденным источникам: {item.deadline_value}."
 
     # --------------------------------------------------------
     # Candidate conversion
@@ -643,6 +705,17 @@ class TableDeadlinesAnswerBuilder:
     ) -> float:
         if question_kind == "other":
             return 0.0
+
+        if question_kind == "decision_payment":
+            cross = {
+                "decision": 45.0,
+                "payment": 42.0,
+                "notification": 0.0,
+                "registration": -10.0,
+                "correction": -60.0,
+                "other": -10.0,
+            }
+            return cross.get(deadline_kind, 0.0)
 
         if deadline_kind == question_kind:
             return 40.0
@@ -1019,7 +1092,11 @@ class TableDeadlinesAnswerBuilder:
         if item.kind_confidence >= 0.60 and item.deadline_kind != "other":
             return item.deadline_kind
 
-        if question_deadline_kind and question_deadline_kind != "other":
+        if (
+            question_deadline_kind
+            and question_deadline_kind != "other"
+            and question_deadline_kind in self._CONCRETE_DEADLINE_KINDS
+        ):
             return question_deadline_kind
 
         if item.deadline_kind and item.deadline_kind != "other":
@@ -1062,6 +1139,19 @@ class TableDeadlinesAnswerBuilder:
         if any(marker in norm for marker in payment_exact_markers):
             return "payment"
 
+        decision_exact_markers = (
+            "срок принятия решения",
+            "когда примут решение",
+            "когда будет решение",
+            "срок рассмотрения",
+            "максимальный срок предоставления",
+            "срок предоставления государственной услуги",
+        )
+        has_decision_marker = any(marker in norm for marker in decision_exact_markers)
+        has_payment_marker = self._has_payment_question_marker(norm)
+        if has_decision_marker and has_payment_marker:
+            return "decision_payment"
+
         if "уведом" in norm or "сообщ" in norm:
             return "notification"
 
@@ -1071,18 +1161,19 @@ class TableDeadlinesAnswerBuilder:
         if "опечат" in norm or "ошиб" in norm or "исправлен" in norm:
             return "correction"
 
-        decision_exact_markers = (
-            "срок принятия решения",
-            "когда примут решение",
-            "когда будет решение",
-            "срок рассмотрения",
-            "максимальный срок предоставления",
-            "срок предоставления государственной услуги",
-        )
-        if any(marker in norm for marker in decision_exact_markers):
+        if has_decision_marker:
             return "decision"
 
-        if (
+        if has_payment_marker:
+            return "payment"
+
+        return "other"
+
+    def _has_payment_question_marker(
+        self,
+        norm: str,
+    ) -> bool:
+        return (
             "выплат" in norm
             or "перечисл" in norm
             or "зачисл" in norm
@@ -1090,10 +1181,8 @@ class TableDeadlinesAnswerBuilder:
             or "придет" in norm
             or "придёт" in norm
             or "получу" in norm
-        ):
-            return "payment"
-
-        return "other"
+            or "получить" in norm
+        )
 
     def _classify_deadline_kind(
         self,
