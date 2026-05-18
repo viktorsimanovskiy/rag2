@@ -23,12 +23,14 @@
 from __future__ import annotations
 
 import logging
+from time import perf_counter
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from uuid import UUID
 
 from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only, noload
 
 from app.db.models.documents import (
     DocumentBlock,
@@ -225,7 +227,12 @@ class GenerationPipeline:
 
         If evidence_package is empty or weak, safe_no_answer is returned.
         """
+        total_started_at = perf_counter()
+        timings: dict[str, float] = {}
+
+        validation_started_at = perf_counter()
         self._validate_input(payload)
+        timings["validate_input_sec"] = round(perf_counter() - validation_started_at, 6)
 
         if evidence_package is None or not evidence_package.selected_candidates:
             return self._build_safe_no_answer_result(
@@ -248,12 +255,17 @@ class GenerationPipeline:
                 evidence_package=evidence_package,
             )
 
+        stage_started_at = perf_counter()
         hydrated_objects = await self._hydrate_evidence_objects(evidence_package)
+        timings["hydrate_evidence_sec"] = round(perf_counter() - stage_started_at, 6)
+
+        stage_started_at = perf_counter()
         plan = self._build_answer_plan(
             payload=payload,
             evidence_package=evidence_package,
             hydrated_objects=hydrated_objects,
         )
+        timings["build_answer_plan_sec"] = round(perf_counter() - stage_started_at, 6)
 
         if (
             plan.answer_mode == AnswerModeEnum.SAFE_NO_ANSWER
@@ -268,21 +280,28 @@ class GenerationPipeline:
                 },
             )
 
+        stage_started_at = perf_counter()
         documents_answer_payload = self._prepare_documents_table_answer(
             payload=payload,
             evidence_package=evidence_package,
         )
+        timings["prepare_documents_answer_sec"] = round(perf_counter() - stage_started_at, 6)
 
+        stage_started_at = perf_counter()
         deadlines_answer_payload = self._prepare_deadlines_table_answer(
             payload=payload,
             evidence_package=evidence_package,
         )
-        
+        timings["prepare_deadlines_answer_sec"] = round(perf_counter() - stage_started_at, 6)
+
+        stage_started_at = perf_counter()
         rejection_answer_payload = self._prepare_rejection_table_answer(
             payload=payload,
             evidence_package=evidence_package,
         )
+        timings["prepare_rejection_answer_sec"] = round(perf_counter() - stage_started_at, 6)
 
+        stage_started_at = perf_counter()
         answer_text = self._compose_answer_text(
             payload=payload,
             plan=plan,
@@ -292,35 +311,47 @@ class GenerationPipeline:
             deadlines_answer_payload=deadlines_answer_payload,
             rejection_answer_payload=rejection_answer_payload,
         )
+        timings["compose_answer_text_sec"] = round(perf_counter() - stage_started_at, 6)
 
+        stage_started_at = perf_counter()
         answer_text_short = self._build_short_answer(
             answer_text=answer_text,
             answer_mode=plan.answer_mode,
         )
+        timings["build_short_answer_sec"] = round(perf_counter() - stage_started_at, 6)
 
+        stage_started_at = perf_counter()
         citations = self._build_citations(
             plan=plan,
             hydrated_objects=hydrated_objects,
         )
+        timings["build_citations_sec"] = round(perf_counter() - stage_started_at, 6)
 
+        stage_started_at = perf_counter()
         evidence_items = self._build_evidence_items(
             candidates=plan.primary_candidates + plan.supporting_candidates
         )
+        timings["build_evidence_items_sec"] = round(perf_counter() - stage_started_at, 6)
 
+        stage_started_at = perf_counter()
         det_validation = await self._run_deterministic_validation(
             question_text=payload.question_text_raw,
             answer_text=answer_text,
             evidence_package=evidence_package,
             citations_json=citations,
         )
+        timings["deterministic_validation_sec"] = round(perf_counter() - stage_started_at, 6)
 
+        stage_started_at = perf_counter()
         sem_validation = await self._run_semantic_validation(
             question_text=payload.question_text_raw,
             answer_text=answer_text,
             evidence_package=evidence_package,
             answer_mode=plan.answer_mode,
         )
+        timings["semantic_validation_sec"] = round(perf_counter() - stage_started_at, 6)
 
+        stage_started_at = perf_counter()
         validation_status = self._derive_validation_status(
             deterministic_passed=det_validation.passed,
             semantic_passed=sem_validation.passed,
@@ -347,6 +378,8 @@ class GenerationPipeline:
             validation_status=validation_status,
             confidence_score=confidence_score,
         )
+        timings["derive_scores_and_reuse_sec"] = round(perf_counter() - stage_started_at, 6)
+        timings["total_sec"] = round(perf_counter() - total_started_at, 6)
 
         return GenerationResult(
             answer_mode=plan.answer_mode,
@@ -371,6 +404,7 @@ class GenerationPipeline:
                 "documents_builder_debug": documents_answer_payload.get("debug"),
                 "deadlines_builder_debug": deadlines_answer_payload.get("debug"),
                 "rejection_builder_debug": rejection_answer_payload.get("debug"),
+                "generation_timings_sec": timings,
             },
             reuse_decision_payload_json={
                 "reuse_allowed": reuse_allowed,
@@ -580,7 +614,23 @@ class GenerationPipeline:
     async def _load_documents(self, ids: list[UUID]) -> dict[UUID, Any]:
         if not ids:
             return {}
-        stmt: Select[Any] = select(DocumentRegistry).where(DocumentRegistry.document_id.in_(ids))
+
+        # В generation нужны только реквизиты самого документа.
+        # Без явного noload("*") ORM из-за relationship(lazy="selectin")
+        # может подтянуть блоки, таблицы, строки таблиц и legal_facts всего
+        # выбранного документа. Для runtime это лишние секунды.
+        stmt: Select[Any] = (
+            select(DocumentRegistry)
+            .options(
+                noload("*"),
+                load_only(
+                    DocumentRegistry.document_id,
+                    DocumentRegistry.document_name,
+                    DocumentRegistry.publication_payload_json,
+                ),
+            )
+            .where(DocumentRegistry.document_id.in_(ids))
+        )
         result = await self.db.execute(stmt)
         rows = result.scalars().all()
         return {row.document_id: row for row in rows}
@@ -588,7 +638,22 @@ class GenerationPipeline:
     async def _load_legal_facts(self, ids: list[UUID]) -> dict[UUID, Any]:
         if not ids:
             return {}
-        stmt: Select[Any] = select(LegalFact).where(LegalFact.fact_id.in_(ids))
+
+        stmt: Select[Any] = (
+            select(LegalFact)
+            .options(
+                noload("*"),
+                load_only(
+                    LegalFact.fact_id,
+                    LegalFact.document_id,
+                    LegalFact.fact_type,
+                    LegalFact.value_json,
+                    LegalFact.condition_json,
+                    LegalFact.validity_note,
+                ),
+            )
+            .where(LegalFact.fact_id.in_(ids))
+        )
         result = await self.db.execute(stmt)
         rows = result.scalars().all()
         return {row.fact_id: row for row in rows}
@@ -596,7 +661,21 @@ class GenerationPipeline:
     async def _load_tables(self, ids: list[UUID]) -> dict[UUID, Any]:
         if not ids:
             return {}
-        stmt: Select[Any] = select(DocumentTable).where(DocumentTable.table_id.in_(ids))
+
+        stmt: Select[Any] = (
+            select(DocumentTable)
+            .options(
+                noload("*"),
+                load_only(
+                    DocumentTable.table_id,
+                    DocumentTable.document_id,
+                    DocumentTable.table_title,
+                    DocumentTable.table_number,
+                    DocumentTable.summary,
+                ),
+            )
+            .where(DocumentTable.table_id.in_(ids))
+        )
         result = await self.db.execute(stmt)
         rows = result.scalars().all()
         return {row.table_id: row for row in rows}
@@ -604,7 +683,23 @@ class GenerationPipeline:
     async def _load_rows(self, ids: list[UUID]) -> dict[UUID, Any]:
         if not ids:
             return {}
-        stmt: Select[Any] = select(DocumentTableRow).where(DocumentTableRow.row_id.in_(ids))
+
+        stmt: Select[Any] = (
+            select(DocumentTableRow)
+            .options(
+                noload("*"),
+                load_only(
+                    DocumentTableRow.row_id,
+                    DocumentTableRow.document_id,
+                    DocumentTableRow.table_id,
+                    DocumentTableRow.row_order,
+                    DocumentTableRow.row_summary,
+                    DocumentTableRow.normalized_row_json,
+                    DocumentTableRow.metadata_json,
+                ),
+            )
+            .where(DocumentTableRow.row_id.in_(ids))
+        )
         result = await self.db.execute(stmt)
         rows = result.scalars().all()
         return {row.row_id: row for row in rows}
@@ -612,7 +707,20 @@ class GenerationPipeline:
     async def _load_blocks(self, ids: list[UUID]) -> dict[UUID, Any]:
         if not ids:
             return {}
-        stmt: Select[Any] = select(DocumentBlock).where(DocumentBlock.block_id.in_(ids))
+
+        stmt: Select[Any] = (
+            select(DocumentBlock)
+            .options(
+                noload("*"),
+                load_only(
+                    DocumentBlock.block_id,
+                    DocumentBlock.document_id,
+                    DocumentBlock.clause_number,
+                    DocumentBlock.content_clean,
+                ),
+            )
+            .where(DocumentBlock.block_id.in_(ids))
+        )
         result = await self.db.execute(stmt)
         rows = result.scalars().all()
         return {row.block_id: row for row in rows}
