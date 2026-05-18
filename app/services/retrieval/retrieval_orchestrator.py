@@ -1396,6 +1396,43 @@ class RetrievalOrchestrator:
         return []
 
     # --------------------------------------------------------
+    # Service-aware retrieval helpers
+    # --------------------------------------------------------
+
+    def _get_resolved_service_key(
+        self,
+        payload: RetrievalInput,
+    ) -> Optional[str]:
+        """
+        Return service_key only when service resolver made a confident choice.
+
+        Ambiguous / not_found resolutions must not hard-filter retrieval,
+        otherwise the system may silently answer from the wrong service.
+        """
+        service_resolution = (payload.constraints_json or {}).get("service_resolution")
+        if not isinstance(service_resolution, dict):
+            return None
+
+        if service_resolution.get("resolution_status") != "resolved":
+            return None
+
+        service_key = service_resolution.get("service_key")
+        if not isinstance(service_key, str) or not service_key.strip():
+            return None
+
+        return service_key.strip()
+
+    def _apply_service_key_filter(
+        self,
+        stmt: Any,
+        payload: RetrievalInput,
+    ) -> Any:
+        service_key = self._get_resolved_service_key(payload)
+        if not service_key:
+            return stmt
+        return stmt.where(DocumentRegistry.service_key == service_key)
+
+    # --------------------------------------------------------
     # Branch retrieval
     # --------------------------------------------------------
 
@@ -1432,6 +1469,7 @@ class RetrievalOrchestrator:
             .join(DocumentRegistry, DocumentRegistry.document_id == LegalFact.document_id)
             .where(DocumentRegistry.status == "active")
         )
+        stmt = self._apply_service_key_filter(stmt, payload)
 
         if subject_category:
             stmt = stmt.where(
@@ -1498,6 +1536,7 @@ class RetrievalOrchestrator:
             .join(DocumentRegistry, DocumentRegistry.document_id == DocumentTable.document_id)
             .where(DocumentRegistry.status == "active")
         )
+        stmt = self._apply_service_key_filter(stmt, payload)
 
         if payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION:
             stmt = stmt.where(
@@ -1578,6 +1617,7 @@ class RetrievalOrchestrator:
             .join(DocumentRegistry, DocumentRegistry.document_id == DocumentTableRow.document_id)
             .where(DocumentRegistry.status == "active")
         )
+        stmt = self._apply_service_key_filter(stmt, payload)
 
         if payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION:
             stmt = stmt.where(
@@ -1655,6 +1695,7 @@ class RetrievalOrchestrator:
             .join(DocumentRegistry, DocumentRegistry.document_id == DocumentBlock.document_id)
             .where(DocumentRegistry.status == "active")
         )
+        stmt = self._apply_service_key_filter(stmt, payload)
 
         stmt = stmt.order_by(desc("score")).limit(payload.top_k_blocks)
 
@@ -2488,7 +2529,12 @@ class RetrievalOrchestrator:
             if self._candidate_effective_score(candidate) >= strong_candidate_threshold
         )
 
+        service_resolution = (payload.constraints_json or {}).get("service_resolution")
+        service_filter_key = self._get_resolved_service_key(payload)
+
         metrics_json = {
+            "service_filter_applied": service_filter_key is not None,
+            "service_filter_key": service_filter_key,
             "raw_candidates_count": len(raw_candidates),
             "merged_candidates_count": len(merged_candidates),
             "reranked_candidates_count": len(reranked_candidates),
@@ -2511,6 +2557,9 @@ class RetrievalOrchestrator:
 
         debug_payload_json = {
             "strategy_code": strategy.strategy_code,
+            "service_resolution": service_resolution if isinstance(service_resolution, dict) else None,
+            "service_filter_applied": service_filter_key is not None,
+            "service_filter_key": service_filter_key,
             "priority_document_ids": [str(x) for x in priority_document_ids],
             "evidence_quality": evidence_quality,
             "guard_reason": guard_reason,

@@ -30,6 +30,11 @@ from app.services.retrieval.retrieval_orchestrator import (
     RetrievalInput,
     RetrievalOrchestrator,
 )
+from app.services.retrieval.service_resolver import (
+    ServiceResolutionResult,
+    ServiceResolver,
+    ServiceResolverInput,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,9 +108,11 @@ class RuntimeAnswerService:
         *,
         retrieval_orchestrator: RetrievalOrchestrator,
         generation_pipeline: GenerationPipeline,
+        service_resolver: Optional[ServiceResolver] = None,
     ) -> None:
         self.retrieval_orchestrator = retrieval_orchestrator
         self.generation_pipeline = generation_pipeline
+        self.service_resolver = service_resolver
 
     # --------------------------------------------------------
     # Public API
@@ -119,9 +126,12 @@ class RuntimeAnswerService:
 
         resolved_query_terms = self._deduplicate_terms(list(payload.query_terms or []))
 
+        service_resolution = await self._resolve_service_context(payload)
+
         retrieval_input = self._build_retrieval_input(
             payload,
             resolved_query_terms=resolved_query_terms,
+            service_resolution=service_resolution,
         )
 
         evidence_package = await self.retrieval_orchestrator.retrieve(
@@ -150,6 +160,7 @@ class RuntimeAnswerService:
             "selected_table_ids_count": len(evidence_package.selected_table_ids),
             "selected_row_ids_count": len(evidence_package.selected_row_ids),
             "selected_block_ids_count": len(evidence_package.selected_block_ids),
+            "service_resolution": self._service_resolution_to_json(service_resolution),
         }
 
         logger.info(
@@ -170,6 +181,73 @@ class RuntimeAnswerService:
         )
 
     # --------------------------------------------------------
+    # Service resolution
+    # --------------------------------------------------------
+
+    async def _resolve_service_context(
+        self,
+        payload: RuntimeAnswerInput,
+    ) -> Optional[ServiceResolutionResult]:
+        """
+        Try to resolve the user's question to a concrete service.
+
+        The result is passed to retrieval as metadata. Retrieval may apply a
+        strict service_key filter only when the resolver status is "resolved".
+        Ambiguous and not_found results are intentionally not hard-filtered.
+        """
+        if self.service_resolver is None:
+            return None
+
+        question_text = payload.question_text_normalized or payload.question_text_raw
+        result = await self.service_resolver.resolve(
+            ServiceResolverInput(question_text=question_text)
+        )
+
+        logger.info(
+            "Service resolution completed",
+            extra={
+                "question_event_id": str(payload.question_event_id),
+                "resolution_status": result.resolution_status,
+                "service_key": result.service_key,
+                "candidates_count": len(result.candidates),
+            },
+        )
+
+        return result
+
+    def _service_resolution_to_json(
+        self,
+        service_resolution: Optional[ServiceResolutionResult],
+    ) -> dict[str, Any]:
+        if service_resolution is None:
+            return {}
+
+        selected = service_resolution.selected_service
+
+        return {
+            "resolution_status": service_resolution.resolution_status,
+            "service_key": selected.service_key if selected is not None else None,
+            "service_name_short": selected.service_name_short if selected is not None else None,
+            "service_name_full": selected.service_name_full if selected is not None else None,
+            "frgu_1": selected.frgu_1 if selected is not None else None,
+            "frgu_3": selected.frgu_3 if selected is not None else None,
+            "score": selected.score if selected is not None else None,
+            "confidence": selected.confidence if selected is not None else None,
+            "candidates": [
+                {
+                    "service_key": candidate.service_key,
+                    "service_name_short": candidate.service_name_short,
+                    "score": candidate.score,
+                    "confidence": candidate.confidence,
+                    "matched_terms": list(candidate.matched_terms),
+                    "matched_aliases": list(candidate.matched_aliases),
+                }
+                for candidate in service_resolution.candidates[:5]
+            ],
+            "debug_payload_json": service_resolution.debug_payload_json,
+        }
+
+    # --------------------------------------------------------
     # Builders
     # --------------------------------------------------------
 
@@ -178,8 +256,12 @@ class RuntimeAnswerService:
         payload: RuntimeAnswerInput,
         *,
         resolved_query_terms: list[str],
+        service_resolution: Optional[ServiceResolutionResult],
     ) -> RetrievalInput:
         constraints_json = dict(payload.query_constraints_json or {})
+        service_resolution_json = self._service_resolution_to_json(service_resolution)
+        if service_resolution_json:
+            constraints_json["service_resolution"] = service_resolution_json
 
         return RetrievalInput(
             question_event_id=payload.question_event_id,
@@ -257,6 +339,29 @@ class RuntimeAnswerService:
             generation_prompt_version=generation_result.generation_prompt_version,
             pipeline_version=generation_result.pipeline_version,
         )
+
+
+    # --------------------------------------------------------
+    # Helpers
+    # --------------------------------------------------------
+
+    @staticmethod
+    def _deduplicate_terms(terms: list[str]) -> list[str]:
+        """Deduplicate query terms while preserving their original order."""
+        result: list[str] = []
+        seen: set[str] = set()
+
+        for term in terms:
+            cleaned = " ".join(str(term).split()).strip()
+            if not cleaned:
+                continue
+            key = cleaned.lower().replace("ё", "е")
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(cleaned)
+
+        return result
 
     # --------------------------------------------------------
     # Validation
