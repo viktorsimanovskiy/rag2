@@ -749,6 +749,21 @@ class GenerationPipeline:
         primary_candidates = candidates[: min(5, len(candidates))]
         supporting_candidates = candidates[min(5, len(candidates)): min(10, len(candidates))]
 
+        if self._should_force_safe_no_answer_for_eligibility(
+            payload=payload,
+            evidence_package=evidence_package,
+        ):
+            return AnswerPlan(
+                answer_mode=AnswerModeEnum.SAFE_NO_ANSWER,
+                strategy_code=evidence_package.strategy_code,
+                primary_candidates=primary_candidates,
+                supporting_candidates=supporting_candidates,
+                no_answer_reason_code="ambiguous_eligibility_service",
+                warnings=[
+                    "Вопрос о праве на меру не привязан к одной услуге, а найденные evidence слабые или разнородные."
+                ],
+            )
+
         answer_mode = self._select_answer_mode(
             payload=payload,
             primary_candidates=primary_candidates,
@@ -778,6 +793,35 @@ class GenerationPipeline:
             direct_answer_points=direct_answer_points,
             warnings=[],
         )
+
+    def _should_force_safe_no_answer_for_eligibility(
+        self,
+        *,
+        payload: GenerationRequest,
+        evidence_package: EvidencePackage,
+    ) -> bool:
+        if payload.intent_type != QuestionIntentEnum.ELIGIBILITY_QUESTION:
+            return False
+
+        metrics = evidence_package.metrics_json or {}
+        debug_payload = evidence_package.debug_payload_json or {}
+        service_resolution = debug_payload.get("service_resolution") or {}
+
+        resolution_status = str(service_resolution.get("resolution_status") or "").strip().lower()
+        evidence_quality = str(metrics.get("evidence_quality") or "").strip().lower()
+        guard_reason = str(metrics.get("guard_reason") or "").strip().lower()
+        selected_document_count = int(metrics.get("selected_document_ids_count") or 0)
+        strong_candidate_count = int(metrics.get("strong_candidate_count") or 0)
+
+        if resolution_status in {"ambiguous", "not_found", ""} and (
+            evidence_quality == "weak"
+            or guard_reason == "no_clear_document_leader"
+            or selected_document_count > 2
+            or strong_candidate_count == 0
+        ):
+            return True
+
+        return False
 
     def _select_answer_mode(
         self,

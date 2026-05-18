@@ -1000,6 +1000,14 @@ class TableDeadlinesAnswerBuilder:
                 re.IGNORECASE,
             ),
             re.compile(
+                rf"составляет\s+{count_token}\s+(?:рабоч(?:их|его)|календарн(?:ых|ого))\s+дн(?:я|ей)",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                rf"составляет\s+не\s+более\s+{count_token}\s+(?:рабоч(?:их|его)|календарн(?:ых|ого))\s+дн(?:я|ей)",
+                re.IGNORECASE,
+            ),
+            re.compile(
                 r"не позднее\s+26(?:-го)?\s+числа(?:\s+месяца)?",
                 re.IGNORECASE,
             ),
@@ -1012,9 +1020,23 @@ class TableDeadlinesAnswerBuilder:
         for pattern in patterns:
             match = pattern.search(source)
             if match:
-                return self._clean(match.group(0))
+                return self._normalize_extracted_deadline_value(match.group(0))
 
         return None
+
+    def _normalize_extracted_deadline_value(
+        self,
+        value: str,
+    ) -> str:
+        cleaned = self._clean(value)
+        normalized = self._normalize(cleaned)
+
+        if normalized.startswith("составляет не более "):
+            return self._clean(cleaned[len("составляет "):])
+        if normalized.startswith("составляет "):
+            return self._clean(cleaned[len("составляет "):])
+
+        return cleaned
 
     def _extract_block_scope_text(
         self,

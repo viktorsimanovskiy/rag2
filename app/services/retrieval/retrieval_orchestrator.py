@@ -577,6 +577,28 @@ class RetrievalOrchestrator:
                         "решение принимается",
                     ]
                 )
+            elif question_deadline_kind == "decision_payment":
+                terms.extend(
+                    [
+                        "срок принятия решения",
+                        "срок рассмотрения",
+                        "рассмотрения заявления",
+                        "принятия решения",
+                        "решение о предоставлении",
+                        "решение принимается",
+                        "максимальный срок предоставления",
+                        "срок предоставления государственной услуги",
+                        "срок выплаты",
+                        "выплата",
+                        "выплачивает",
+                        "выплатят",
+                        "получу выплату",
+                        "получу деньги",
+                        "поступят деньги",
+                        "перечисление",
+                        "перечисляет",
+                    ]
+                )
             elif question_deadline_kind == "notification":
                 terms.extend(
                     [
@@ -931,7 +953,13 @@ class RetrievalOrchestrator:
             "срок предоставления",
         )
 
-        if any(marker in text_norm for marker in payment_markers):
+        has_payment_marker = any(marker in text_norm for marker in payment_markers)
+        has_decision_marker = any(marker in text_norm for marker in decision_markers)
+
+        if has_payment_marker and has_decision_marker:
+            return "decision_payment"
+
+        if has_payment_marker:
             return "payment"
 
         if any(marker in text_norm for marker in notification_markers):
@@ -1120,6 +1148,20 @@ class RetrievalOrchestrator:
                         "срок принятия решения",
                         "срок рассмотрения",
                         "решение о предоставлении",
+                    ]
+                )
+            elif question_deadline_kind == "decision_payment":
+                hints.extend(
+                    [
+                        "срок принятия решения",
+                        "срок рассмотрения",
+                        "решение о предоставлении",
+                        "срок предоставления государственной услуги",
+                        "максимальный срок предоставления",
+                        "срок выплаты",
+                        "выплата",
+                        "выплатят",
+                        "получу выплату",
                     ]
                 )
             elif question_deadline_kind == "notification":
@@ -1549,6 +1591,16 @@ class RetrievalOrchestrator:
                 )
             )
 
+        if payload.intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION:
+            # Для eligibility нельзя брать формы заявлений: они длинные, совпадают по
+            # общим словам и затем превращаются в мусорный grounded narrative.
+            stmt = stmt.where(
+                DocumentTable.metadata_json["table_semantic_type"].astext.notin_(
+                    ["form_fields", "forms", "form"]
+                )
+            )
+            stmt = stmt.where(DocumentTable.table_type != "form_table")
+
         if payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION:
             stmt = stmt.where(
                 DocumentTable.metadata_json["table_semantic_type"].astext.in_(
@@ -1647,6 +1699,15 @@ class RetrievalOrchestrator:
         if is_documents_question:
             stmt = stmt.where(
                 DocumentTableRow.metadata_json["table_semantic_type"].astext == "documents"
+            )
+
+        if payload.intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION:
+            # Не допускаем строки форм заявлений в eligibility-path.
+            # Они дают длинные персональные шаблоны вместо условий права на меру.
+            stmt = stmt.where(
+                DocumentTableRow.metadata_json["table_semantic_type"].astext.notin_(
+                    ["form_fields", "forms", "form"]
+                )
             )
 
         if payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION:
@@ -2416,6 +2477,9 @@ class RetrievalOrchestrator:
                 if candidate.source_type in {"block", "legal_fact"} and resolved_service_key:
                     continue
 
+            if payload.intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION and self._is_form_candidate(candidate):
+                continue
+
             if is_deadline_question:
                 has_temporal_markers = self._has_temporal_deadline_markers(candidate)
                 is_deadline_table = self._has_table_semantic_type(candidate, "deadline") or self._has_table_semantic_type(candidate, "deadlines")
@@ -2500,6 +2564,9 @@ class RetrievalOrchestrator:
                         continue
                     if candidate.source_type in {"block", "legal_fact"} and resolved_service_key:
                         continue
+
+                if payload.intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION and self._is_form_candidate(candidate):
+                    continue
 
                 if is_deadline_question:
                     has_temporal_markers = self._has_temporal_deadline_markers(candidate)
@@ -3261,6 +3328,31 @@ class RetrievalOrchestrator:
             return True
 
         return any(ch.isdigit() for ch in text) and any(word in text for word in ["дней", "дня", "числа"])
+        
+    def _is_form_candidate(
+        self,
+        candidate: RetrievedCandidate,
+    ) -> bool:
+        metadata = candidate.metadata_json or {}
+        table_semantic_type = self._normalize_text(metadata.get("table_semantic_type"))
+        table_title = self._normalize_text(
+            metadata.get("table_title")
+            or metadata.get("table_name")
+            or candidate.title
+            or ""
+        )
+
+        if table_semantic_type in {"form_fields", "forms", "form"}:
+            return True
+
+        if candidate.source_type in {"table", "table_row"} and (
+            table_title.startswith("форма ")
+            or "форма заявления" in table_title
+            or "согласие на обработку персональных данных" in table_title
+        ):
+            return True
+
+        return False
         
     def _has_exact_notification_decision_marker(
         self,
