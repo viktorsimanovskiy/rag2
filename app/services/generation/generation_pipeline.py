@@ -1061,6 +1061,16 @@ class GenerationPipeline:
         deadlines_answer_payload: Optional[dict[str, Any]] = None,
         rejection_answer_payload: Optional[dict[str, Any]] = None,
     ) -> str:
+        # Safe/no-answer guard должен иметь приоритет над deterministic builders.
+        # Иначе builder может собрать технически корректный список из слабых
+        # или неоднозначных evidence, а верхнеуровневый ответ всё равно уйдёт
+        # пользователю как будто вопрос был надёжно разрешён.
+        if plan.answer_mode == AnswerModeEnum.SAFE_NO_ANSWER:
+            return self._compose_safe_no_answer_text(
+                payload=payload,
+                plan=plan,
+            )
+
         # Для documents-question сначала всегда пробуем deterministic path.
         if payload.intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION:
             deterministic_text = None
@@ -1087,12 +1097,6 @@ class GenerationPipeline:
 
             if deterministic_text:
                 return deterministic_text                
-
-        if plan.answer_mode == AnswerModeEnum.SAFE_NO_ANSWER:
-            return self._compose_safe_no_answer_text(
-                payload=payload,
-                plan=plan,
-            )
 
         if plan.answer_mode == AnswerModeEnum.DIRECT_STRUCTURED:
             return self._compose_direct_structured_answer(
