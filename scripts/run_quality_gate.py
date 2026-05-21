@@ -519,9 +519,104 @@ def _check_case_expectations(case: dict[str, Any], case_result: dict[str, Any]) 
     return problems
 
 
-async def check_runtime_cases(cases_path: Path) -> CheckResult:
+async def check_intent_classifier(cases_path: Path) -> CheckResult:
     started = time.perf_counter()
     details: dict[str, Any] = {"cases_path": str(cases_path)}
+    case_results: list[dict[str, Any]] = []
+    problems: list[str] = []
+
+    try:
+        cases = _load_cases(cases_path)
+        from app.services.answers.intent_classifier import RuleBasedIntentClassifier
+
+        classifier = RuleBasedIntentClassifier()
+
+        for case in cases:
+            question = str(case["question"])
+            classification = await classifier.classify(question)
+            intent_value = classification.get("intent_type")
+            actual_intent = getattr(intent_value, "value", str(intent_value))
+            routing_payload = classification.get("routing_payload_json") or {}
+            constraints = classification.get("query_constraints_json") or {}
+
+            expected_auto_intents = case.get("expected_auto_intents") or [case.get("intent")]
+            case_problems: list[str] = []
+
+            if expected_auto_intents and actual_intent not in expected_auto_intents:
+                case_problems.append(
+                    f"тип вопроса: ожидалось одно из {expected_auto_intents}, получено {actual_intent}"
+                )
+
+            if case.get("expected_requires_service_discovery") is not None:
+                expected_flag = bool(case.get("expected_requires_service_discovery"))
+                actual_flag = bool(constraints.get("requires_service_discovery"))
+                if actual_flag != expected_flag:
+                    case_problems.append(
+                        "признак подбора мер: "
+                        f"ожидалось {expected_flag}, получено {actual_flag}"
+                    )
+
+            case_result = {
+                "id": case["id"],
+                "question": question,
+                "expected_auto_intents": expected_auto_intents,
+                "actual_intent": actual_intent,
+                "confidence": routing_payload.get("confidence"),
+                "matched_rules": routing_payload.get("matched_rules"),
+                "query_constraints_json": constraints,
+                "ok": not case_problems,
+                "problems": case_problems,
+            }
+            case_results.append(case_result)
+            if case_problems:
+                problems.append(f"{case['id']}: " + "; ".join(case_problems))
+
+        ok = not problems
+        message = "Классификатор намерений работает ожидаемо." if ok else "Есть ошибки классификации намерений."
+        details["cases"] = case_results
+        details["problems"] = problems
+    except Exception as exc:
+        ok = False
+        message = "Проверка классификатора намерений завершилась ошибкой."
+        details["error"] = repr(exc)
+        details["cases"] = case_results
+        details["problems"] = problems
+
+    return CheckResult(
+        name="Классификатор намерений",
+        ok=ok,
+        message=message,
+        details=details,
+        elapsed_seconds=time.perf_counter() - started,
+    )
+
+
+async def _resolve_runtime_intent(
+    *,
+    mode: str,
+    case: dict[str, Any],
+    question: str,
+) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+    if mode == "from-cases":
+        intent = _parse_intent(str(case["intent"]))
+        return intent, {}, {}
+
+    from app.services.answers.intent_classifier import RuleBasedIntentClassifier
+
+    classifier = RuleBasedIntentClassifier()
+    classification = await classifier.classify(question)
+    intent_value = classification.get("intent_type")
+    intent = intent_value if hasattr(intent_value, "value") else _parse_intent(str(intent_value))
+    return (
+        intent,
+        classification.get("routing_payload_json") or {},
+        classification.get("query_constraints_json") or {},
+    )
+
+
+async def check_runtime_cases(cases_path: Path, *, mode: str = "from-cases") -> CheckResult:
+    started = time.perf_counter()
+    details: dict[str, Any] = {"cases_path": str(cases_path), "intent_source": mode}
     case_results: list[dict[str, Any]] = []
     problems: list[str] = []
 
@@ -538,7 +633,11 @@ async def check_runtime_cases(cases_path: Path) -> CheckResult:
         try:
             for case in cases:
                 question = str(case["question"])
-                intent = _parse_intent(str(case["intent"]))
+                intent, routing_payload, query_constraints = await _resolve_runtime_intent(
+                    mode=mode,
+                    case=case,
+                    question=question,
+                )
                 normalized_question = _normalize_text(question)
                 one_started = time.perf_counter()
 
@@ -554,6 +653,8 @@ async def check_runtime_cases(cases_path: Path) -> CheckResult:
                             question_text_normalized=normalized_question,
                             language_code="ru",
                             intent_type=intent,
+                            routing_payload_json=routing_payload,
+                            query_constraints_json=query_constraints,
                         )
                     )
 
@@ -562,7 +663,11 @@ async def check_runtime_cases(cases_path: Path) -> CheckResult:
                 case_result = {
                     "id": case["id"],
                     "question": question,
+                    "intent_source": mode,
                     "intent": intent.value,
+                    "classifier_confidence": routing_payload.get("confidence"),
+                    "classifier_matched_rules": routing_payload.get("matched_rules"),
+                    "query_constraints_json": query_constraints,
                     "answer_mode": _get_answer_mode(result),
                     "service_resolution_status": service_resolution.get("resolution_status"),
                     "service_key": service_resolution.get("service_key"),
@@ -583,18 +688,25 @@ async def check_runtime_cases(cases_path: Path) -> CheckResult:
             await runtime.shutdown()
 
         ok = not problems
-        message = "Контрольные вопросы прошли без регрессии." if ok else "Есть регрессия в контрольных вопросах."
+        if mode == "auto":
+            name = "Контрольные вопросы с автоматическим типом"
+            message = "Контрольные вопросы прошли без ручного указания типа." if ok else "Есть регрессия при автоматическом определении типа."
+        else:
+            name = "Контрольные вопросы с заданным типом"
+            message = "Контрольные вопросы прошли без регрессии." if ok else "Есть регрессия в контрольных вопросах."
+
         details["cases"] = case_results
         details["problems"] = problems
     except Exception as exc:
         ok = False
+        name = "Контрольные вопросы с автоматическим типом" if mode == "auto" else "Контрольные вопросы с заданным типом"
         message = "Проверка контрольных вопросов завершилась ошибкой."
         details["error"] = repr(exc)
         details["cases"] = case_results
         details["problems"] = problems
 
     return CheckResult(
-        name="Контрольные вопросы",
+        name=name,
         ok=ok,
         message=message,
         details=details,
@@ -623,7 +735,19 @@ def _render_text_report(results: list[CheckResult], *, total_elapsed: float) -> 
             for problem in problems[:20]:
                 print(f"  - {problem}")
 
-        if result.name == "Контрольные вопросы":
+        if result.name == "Классификатор намерений":
+            for case in result.details.get("cases") or []:
+                case_marker = "OK" if case.get("ok") else "ОШИБКА"
+                print(
+                    f"  [{case_marker}] {case.get('id')} | "
+                    f"тип={case.get('actual_intent')} | "
+                    f"уверенность={case.get('confidence')} | "
+                    f"правила={case.get('matched_rules')}"
+                )
+                for problem in case.get("problems") or []:
+                    print(f"      - {problem}")
+
+        if result.name.startswith("Контрольные вопросы"):
             for case in result.details.get("cases") or []:
                 case_marker = "OK" if case.get("ok") else "ОШИБКА"
                 print(
@@ -688,8 +812,16 @@ async def run(args: argparse.Namespace) -> int:
         finally:
             await manager.dispose()
 
+    cases_path = Path(args.cases).expanduser().resolve()
+
+    if not args.skip_intent_classifier:
+        results.append(await check_intent_classifier(cases_path))
+
     if not args.skip_runtime:
-        results.append(await check_runtime_cases(Path(args.cases).expanduser().resolve()))
+        if args.runtime_intents in {"from-cases", "both"}:
+            results.append(await check_runtime_cases(cases_path, mode="from-cases"))
+        if args.runtime_intents in {"auto", "both"}:
+            results.append(await check_runtime_cases(cases_path, mode="auto"))
 
     total_elapsed = time.perf_counter() - total_started
     if args.json_report:
@@ -716,7 +848,17 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=30, help="Сколько проблемных строк показывать в выборках.")
     parser.add_argument("--skip-compile", action="store_true", help="Не проверять синтаксис.")
     parser.add_argument("--skip-db", action="store_true", help="Не проверять БД и корпус.")
+    parser.add_argument("--skip-intent-classifier", action="store_true", help="Не проверять классификатор намерений.")
     parser.add_argument("--skip-runtime", action="store_true", help="Не прогонять контрольные вопросы.")
+    parser.add_argument(
+        "--runtime-intents",
+        choices=["from-cases", "auto", "both"],
+        default="both",
+        help=(
+            "Как задавать тип вопроса при проверке ответов: "
+            "from-cases — из файла вопросов; auto — через классификатор; both — оба варианта."
+        ),
+    )
     parser.add_argument("--quiet", action="store_true", help="Не печатать человекочитаемый отчёт.")
     args = parser.parse_args()
 

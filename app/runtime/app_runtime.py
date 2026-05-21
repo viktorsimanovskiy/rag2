@@ -33,6 +33,7 @@ from app.services.answers.answer_orchestrator import (
     QuestionEmbeddingProtocol,
     QuestionNormalizerProtocol,
 )
+from app.services.answers.intent_classifier import RuleBasedIntentClassifier
 
 logger = logging.getLogger(__name__)
 
@@ -76,20 +77,10 @@ class DefaultQuestionNormalizer(QuestionNormalizerProtocol):
         return " ".join(question_text.strip().split())
 
 
-class DefaultIntentClassifier(IntentClassifierProtocol):
-    async def classify(self, question_text: str) -> dict:
-        from app.db.models.enums import QuestionIntentEnum
-
-        return {
-            "intent_type": QuestionIntentEnum.OTHER,
-            "subject_category_code": None,
-            "classifier_version": "default_intent_classifier_v1",
-            "routing_payload_json": {
-                "source": "default_classifier",
-                "note": "fallback bootstrap classifier",
-            },
-            "query_constraints_json": {},
-        }
+class DefaultIntentClassifier(RuleBasedIntentClassifier):
+    """
+    Default live classifier used by AppRuntime when no custom classifier is supplied.
+    """
 
 
 # ============================================================
