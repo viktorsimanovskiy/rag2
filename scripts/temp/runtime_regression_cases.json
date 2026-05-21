@@ -1,0 +1,79 @@
+[
+  {
+    "id": "documents_labor_veteran_region_edv",
+    "question": "я ветеран труда края какие документы нужны для получения едв",
+    "intent": "documents_question",
+    "description": "Конкретная услуга, вопрос о документах. Ожидается предметный ответ по таблице документов.",
+    "expected_service_resolution_statuses": ["resolved"],
+    "forbidden_answer_modes": ["safe_no_answer"],
+    "min_selected_candidates": 1,
+    "required_answer_terms_any": ["документ", "заявление", "паспорт"]
+  },
+  {
+    "id": "ambiguous_edv_refusal",
+    "question": "причины отказа в едв",
+    "intent": "rejection_question",
+    "description": "Неоднозначная ЕДВ. Нельзя смешивать основания отказа по разным выплатам.",
+    "expected_service_resolution_statuses": ["ambiguous", "not_found"],
+    "expected_answer_modes": ["safe_no_answer"],
+    "required_answer_terms_any": ["уточните", "конкрет", "какую", "какой"]
+  },
+  {
+    "id": "sanatorium_child_refusal",
+    "question": "почему могут отказать в предоставлении санкура для ребенка",
+    "intent": "rejection_question",
+    "description": "Конкретная услуга, вопрос об основаниях отказа.",
+    "expected_service_resolution_statuses": ["resolved"],
+    "forbidden_answer_modes": ["safe_no_answer"],
+    "min_selected_candidates": 1,
+    "required_answer_terms_any": ["отказ", "основан", "ребен"]
+  },
+  {
+    "id": "subsidy_decision_deadline",
+    "question": "срок принятия решения по назначению субсидии",
+    "intent": "deadline_question",
+    "description": "Конкретная услуга, вопрос о сроке принятия решения.",
+    "expected_service_resolution_statuses": ["resolved"],
+    "forbidden_answer_modes": ["safe_no_answer"],
+    "min_selected_candidates": 1,
+    "required_answer_terms_any": ["срок", "решени", "дн"]
+  },
+  {
+    "id": "hardship_decision_and_payment_deadline",
+    "question": "я обратился за тжс 07.04.2026 когда примут решение, и я получу выплату",
+    "intent": "deadline_question",
+    "description": "Смешанный вопрос по ТЖС: срок решения и срок выплаты. Нельзя подмешивать ЧС/беззаявительные сроки без оснований.",
+    "expected_service_resolution_statuses": ["resolved"],
+    "min_selected_candidates": 1,
+    "required_answer_terms_any": ["20", "рабоч", "решени", "выплат"]
+  },
+  {
+    "id": "subsidy_documents",
+    "question": "какие документы нужны для субсидии",
+    "intent": "documents_question",
+    "description": "Конкретная услуга, вопрос о перечне документов.",
+    "expected_service_resolution_statuses": ["resolved"],
+    "forbidden_answer_modes": ["safe_no_answer"],
+    "min_selected_candidates": 1,
+    "required_answer_terms_any": ["документ", "заявление", "субсид"]
+  },
+  {
+    "id": "subsidy_representative_power_of_attorney",
+    "question": "может ли представитель по доверенности подать документы на субсидию",
+    "intent": "documents_question",
+    "description": "Вопрос о представителе и доверенности по субсидии.",
+    "expected_service_resolution_statuses": ["resolved"],
+    "forbidden_answer_modes": ["safe_no_answer"],
+    "min_selected_candidates": 1,
+    "required_answer_terms_any": ["представител", "доверен", "документ"]
+  },
+  {
+    "id": "broad_single_mother_three_children_entitlement",
+    "question": "я мать-одиночка с тремя несовершеннолетними детьми что мне положено",
+    "intent": "eligibility_question",
+    "description": "Широкий вопрос под будущий подбор мер. Сейчас нельзя выбирать одну случайную услугу.",
+    "expected_service_resolution_statuses": ["ambiguous", "not_found"],
+    "expected_answer_modes": ["safe_no_answer"],
+    "required_answer_terms_any": ["уточ", "несколь", "мер", "услуг", "недостаточно"]
+  }
+]

@@ -20,6 +20,7 @@ from app.services.ingestion.basic_document_semantic_enricher import (
 )
 from app.services.ingestion.docx_structure_extractor import DocxStructureExtractor
 from app.services.ingestion.docx_text_normalizer import DocxTextNormalizer
+from app.services.ingestion.docx_preprocessor import ConsultantPlusDocxPreprocessor
 from app.services.ingestion.document_ingestion_pipeline import (
     DocumentIngestionInput,
     DocumentIngestionPipeline,
@@ -53,6 +54,7 @@ async def ingest_one(
     source_type: str,
     uploaded_by: str | None,
     manager: DatabaseSessionManager,
+    docx_preprocessing_mode: str,
 ) -> dict:
     started_at = utcnow_iso()
 
@@ -65,6 +67,7 @@ async def ingest_one(
                 enricher=BasicDocumentSemanticEnricher(),
                 qc=StructuralQcService(),
                 publisher=DocumentPublisher(session),
+                preprocessor=ConsultantPlusDocxPreprocessor(),
             )
 
             result = await pipeline.ingest_document(
@@ -73,6 +76,7 @@ async def ingest_one(
                     original_filename=file_path.name,
                     source_type=source_type,
                     uploaded_by=uploaded_by,
+                    docx_preprocessing_mode=docx_preprocessing_mode,
                     metadata_json={
                         "run_mode": "manual_batch_docx_dir",
                         "source_format": "docx",
@@ -120,6 +124,7 @@ async def run(
     source_type: str,
     uploaded_by: str | None,
     recursive: bool,
+    docx_preprocessing_mode: str,
 ) -> int:
     input_path = Path(input_dir).expanduser().resolve()
     logs_path = Path(logs_dir).expanduser().resolve()
@@ -171,6 +176,7 @@ async def run(
                 source_type=source_type,
                 uploaded_by=uploaded_by,
                 manager=manager,
+                docx_preprocessing_mode=docx_preprocessing_mode,
             )
 
             log_filename = f"{idx:03d}_{sanitize_name(file_path.stem)}.json"
@@ -205,6 +211,7 @@ async def run(
             "logs_dir": str(logs_path),
             "recursive": recursive,
             "source_type": source_type,
+            "docx_preprocessing_mode": docx_preprocessing_mode,
             "uploaded_by": uploaded_by,
             "started_at": batch_started_at,
             "finished_at": utcnow_iso(),
@@ -236,6 +243,12 @@ def main() -> int:
     parser.add_argument("--source-type", default="manual_batch", help="source_type for ingestion input")
     parser.add_argument("--uploaded-by", default=None, help="uploaded_by value for ingestion input")
     parser.add_argument("--recursive", action="store_true", help="Scan subdirectories recursively")
+    parser.add_argument(
+        "--docx-preprocessing-mode",
+        choices=["off", "report_only", "trim_for_rag"],
+        default="off",
+        help="DOCX preprocessing mode. report_only attaches a cleaning/trim report to logs without changing published data; trim_for_rag publishes prepared RAG content.",
+    )
     args = parser.parse_args()
 
     return asyncio.run(
@@ -245,6 +258,7 @@ def main() -> int:
             source_type=args.source_type,
             uploaded_by=args.uploaded_by,
             recursive=args.recursive,
+            docx_preprocessing_mode=args.docx_preprocessing_mode,
         )
     )
 

@@ -102,6 +102,16 @@ class DocxStructureExtractor:
         "КОНСУЛЬТАНТПЛЮС",
     )
 
+    _OFFICIAL_START_MARKER = "МИНИСТЕРСТВО СОЦИАЛЬНОЙ ПОЛИТИКИ"
+
+    _STRICT_CONSULTANT_NOISE_MARKERS = (
+        "КОНСУЛЬТАНТПЛЮС",
+        "ДОКУМЕНТ ПРЕДОСТАВЛЕН КОНСУЛЬТАНТПЛЮС",
+        "WWW.CONSULTANT.RU",
+        "СПИСОК ИЗМЕНЯЮЩИХ ДОКУМЕНТОВ",
+        "НУМЕРАЦИЯ ПУНКТОВ ДАНА В СООТВЕТСТВИИ",
+    )
+
     _FORM_TITLE_MARKERS = (
         "СОСТАВ ЗАПРОСА",
         "СОГЛАСИЕ НА ОБРАБОТКУ ПЕРСОНАЛЬНЫХ ДАННЫХ",
@@ -250,6 +260,25 @@ class DocxStructureExtractor:
         tables: list[dict[str, Any]] = []
         table_rows: list[dict[str, Any]] = []
 
+        trim_config = self._get_docx_preprocessing_trim_config(
+            payload.parser_payload_json
+        )
+        trim_enabled = trim_config is not None
+        official_start_reached = not trim_enabled
+        trim_boundary_reached = False
+        trim_last_core_table_index = (
+            int(trim_config["last_core_table_index"])
+            if trim_config is not None
+            else None
+        )
+        preprocessing_skip_counts = {
+            "skipped_before_official_start": 0,
+            "skipped_strict_consultant_noise": 0,
+            "skipped_after_last_core_table": 0,
+            "skipped_residual_form_fields_tables": 0,
+            "skipped_residual_abbreviation_tables": 0,
+        }
+
         paragraph_context: deque[dict[str, Any]] = deque(
             maxlen=self.keep_last_paragraph_context
         )
@@ -264,6 +293,24 @@ class DocxStructureExtractor:
 
         for item in self._iter_block_items(doc):
             if isinstance(item, Paragraph):
+                paragraph_text = self._clean_text(item.text)
+
+                if trim_enabled:
+                    if not official_start_reached:
+                        if self._is_official_start_text(paragraph_text):
+                            official_start_reached = True
+                        else:
+                            preprocessing_skip_counts["skipped_before_official_start"] += 1
+                            continue
+
+                    if trim_boundary_reached:
+                        preprocessing_skip_counts["skipped_after_last_core_table"] += 1
+                        continue
+
+                    if self._is_strict_consultant_noise_text(paragraph_text):
+                        preprocessing_skip_counts["skipped_strict_consultant_noise"] += 1
+                        continue
+
                 block = self._build_block_from_paragraph(
                     paragraph=item,
                     block_order=block_order + 1,
@@ -292,6 +339,28 @@ class DocxStructureExtractor:
 
             elif isinstance(item, Table):
                 table_counter += 1
+
+                if trim_enabled:
+                    if not official_start_reached:
+                        preprocessing_skip_counts["skipped_before_official_start"] += 1
+                        continue
+
+                    if (
+                        trim_boundary_reached
+                        or (
+                            trim_last_core_table_index is not None
+                            and table_counter > trim_last_core_table_index
+                        )
+                    ):
+                        preprocessing_skip_counts["skipped_after_last_core_table"] += 1
+                        trim_boundary_reached = True
+                        continue
+
+                    table_text_sample = self._table_text_sample(item)
+                    if self._is_strict_consultant_noise_text(table_text_sample):
+                        preprocessing_skip_counts["skipped_strict_consultant_noise"] += 1
+                        continue
+
                 table_id = f"docx_tbl_{table_counter}_{uuid4().hex[:8]}"
 
                 table_title = self._detect_table_title(
@@ -317,6 +386,8 @@ class DocxStructureExtractor:
                             "table_title": table_title,
                         },
                     )
+                    if trim_enabled and table_counter == trim_last_core_table_index:
+                        trim_boundary_reached = True
                     continue
 
                 table_payload = self._build_table_payload(
@@ -327,8 +398,27 @@ class DocxStructureExtractor:
                     paragraph_context=list(paragraph_context),
                     row_payloads=row_payloads,
                 )
+
+                if trim_enabled:
+                    residual_skip_reason = self._detect_preprocessed_residual_table_skip_reason(
+                        table_payload=table_payload,
+                    )
+                    if residual_skip_reason == "form_fields":
+                        preprocessing_skip_counts["skipped_residual_form_fields_tables"] += 1
+                        if table_counter == trim_last_core_table_index:
+                            trim_boundary_reached = True
+                        continue
+                    if residual_skip_reason == "abbreviations":
+                        preprocessing_skip_counts["skipped_residual_abbreviation_tables"] += 1
+                        if table_counter == trim_last_core_table_index:
+                            trim_boundary_reached = True
+                        continue
+
                 tables.append(table_payload)
                 table_rows.extend(row_payloads)
+
+                if trim_enabled and table_counter == trim_last_core_table_index:
+                    trim_boundary_reached = True
 
         document_title = self._detect_document_title(
             original_filename=payload.original_filename,
@@ -386,7 +476,12 @@ class DocxStructureExtractor:
             ),
             "service_name_full": service_name_full,
             "service_name_short": service_name_short,
+            "docx_preprocessing_trim_applied": trim_enabled,
+            "docx_preprocessing_skip_counts": preprocessing_skip_counts,
         }
+        docx_preprocessing_payload = (payload.parser_payload_json or {}).get("docx_preprocessing")
+        if docx_preprocessing_payload is not None:
+            extraction_payload_json["docx_preprocessing"] = docx_preprocessing_payload
 
         logger.info(
             "DOCX structure extracted",
@@ -412,6 +507,130 @@ class DocxStructureExtractor:
             table_rows=table_rows,
             extraction_payload_json=extraction_payload_json,
         )
+
+    def _get_docx_preprocessing_trim_config(
+        self,
+        parser_payload_json: dict[str, Any] | None,
+    ) -> Optional[dict[str, Any]]:
+        payload = (parser_payload_json or {}).get("docx_preprocessing") or {}
+        if payload.get("mode") != "trim_for_rag":
+            return None
+        if not payload.get("applied_to_published_content"):
+            return None
+
+        report = payload.get("report") or {}
+        if not (
+            report.get("official_start_found")
+            and report.get("has_exactly_one_each_core_table")
+            and report.get("trim_after_last_core_table_candidate")
+            and not report.get("tail_contains_core_table")
+        ):
+            return None
+
+        last_core_table_index = report.get("last_core_table_index")
+        if last_core_table_index is None:
+            return None
+
+        return {"last_core_table_index": int(last_core_table_index)}
+
+    def _is_official_start_text(self, text: str) -> bool:
+        text_n = self._normalize_detection_text(text)
+        return (
+            text_n == self._OFFICIAL_START_MARKER
+            or text_n.startswith(self._OFFICIAL_START_MARKER)
+        )
+
+    def _is_strict_consultant_noise_text(self, text: str) -> bool:
+        text_n = self._normalize_detection_text(text)
+        if not text_n or len(text_n) > 700:
+            return False
+        return any(marker in text_n for marker in self._STRICT_CONSULTANT_NOISE_MARKERS)
+
+    def _detect_preprocessed_residual_table_skip_reason(
+        self,
+        *,
+        table_payload: dict[str, Any],
+    ) -> Optional[str]:
+        """
+        Extra conservative cleanup used only with docx_preprocessing_mode=trim_for_rag.
+
+        Tail trimming removes forms after the last core table. Some ConsultantPlus
+        exports also contain non-normative helper tables before the core tables:
+        mostly abbreviation/definition tables and, rarely, form fragments. They are
+        useful for reading the source manually, but they pollute retrieval.
+
+        We deliberately do not remove arbitrary generic tables here. Only two
+        classes are skipped:
+        - tables already classified as form_fields;
+        - explicit abbreviation / conditional-designation tables.
+        """
+        table_type = str(table_payload.get("table_type") or "")
+        if table_type == "form_fields":
+            return "form_fields"
+
+        if self._is_abbreviation_or_designation_table_payload(table_payload):
+            return "abbreviations"
+
+        return None
+
+    def _is_abbreviation_or_designation_table_payload(
+        self,
+        table_payload: dict[str, Any],
+    ) -> bool:
+        title_n = self._normalize_detection_text(str(table_payload.get("table_title") or ""))
+        summary_n = self._normalize_detection_text(str(table_payload.get("summary") or ""))
+        preview_n = self._normalize_detection_text(str(table_payload.get("markdown_preview") or ""))
+
+        header_schema = table_payload.get("header_schema_json") or {}
+        raw_headers = header_schema.get("raw_headers") or []
+        headers_n = self._normalize_detection_text(" ".join(str(x) for x in raw_headers))
+
+        haystack = " ".join([title_n, summary_n, headers_n, preview_n[:1500]])
+
+        strong_title_markers = (
+            "ПЕРЕЧЕНЬ УСЛОВНЫХ ОБОЗНАЧЕНИЙ",
+            "ПЕРЕЧЕНЬ ОБОЗНАЧЕНИЙ И УСЛОВНЫХ СОКРАЩЕНИЙ",
+            "УСЛОВНЫЕ ОБОЗНАЧЕНИЯ И СОКРАЩЕНИЯ",
+            "ПЕРЕЧЕНЬ УСЛОВНЫХ СОКРАЩЕНИЙ",
+            "УСЛОВНЫЕ СОКРАЩЕНИЯ",
+            "ПЕРЕЧЕНЬ СОКРАЩЕНИЙ",
+            "ПЕРЕЧЕНЬ ТЕРМИНОВ И СОКРАЩЕНИЙ",
+        )
+        if any(marker in title_n for marker in strong_title_markers):
+            return True
+
+        # Some tables have a weak title but their first header is literally
+        # "1. Условные обозначения". Require enough rows to avoid catching
+        # a random one-line explanatory table.
+        rows_count = int(table_payload.get("rows_count") or 0)
+        if rows_count >= 8 and "УСЛОВНЫЕ ОБОЗНАЧЕНИЯ" in headers_n:
+            return True
+
+        abbreviation_like = (
+            "ГОСУДАРСТВЕННАЯ УСЛУГА" in haystack
+            and (
+                "ГМИС" in haystack
+                or "ЕЦЦПСС" in haystack
+                or "ЕПГУ" in haystack
+                or "МФЦ" in haystack
+            )
+        )
+        if rows_count >= 12 and "УСЛОВНЫ" in haystack and abbreviation_like:
+            return True
+
+        return False
+
+    def _table_text_sample(self, table: Table, *, max_rows: int = 16) -> str:
+        row_texts: list[str] = []
+        for row in table.rows[:max_rows]:
+            values = [self._clean_text(cell.text) for cell in row.cells]
+            deduped: list[str] = []
+            for value in values:
+                if value and (not deduped or deduped[-1] != value):
+                    deduped.append(value)
+            if deduped:
+                row_texts.append(" | ".join(deduped))
+        return " || ".join(row_texts)
 
     def _validate_input(self, payload: ExtractionInput) -> None:
         if payload is None:
