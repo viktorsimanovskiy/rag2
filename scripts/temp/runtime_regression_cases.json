@@ -156,24 +156,105 @@
     "id": "broad_single_mother_three_children_entitlement",
     "question": "я мать-одиночка с тремя несовершеннолетними детьми что мне положено",
     "intent": "eligibility_question",
-    "description": "Широкий вопрос под будущий подбор мер. Сейчас нельзя выбирать одну случайную услугу.",
+    "description": "Широкий вопрос под подбор нескольких возможных мер. Нельзя выбирать одну случайную услугу; должен сработать отдельный режим подбора.",
     "expected_service_resolution_statuses": [
-      "ambiguous",
-      "not_found"
+      "service_discovery"
     ],
     "expected_answer_modes": [
-      "safe_no_answer"
+      "grounded_narrative"
     ],
     "required_answer_terms_any": [
-      "уточ",
-      "несколь",
-      "мер",
-      "услуг",
-      "недостаточно"
+      "могут быть релевантны",
+      "возможные направления",
+      "для точного",
+      "дет"
     ],
     "expected_auto_intents": [
       "eligibility_question"
     ],
-    "expected_requires_service_discovery": true
+    "expected_requires_service_discovery": true,
+    "forbidden_answer_modes": [
+      "safe_no_answer"
+    ],
+    "min_selected_candidates": 1,
+    "forbidden_answer_terms_any": [
+      "не могу надёжно ответить",
+      "недостаточно подтверждённых данных"
+    ]
+  },
+  {
+    "id": "broad_honorary_donor_entitlement",
+    "question": "я почетный донор россии что мне положено",
+    "intent": "eligibility_question",
+    "description": "Широкий вопрос по донору. Должен сработать подбор мер, а не выбор одной случайной услуги.",
+    "expected_service_resolution_statuses": [
+      "service_discovery"
+    ],
+    "expected_answer_modes": [
+      "grounded_narrative"
+    ],
+    "required_answer_terms_any": [
+      "донор",
+      "могут быть релевантны",
+      "для точного"
+    ],
+    "expected_auto_intents": [
+      "eligibility_question"
+    ],
+    "expected_requires_service_discovery": true,
+    "forbidden_answer_modes": [
+      "safe_no_answer"
+    ],
+    "min_selected_candidates": 1
+  },
+  {
+    "id": "broad_vov_participant_entitlement",
+    "question": "я участник вов что мне положено",
+    "intent": "eligibility_question",
+    "description": "Широкий вопрос по участнику ВОВ. Должен сработать подбор возможных мер.",
+    "expected_service_resolution_statuses": [
+      "service_discovery"
+    ],
+    "expected_answer_modes": [
+      "grounded_narrative"
+    ],
+    "required_answer_terms_any": [
+      "войн",
+      "могут быть релевантны",
+      "для точного"
+    ],
+    "expected_auto_intents": [
+      "eligibility_question"
+    ],
+    "expected_requires_service_discovery": true,
+    "forbidden_answer_modes": [
+      "safe_no_answer"
+    ],
+    "min_selected_candidates": 1
+  },
+  {
+    "id": "broad_vov_disabled_entitlement",
+    "question": "я инвалид вов что мне положено",
+    "intent": "eligibility_question",
+    "description": "Широкий вопрос по инвалиду ВОВ. Должен сработать подбор возможных мер.",
+    "expected_service_resolution_statuses": [
+      "service_discovery"
+    ],
+    "expected_answer_modes": [
+      "grounded_narrative"
+    ],
+    "required_answer_terms_any": [
+      "инвалид",
+      "войн",
+      "могут быть релевантны"
+    ],
+    "expected_auto_intents": [
+      "eligibility_question"
+    ],
+    "expected_requires_service_discovery": true,
+    "forbidden_answer_modes": [
+      "safe_no_answer"
+    ],
+    "min_selected_candidates": 1
   }
 ]

@@ -90,6 +90,21 @@ class QueryEmbeddingService:
             model_name=self.model_name,
         )
 
+    async def embed(
+        self,
+        text: str,
+    ) -> List[float]:
+        """
+        Compatibility method for AnswerOrchestrator.QuestionEmbeddingProtocol.
+
+        The canonical public method remains embed_query(), which returns both
+        vector and model name. The live answer orchestrator expects a simpler
+        provider-like method named embed(), so this adapter keeps both paths
+        aligned.
+        """
+        result = await self.embed_query(text)
+        return result.embedding
+
     async def embed_batch(
         self,
         texts: List[str],

@@ -234,7 +234,10 @@ class AnswerOrchestrator:
         self._validate_user_question_input(payload)
 
         session = await self._resolve_or_create_session(payload)
-        routing = await self._build_question_routing(payload.question_text)
+        routing = await self._build_question_routing(
+            payload.question_text,
+            request_metadata_json=payload.request_metadata_json,
+        )
 
         question_event = await self._create_question_event(
             session_id=session.session_id,
@@ -355,7 +358,18 @@ class AnswerOrchestrator:
     async def _build_question_routing(
         self,
         question_text: str,
+        *,
+        request_metadata_json: Optional[dict[str, Any]] = None,
     ) -> QuestionRoutingResult:
+        """
+        Build routing metadata for a user question.
+
+        request_metadata_json may contain forced_intent_type from the HTTP API/n8n.
+        Even when intent is forced, the classifier is still executed because it may
+        add useful query constraints, for example requires_service_discovery.
+        """
+        request_metadata_json = dict(request_metadata_json or {})
+
         normalized_text = await self.question_normalizer.normalize(question_text)
         classification = await self.intent_classifier.classify(normalized_text)
 
@@ -365,6 +379,24 @@ class AnswerOrchestrator:
             if isinstance(intent_value, QuestionIntentEnum)
             else QuestionIntentEnum(intent_value)
         )
+
+        routing_payload_json = dict(classification.get("routing_payload_json") or {})
+        query_constraints_json = dict(classification.get("query_constraints_json") or {})
+
+        forced_intent_value = request_metadata_json.get("forced_intent_type")
+        if forced_intent_value:
+            forced_intent = (
+                forced_intent_value
+                if isinstance(forced_intent_value, QuestionIntentEnum)
+                else QuestionIntentEnum(str(forced_intent_value))
+            )
+            routing_payload_json["forced_intent"] = {
+                "enabled": True,
+                "source": request_metadata_json.get("forced_intent_source") or "request_metadata",
+                "original_intent_type": intent_type.value,
+                "forced_intent_type": forced_intent.value,
+            }
+            intent_type = forced_intent
 
         question_embedding: Optional[list[float]] = None
         embedding_model_name: Optional[str] = None
@@ -379,8 +411,8 @@ class AnswerOrchestrator:
             subject_category_code=classification.get("subject_category_code"),
             classifier_version=classification.get("classifier_version"),
             embedding_model_name=embedding_model_name,
-            routing_payload_json=classification.get("routing_payload_json", {}),
-            query_constraints_json=classification.get("query_constraints_json", {}),
+            routing_payload_json=routing_payload_json,
+            query_constraints_json=query_constraints_json,
             question_embedding=question_embedding,
         )
 

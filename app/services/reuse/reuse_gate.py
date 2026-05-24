@@ -596,7 +596,8 @@ class ReuseGate:
         - answer has evidence_hash
         - answer has at least one evidence item
         - evidence items are structurally complete
-        - every evidence item points to exactly one object
+        - every evidence item has either document evidence, one precise evidence pointer,
+          or document evidence plus one precise evidence pointer
         - at least one strong evidence object exists:
           document, block, table, table_row, or legal_fact
 
@@ -621,21 +622,31 @@ class ReuseGate:
         strong_item_count = 0
 
         for item in evidence_items:
-            pointer_count = sum(
+            precise_pointer_count = sum(
                 1 for value in [
-                    item.document_id,
                     item.block_id,
                     item.table_id,
                     item.table_row_id,
                     item.legal_fact_id,
                 ] if value is not None
             )
+            has_document_pointer = item.document_id is not None
 
-            if pointer_count != 1:
+            if precise_pointer_count == 0 and not has_document_pointer:
                 invalid_items.append({
                     "answer_evidence_item_id": str(item.answer_evidence_item_id),
-                    "reason": "invalid_pointer_count",
-                    "pointer_count": pointer_count,
+                    "reason": "missing_pointer",
+                    "precise_pointer_count": precise_pointer_count,
+                    "has_document_pointer": has_document_pointer,
+                })
+                continue
+
+            if precise_pointer_count > 1:
+                invalid_items.append({
+                    "answer_evidence_item_id": str(item.answer_evidence_item_id),
+                    "reason": "too_many_precise_pointers",
+                    "precise_pointer_count": precise_pointer_count,
+                    "has_document_pointer": has_document_pointer,
                 })
                 continue
 

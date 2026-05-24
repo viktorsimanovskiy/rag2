@@ -587,13 +587,24 @@ class AnswerEvidenceItem(Base):
         ),
         CheckConstraint(
             """
-            ((CASE WHEN document_id IS NOT NULL THEN 1 ELSE 0 END) +
-             (CASE WHEN block_id IS NOT NULL THEN 1 ELSE 0 END) +
-             (CASE WHEN table_id IS NOT NULL THEN 1 ELSE 0 END) +
-             (CASE WHEN table_row_id IS NOT NULL THEN 1 ELSE 0 END) +
-             (CASE WHEN legal_fact_id IS NOT NULL THEN 1 ELSE 0 END)) = 1
+            (
+                (
+                    (CASE WHEN block_id IS NOT NULL THEN 1 ELSE 0 END) +
+                    (CASE WHEN table_id IS NOT NULL THEN 1 ELSE 0 END) +
+                    (CASE WHEN table_row_id IS NOT NULL THEN 1 ELSE 0 END) +
+                    (CASE WHEN legal_fact_id IS NOT NULL THEN 1 ELSE 0 END)
+                ) = 1
+            )
+            OR
+            (
+                document_id IS NOT NULL
+                AND block_id IS NULL
+                AND table_id IS NULL
+                AND table_row_id IS NULL
+                AND legal_fact_id IS NULL
+            )
             """,
-            name="chk_answer_evidence_exactly_one_pointer",
+            name="chk_answer_evidence_document_or_one_precise_pointer",
         ),
         Index("idx_answer_evidence_items_answer", "answer_event_id"),
         Index("idx_answer_evidence_items_document", "document_id"),

@@ -516,6 +516,21 @@ def _check_case_expectations(case: dict[str, Any], case_result: dict[str, Any]) 
     if found_forbidden:
         problems.append(f"в ответе найдены запрещённые фрагменты: {found_forbidden}")
 
+    if bool(case.get("expected_requires_service_discovery")):
+        strategy_code = case_result.get("strategy_code")
+        if service_status != "service_discovery":
+            problems.append(
+                "режим подбора мер не сработал: "
+                f"ожидался статус service_discovery, получено {service_status}"
+            )
+        if strategy_code != "service_discovery":
+            problems.append(
+                "использована неверная стратегия: "
+                f"ожидалась service_discovery, получено {strategy_code}"
+            )
+        if answer_mode == "safe_no_answer":
+            problems.append("для вопроса под подбор мер получен safe_no_answer")
+
     return problems
 
 
@@ -599,7 +614,13 @@ async def _resolve_runtime_intent(
 ) -> tuple[Any, dict[str, Any], dict[str, Any]]:
     if mode == "from-cases":
         intent = _parse_intent(str(case["intent"]))
-        return intent, {}, {}
+        routing_payload = dict(case.get("routing_payload_json") or {})
+        query_constraints = dict(case.get("query_constraints_json") or {})
+        if bool(case.get("expected_requires_service_discovery")):
+            query_constraints.setdefault("requires_service_discovery", True)
+            query_constraints.setdefault("avoid_single_service_resolution", True)
+            query_constraints.setdefault("routing_mode", "service_discovery")
+        return intent, routing_payload, query_constraints
 
     from app.services.answers.intent_classifier import RuleBasedIntentClassifier
 

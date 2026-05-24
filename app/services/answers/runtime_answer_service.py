@@ -20,7 +20,12 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 from uuid import UUID
 
-from app.db.models.enums import QuestionIntentEnum
+from app.db.models.enums import (
+    AnswerModeEnum,
+    EvidenceItemTypeEnum,
+    QuestionIntentEnum,
+    ValidationStatusEnum,
+)
 from app.services.generation.generation_pipeline import (
     GenerationPipeline,
     GenerationRequest,
@@ -35,6 +40,12 @@ from app.services.retrieval.service_resolver import (
     ServiceResolutionResult,
     ServiceResolver,
     ServiceResolverInput,
+)
+from app.services.feedback.feedback_service import EvidenceItemInput
+from app.services.retrieval.service_discovery import (
+    ServiceDiscovery,
+    ServiceDiscoveryInput,
+    ServiceDiscoveryResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -110,10 +121,12 @@ class RuntimeAnswerService:
         retrieval_orchestrator: RetrievalOrchestrator,
         generation_pipeline: GenerationPipeline,
         service_resolver: Optional[ServiceResolver] = None,
+        service_discovery: Optional[ServiceDiscovery] = None,
     ) -> None:
         self.retrieval_orchestrator = retrieval_orchestrator
         self.generation_pipeline = generation_pipeline
         self.service_resolver = service_resolver
+        self.service_discovery = service_discovery
 
     # --------------------------------------------------------
     # Public API
@@ -132,6 +145,14 @@ class RuntimeAnswerService:
         terms_started_at = perf_counter()
         resolved_query_terms = self._deduplicate_terms(list(payload.query_terms or []))
         terms_elapsed = perf_counter() - terms_started_at
+
+        if self._requires_service_discovery(payload):
+            return await self._build_service_discovery_answer(
+                payload=payload,
+                total_started_at=total_started_at,
+                validation_elapsed=validation_elapsed,
+                terms_elapsed=terms_elapsed,
+            )
 
         service_resolution_started_at = perf_counter()
         service_resolution = await self._resolve_service_context(payload)
@@ -212,6 +233,342 @@ class RuntimeAnswerService:
             evidence_package=evidence_package,
             runtime_payload_json=runtime_payload_json,
         )
+
+
+    # --------------------------------------------------------
+    # Service discovery
+    # --------------------------------------------------------
+
+    def _requires_service_discovery(self, payload: RuntimeAnswerInput) -> bool:
+        """
+        Return True for broad entitlement questions that must not be forced
+        into one randomly selected service.
+        """
+        sources = (
+            payload.query_constraints_json or {},
+            payload.routing_payload_json or {},
+            payload.request_metadata_json or {},
+        )
+        for source in sources:
+            if bool(source.get("requires_service_discovery")):
+                return True
+            if str(source.get("routing_mode") or "").strip().lower() == "service_discovery":
+                return True
+        return False
+
+    async def _build_service_discovery_answer(
+        self,
+        *,
+        payload: RuntimeAnswerInput,
+        total_started_at: float,
+        validation_elapsed: float,
+        terms_elapsed: float,
+    ) -> RuntimeAnswerResult:
+        discovery_started_at = perf_counter()
+
+        if self.service_discovery is None:
+            evidence_package = EvidencePackage(
+                question_event_id=payload.question_event_id,
+                strategy_code="service_discovery_unavailable",
+                metrics_json={
+                    "evidence_quality": "insufficient",
+                    "guard_reason": "service_discovery_not_configured",
+                },
+                debug_payload_json={
+                    "service_resolution": {
+                        "resolution_status": "service_discovery_unavailable",
+                        "service_key": None,
+                    },
+                    "evidence_quality": "insufficient",
+                    "guard_reason": "service_discovery_not_configured",
+                },
+            )
+            generation_result = self._build_service_discovery_unavailable_result(payload)
+            enriched_generation_result = self._enrich_generation_result(
+                generation_result=generation_result,
+                evidence_package=evidence_package,
+                payload=payload,
+            )
+            return RuntimeAnswerResult(
+                generation_result=enriched_generation_result,
+                evidence_package=evidence_package,
+                runtime_payload_json={
+                    "question_event_id": str(payload.question_event_id),
+                    "strategy_code": evidence_package.strategy_code,
+                    "selected_candidates_count": 0,
+                    "selected_document_ids_count": 0,
+                    "selected_fact_ids_count": 0,
+                    "selected_table_ids_count": 0,
+                    "selected_row_ids_count": 0,
+                    "selected_block_ids_count": 0,
+                    "service_resolution": evidence_package.debug_payload_json.get("service_resolution"),
+                    "timings_sec": {
+                        "validation_sec": round(validation_elapsed, 6),
+                        "query_terms_sec": round(terms_elapsed, 6),
+                        "service_discovery_sec": 0.0,
+                        "total_sec": round(perf_counter() - total_started_at, 6),
+                    },
+                },
+            )
+
+        discovery_result = await self.service_discovery.discover(
+            ServiceDiscoveryInput(
+                question_text_raw=payload.question_text_raw,
+                question_text_normalized=payload.question_text_normalized,
+            )
+        )
+        discovery_elapsed = perf_counter() - discovery_started_at
+
+        evidence_package = self._build_service_discovery_evidence_package(
+            payload=payload,
+            discovery_result=discovery_result,
+        )
+        generation_result = self._build_service_discovery_generation_result(
+            discovery_result=discovery_result,
+        )
+        enriched_generation_result = self._enrich_generation_result(
+            generation_result=generation_result,
+            evidence_package=evidence_package,
+            payload=payload,
+        )
+
+        total_elapsed = perf_counter() - total_started_at
+        timings_json = {
+            "validation_sec": round(validation_elapsed, 6),
+            "query_terms_sec": round(terms_elapsed, 6),
+            "service_discovery_sec": round(discovery_elapsed, 6),
+            "total_sec": round(total_elapsed, 6),
+        }
+
+        runtime_payload_json = {
+            "question_event_id": str(payload.question_event_id),
+            "strategy_code": evidence_package.strategy_code,
+            "selected_candidates_count": len(evidence_package.selected_candidates),
+            "selected_document_ids_count": len(evidence_package.selected_document_ids),
+            "selected_fact_ids_count": len(evidence_package.selected_fact_ids),
+            "selected_table_ids_count": len(evidence_package.selected_table_ids),
+            "selected_row_ids_count": len(evidence_package.selected_row_ids),
+            "selected_block_ids_count": len(evidence_package.selected_block_ids),
+            "service_resolution": evidence_package.debug_payload_json.get("service_resolution"),
+            "timings_sec": timings_json,
+        }
+
+        logger.info(
+            "Service discovery answer built",
+            extra={
+                "question_event_id": str(payload.question_event_id),
+                "answer_mode": str(enriched_generation_result.answer_mode),
+                "selected_services_count": len(discovery_result.candidates),
+            },
+        )
+
+        return RuntimeAnswerResult(
+            generation_result=enriched_generation_result,
+            evidence_package=evidence_package,
+            runtime_payload_json=runtime_payload_json,
+        )
+
+    def _build_service_discovery_evidence_package(
+        self,
+        *,
+        payload: RuntimeAnswerInput,
+        discovery_result: ServiceDiscoveryResult,
+    ) -> EvidencePackage:
+        from app.services.retrieval.retrieval_orchestrator import RetrievedCandidate
+
+        candidates: list[RetrievedCandidate] = []
+        for service_candidate in discovery_result.candidates:
+            for row in service_candidate.matched_rows[:2]:
+                candidates.append(
+                    RetrievedCandidate(
+                        source_type="table_row",
+                        source_id=row.row_id,
+                        document_id=row.document_id,
+                        score=row.score,
+                        rerank_score=None,
+                        document_name=row.document_name,
+                        doc_uid_base=None,
+                        revision_date=None,
+                        subject_category=None,
+                        title=row.table_title,
+                        snippet=row.applicant_category_name or row.row_summary,
+                        citation_json=row.citation_json,
+                        metadata_json={
+                            "service_key": row.service_key,
+                            "service_name_short": row.service_name_short,
+                            "service_discovery_score": row.score,
+                            "matched_signal_codes": row.matched_signal_codes,
+                            "matched_terms": row.matched_terms,
+                        },
+                    )
+                )
+
+        row_ids = [candidate.source_id for candidate in candidates]
+        document_ids = self._unique_uuid(candidate.document_id for candidate in candidates)
+        table_ids = self._unique_uuid(
+            row.table_id
+            for service_candidate in discovery_result.candidates
+            for row in service_candidate.matched_rows[:2]
+        )
+
+        service_resolution = {
+            "resolution_status": "service_discovery",
+            "service_key": None,
+            "service_name_short": None,
+            "service_name_full": None,
+            "candidates": [
+                {
+                    "service_key": candidate.service_key,
+                    "service_name_short": candidate.service_name_short,
+                    "score": candidate.score,
+                    "matched_signal_codes": candidate.matched_signal_codes,
+                    "matched_signal_labels": candidate.matched_signal_labels,
+                }
+                for candidate in discovery_result.candidates[:7]
+            ],
+            "debug_payload_json": discovery_result.debug_payload_json,
+        }
+
+        evidence_quality = "strong" if discovery_result.can_answer else "insufficient"
+        guard_reason = None if discovery_result.can_answer else "service_discovery_no_candidates"
+
+        return EvidencePackage(
+            question_event_id=payload.question_event_id,
+            strategy_code="service_discovery",
+            selected_candidates=candidates,
+            selected_fact_ids=[],
+            selected_table_ids=table_ids,
+            selected_row_ids=row_ids,
+            selected_block_ids=[],
+            selected_document_ids=document_ids,
+            metrics_json={
+                "service_filter_applied": False,
+                "service_filter_key": None,
+                "selected_services_count": len(discovery_result.candidates),
+                "selected_document_ids_count": len(document_ids),
+                "selected_table_ids_count": len(table_ids),
+                "selected_row_ids_count": len(row_ids),
+                "selected_fact_ids_count": 0,
+                "selected_block_ids_count": 0,
+                "final_candidates_count": len(candidates),
+                "evidence_quality": evidence_quality,
+                "guard_reason": guard_reason,
+            },
+            debug_payload_json={
+                "strategy_code": "service_discovery",
+                "service_resolution": service_resolution,
+                "service_filter_applied": False,
+                "service_filter_key": None,
+                "evidence_quality": evidence_quality,
+                "guard_reason": guard_reason,
+                "service_discovery": discovery_result.debug_payload_json,
+            },
+        )
+
+    def _build_service_discovery_generation_result(
+        self,
+        *,
+        discovery_result: ServiceDiscoveryResult,
+    ) -> GenerationResult:
+        if discovery_result.can_answer:
+            answer_mode = AnswerModeEnum.GROUNDED_NARRATIVE
+            confidence_score = 0.72
+            trust_score = 0.70
+            reason_code = None
+        else:
+            answer_mode = AnswerModeEnum.SAFE_NO_ANSWER
+            confidence_score = 0.40
+            trust_score = 0.35
+            reason_code = "service_discovery_no_candidates"
+
+        evidence_items: list[EvidenceItemInput] = []
+        seen_rows: set[Any] = set()
+        for service_candidate in discovery_result.candidates:
+            for row in service_candidate.matched_rows[:2]:
+                if row.row_id in seen_rows:
+                    continue
+                seen_rows.add(row.row_id)
+                evidence_items.append(
+                    EvidenceItemInput(
+                        evidence_item_type=EvidenceItemTypeEnum.TABLE_ROW,
+                        role_code="primary_evidence" if len(evidence_items) < 5 else "supporting_evidence",
+                        citation_json=row.citation_json,
+                        document_id=row.document_id,
+                        table_row_id=row.row_id,
+                    )
+                )
+
+        return GenerationResult(
+            answer_mode=answer_mode,
+            answer_text=discovery_result.answer_text,
+            answer_text_short=discovery_result.answer_text_short,
+            confidence_score=confidence_score,
+            trust_score_at_generation=trust_score,
+            validation_status=ValidationStatusEnum.PASSED,
+            deterministic_validation_passed=True,
+            semantic_validation_passed=True,
+            reuse_allowed=False,
+            reuse_policy_version="reuse_gate_v1",
+            citations_json=discovery_result.citations_json,
+            answer_payload_json={
+                "strategy_code": "service_discovery",
+                "reason_code": reason_code,
+                "service_discovery": discovery_result.debug_payload_json,
+                "warnings": discovery_result.warnings,
+            },
+            reuse_decision_payload_json={
+                "reuse_allowed": False,
+                "reason_code": "service_discovery_answer",
+            },
+            evidence_items=evidence_items,
+            generation_model_name=None,
+            generation_prompt_version="service_discovery_template_v1",
+            pipeline_version="runtime_service_discovery_v1",
+        )
+
+    @staticmethod
+    def _build_service_discovery_unavailable_result(payload: RuntimeAnswerInput) -> GenerationResult:
+        answer_text = (
+            "Для такого вопроса нужен режим подбора возможных мер, но он сейчас не подключён. "
+            "Я не буду выбирать одну случайную услугу, потому что это может привести к неверному ответу."
+        )
+        return GenerationResult(
+            answer_mode=AnswerModeEnum.SAFE_NO_ANSWER,
+            answer_text=answer_text,
+            answer_text_short=answer_text,
+            confidence_score=0.30,
+            trust_score_at_generation=0.30,
+            validation_status=ValidationStatusEnum.PASSED,
+            deterministic_validation_passed=True,
+            semantic_validation_passed=True,
+            reuse_allowed=False,
+            reuse_policy_version="reuse_gate_v1",
+            citations_json=[],
+            answer_payload_json={
+                "strategy_code": "service_discovery_unavailable",
+                "reason_code": "service_discovery_not_configured",
+                "question_event_id": str(payload.question_event_id),
+            },
+            reuse_decision_payload_json={
+                "reuse_allowed": False,
+                "reason_code": "service_discovery_not_configured",
+            },
+            evidence_items=[],
+            generation_model_name=None,
+            generation_prompt_version="service_discovery_template_v1",
+            pipeline_version="runtime_service_discovery_v1",
+        )
+
+    @staticmethod
+    def _unique_uuid(values: Any) -> list[Any]:
+        result: list[Any] = []
+        seen: set[Any] = set()
+        for value in values:
+            if value is None or value in seen:
+                continue
+            seen.add(value)
+            result.append(value)
+        return result
 
     # --------------------------------------------------------
     # Service resolution

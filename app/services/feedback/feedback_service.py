@@ -84,13 +84,11 @@ class EvidenceItemInput:
     """
     Represents one evidence object used to produce an answer.
 
-    Exactly one of:
-    - document_id
-    - block_id
-    - table_id
-    - table_row_id
-    - legal_fact_id
-    must be present.
+    Valid pointer shapes:
+    - document_id only;
+    - exactly one precise pointer: block_id, table_id, table_row_id or legal_fact_id;
+    - document_id plus exactly one precise pointer, when document_id is used as
+      a freshness-check context for the precise evidence object.
     """
     evidence_item_type: EvidenceItemTypeEnum
     role_code: str
@@ -597,9 +595,8 @@ class FeedbackService:
             self._validate_evidence_item_input(item, index=idx)
 
     def _validate_evidence_item_input(self, item: EvidenceItemInput, index: int) -> None:
-        pointer_count = sum(
+        precise_pointer_count = sum(
             1 for value in [
-                item.document_id,
                 item.block_id,
                 item.table_id,
                 item.table_row_id,
@@ -607,9 +604,16 @@ class FeedbackService:
             ] if value is not None
         )
 
-        if pointer_count != 1:
+        has_document_pointer = item.document_id is not None
+
+        if precise_pointer_count == 0 and not has_document_pointer:
             raise ValidationError(
-                f"Evidence item at index={index} must contain exactly one pointer id."
+                f"Evidence item at index={index} must contain a pointer id."
+            )
+
+        if precise_pointer_count > 1:
+            raise ValidationError(
+                f"Evidence item at index={index} must contain no more than one precise pointer id."
             )
 
         if not item.role_code or not item.role_code.strip():

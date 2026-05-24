@@ -43,6 +43,7 @@ from app.services.retrieval.retrieval_orchestrator import (
     RetrievalOrchestrator,
     RetrievalRerankerProtocol,
 )
+from app.services.retrieval.service_discovery import ServiceDiscovery
 from app.services.retrieval.service_resolver import ServiceResolver
 from app.services.reuse.reuse_gate import ReuseGate
 from app.adapters.telegram.telegram_message_adapter import TelegramMessageAdapter
@@ -118,6 +119,7 @@ class ServiceFactory:
         self._reuse_gate: Optional[ReuseGate] = None
         self._retrieval_orchestrator: Optional[RetrievalOrchestrator] = None
         self._service_resolver: Optional[ServiceResolver] = None
+        self._service_discovery: Optional[ServiceDiscovery] = None
         self._generation_pipeline: Optional[GenerationPipeline] = None
         self._runtime_answer_service: Optional[RuntimeAnswerService] = None
         self._answer_orchestrator: Optional[AnswerOrchestrator] = None
@@ -159,6 +161,11 @@ class ServiceFactory:
             self._service_resolver = ServiceResolver(self.db)
         return self._service_resolver
 
+    def get_service_discovery(self) -> ServiceDiscovery:
+        if self._service_discovery is None:
+            self._service_discovery = ServiceDiscovery(self.db)
+        return self._service_discovery
+
     def get_generation_pipeline(self) -> GenerationPipeline:
         if self._generation_pipeline is None:
             self._generation_pipeline = GenerationPipeline(
@@ -174,6 +181,7 @@ class ServiceFactory:
                 retrieval_orchestrator=self.get_retrieval_orchestrator(),
                 generation_pipeline=self.get_generation_pipeline(),
                 service_resolver=self.get_service_resolver(),
+                service_discovery=self.get_service_discovery(),
             )
         return self._runtime_answer_service
 
@@ -225,6 +233,7 @@ class ServiceFactory:
             "reuse_gate": self.get_reuse_gate(),
             "retrieval_orchestrator": self.get_retrieval_orchestrator(),
             "service_resolver": self.get_service_resolver(),
+            "service_discovery": self.get_service_discovery(),
             "generation_pipeline": self.get_generation_pipeline(),
             "runtime_answer_service": self.get_runtime_answer_service(),
             "answer_orchestrator": self.get_answer_orchestrator(),
