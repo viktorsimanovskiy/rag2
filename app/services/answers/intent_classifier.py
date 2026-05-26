@@ -20,7 +20,7 @@ from typing import Any, Iterable
 from app.db.models.enums import QuestionIntentEnum
 
 
-CLASSIFIER_VERSION = "rule_based_intent_classifier_v1"
+CLASSIFIER_VERSION = "rule_based_intent_classifier_v2_demo_stabilization"
 
 
 @dataclass(slots=True)
@@ -254,6 +254,32 @@ def _build_rules() -> list[IntentRule]:
             },
         ),
         IntentRule(
+            code="service_discovery_crisis_or_material_help",
+            intent_type=QuestionIntentEnum.ELIGIBILITY_QUESTION,
+            weight=130,
+            patterns=(
+                r"\bдайте\s+денег\b",
+                r"\bне\s+хватает\s+денег\b",
+                r"\bнечего\s+есть\b",
+                r"\bпомогите\b.*\b(?:есть|еда|продукт|деньг|дров|топлив|школ|дом|жилье|жилье)\b",
+                r"\bнужна\s+помощь\b.*\b(?:деньг|дров|топлив|школ|дом|жилье|жилье|пожар)\b",
+                r"\bсгорел\w*\s+(?:дом|жилье|жилье|квартир)\b",
+                r"\bпожар\b.*\b(?:дом|жилье|жилье|квартир|помощ)\b",
+                r"\bпомощь\s+на\s+(?:дрова|уголь|топливо|школ[ауеы]|продукт|ед[уы])\b",
+                r"\bсобрать\s+(?:ребенк\w*|дет\w*)\s+в\s+школ",
+            ),
+            adds_constraints={
+                "requires_service_discovery": True,
+                "avoid_single_service_resolution": True,
+                "routing_mode": "service_discovery",
+                "service_discovery_context": "crisis_or_material_help",
+            },
+            adds_payload={
+                "requires_service_discovery": True,
+                "routing_note": "кризисный или бытовой запрос о материальной помощи",
+            },
+        ),
+        IntentRule(
             code="documents_direct",
             intent_type=QuestionIntentEnum.DOCUMENTS_QUESTION,
             weight=110,
@@ -270,12 +296,15 @@ def _build_rules() -> list[IntentRule]:
         IntentRule(
             code="representative_documents",
             intent_type=QuestionIntentEnum.DOCUMENTS_QUESTION,
-            weight=95,
+            weight=105,
             patterns=(
                 r"\bпредставител[ьяюем]*\b.*\bдоверенн?ост[ьи]\b",
                 r"\bдоверенн?ост[ьи]\b.*\bпредставител[ьяюем]*\b",
+                r"\bпредставител[ьяюем]*\b.*\b(?:подать|представить|сдать)\b.*\bдокумент[а-я]*\b",
                 r"\bдокумент[а-я]*\s+представител[ьяюем]*\b",
             ),
+            adds_constraints={"document_focus": "representative"},
+            adds_payload={"document_focus": "representative"},
         ),
         IntentRule(
             code="rejection_direct",

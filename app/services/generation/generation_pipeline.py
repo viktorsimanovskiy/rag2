@@ -418,8 +418,24 @@ class GenerationPipeline:
             evidence_items=evidence_items,
             generation_model_name=None,
             generation_prompt_version="grounded_template_v1",
-            pipeline_version="generation_pipeline_v1",
+            pipeline_version="generation_pipeline_v3_compact_narrative_cleanup",
         )
+
+    def _extract_document_focus(
+        self,
+        payload: GenerationRequest,
+    ) -> Optional[str]:
+        for source in (
+            payload.query_constraints_json or {},
+            payload.routing_payload_json or {},
+            payload.request_metadata_json or {},
+        ):
+            if not isinstance(source, dict):
+                continue
+            value = source.get("document_focus")
+            if isinstance(value, str) and value.strip():
+                return value.strip().lower()
+        return None
 
     def _extract_submission_channel(
         self,
@@ -511,15 +527,23 @@ class GenerationPipeline:
             )
 
             answer_text = None
+            document_focus = self._extract_document_focus(payload)
             if result.can_answer:
-                answer_text = self.table_documents_answer_builder.render_text(
-                    result=result,
-                    submission_channel=submission_channel,
-                )
+                if document_focus == "representative":
+                    answer_text = self.table_documents_answer_builder.render_representative_text(
+                        result=result,
+                        submission_channel=submission_channel,
+                    )
+                else:
+                    answer_text = self.table_documents_answer_builder.render_text(
+                        result=result,
+                        submission_channel=submission_channel,
+                    )
 
             debug_payload = result.debug_payload(
                 submission_channel=submission_channel,
             )
+            debug_payload["document_focus"] = document_focus
             debug_payload["can_answer"] = result.can_answer
 
             return {
@@ -1012,28 +1036,38 @@ class GenerationPipeline:
         elif candidate.source_type == "table_row":
             row = hydrated_objects["rows"].get(candidate.source_id)
             if row is None:
-                return self._normalize_sentence(candidate.snippet)
+                return self._normalize_sentence(
+                    self._clean_answer_point(candidate.snippet, intent_type=intent_type)
+                )
 
             row_summary = str(getattr(row, "row_summary", "") or "").strip()
+            row_summary = self._clean_answer_point(row_summary, intent_type=intent_type)
             if row_summary:
                 return self._normalize_sentence(row_summary)
 
             normalized_row_json = getattr(row, "normalized_row_json", {}) or {}
             if isinstance(normalized_row_json, dict) and normalized_row_json:
-                return self._compact_json_dict(normalized_row_json) + "."
+                compact = self._compact_json_dict(normalized_row_json, intent_type=intent_type)
+                if compact:
+                    return self._normalize_sentence(compact)
 
         elif candidate.source_type == "table":
             table = hydrated_objects["tables"].get(candidate.source_id)
             if table is None:
-                return self._normalize_sentence(candidate.snippet)
+                return self._normalize_sentence(
+                    self._clean_answer_point(candidate.snippet, intent_type=intent_type)
+                )
 
             summary = str(getattr(table, "summary", "") or "").strip()
             title = str(getattr(table, "table_title", "") or "").strip()
 
-            if summary:
-                return self._normalize_sentence(summary)
+            cleaned_summary = self._clean_answer_point(summary, intent_type=intent_type)
+            if cleaned_summary:
+                return self._normalize_sentence(cleaned_summary)
             if title:
-                return f"Найдена релевантная таблица: {title}."
+                return self._normalize_sentence(
+                    self._shorten_text(self._humanize_table_title(title), limit=260)
+                )
 
         elif candidate.source_type == "block":
             block = hydrated_objects["blocks"].get(candidate.source_id)
@@ -1148,6 +1182,7 @@ class GenerationPipeline:
                 ),
             )
 
+        body = self._shorten_text(body, limit=1400) or body
         closing = "Ответ сформирован только по найденным актуальным источникам."
         return f"{intro} {body} {closing}".strip()
 
@@ -1967,23 +2002,191 @@ class GenerationPipeline:
             evidence_items=[],
             generation_model_name=None,
             generation_prompt_version="grounded_template_v1",
-            pipeline_version="generation_pipeline_v1",
+            pipeline_version="generation_pipeline_v3_compact_narrative_cleanup",
         )
 
     def _compact_json_dict(
         self,
         payload: dict[str, Any],
+        *,
+        intent_type: QuestionIntentEnum | None = None,
     ) -> str:
         parts: list[str] = []
         for key, value in payload.items():
             key_text = str(key).strip()
+            if self._is_technical_table_key(key_text):
+                continue
+
             if isinstance(value, list):
-                value_text = ", ".join(str(x) for x in value[:6])
+                value_text = ", ".join(str(x) for x in value[:4])
             else:
                 value_text = str(value).strip()
+
+            value_text = self._clean_answer_point(value_text, intent_type=intent_type)
             if key_text and value_text:
-                parts.append(f"{key_text}: {value_text}")
-        return "; ".join(parts[:4])
+                readable_key = self._humanize_table_key(key_text)
+                if readable_key:
+                    parts.append(f"{readable_key}: {value_text}")
+                else:
+                    parts.append(value_text)
+
+        return "; ".join(parts[:3])
+
+    def _clean_answer_point(
+        self,
+        value: Optional[str],
+        *,
+        intent_type: QuestionIntentEnum | None = None,
+    ) -> Optional[str]:
+        if value is None:
+            return None
+
+        text = " ".join(str(value).strip().split())
+        if not text:
+            return None
+
+        lowered = text.lower().replace("ё", "е")
+
+        # Не отправляем пользователю внутреннюю структуру таблиц. Такие строки
+        # полезны в отладке, но в Telegram выглядят как технический дамп.
+        technical_markers = (
+            "колонки таблицы:",
+            "тип таблицы:",
+            "количество строк:",
+            "n п/п:",
+            "n п п:",
+            "n_п_п",
+            "идентификаторы категорий (признаков) заявителей",
+            "идентификаторы_категорий",
+            "идентификатор_категорий",
+            "наименование_отдельных_признаков",
+            "наименование_значение_признаков",
+            "исчерпывающий перечень документов",
+            "исчерпывающий перечень оснований",
+        )
+        if any(marker in lowered for marker in technical_markers):
+            # Если в тексте после технической шапки есть содержательный кусок,
+            # оставляем только хвост после наиболее частых полей.
+            for separator in ("наименование документа:", "наименование признака заявителя:", "перечень оснований:"):
+                if separator in lowered:
+                    pos = lowered.find(separator) + len(separator)
+                    text = text[pos:].strip(" .;:-")
+                    lowered = text.lower().replace("ё", "е")
+                    break
+            else:
+                return None
+
+        # Убираем повторяющиеся технические подписи колонок в середине строки.
+        cleanup_fragments = (
+            "Таблица:",
+            "Колонки таблицы:",
+            "Тип таблицы:",
+            "Количество строк:",
+            "N п/п:",
+            "N п п:",
+            "Идентификаторы категорий признаков заявителей:",
+            "Идентификатор категорий признаков заявителей:",
+            "Способ подачи в уполномоченное учреждение:",
+            "Способ подачи в уполномоченное учреждение 2:",
+            "Способ подачи в уполномоченное учреждение 3:",
+            "Колонка 7:",
+            "Иные требования количество экземпляров:",
+        )
+        for fragment in cleanup_fragments:
+            text = text.replace(fragment, "")
+
+        text = " ".join(text.split()).strip(" .;:-")
+        if not text:
+            return None
+
+        # Некоторые row_summary приходят из таблиц как технические slug-значения:
+        # "n_п_п", "идентификаторы_категорий", "а_б_в_г", длинные значения с
+        # подчёркиваниями. Для пользователя это мусор, а не grounded-ответ.
+        lowered = text.lower().replace("ё", "е")
+        underscore_tokens = re.findall(r"\b[а-яa-z0-9]+(?:_[а-яa-z0-9]+){1,}\b", lowered)
+        if underscore_tokens:
+            if any(
+                marker in lowered
+                for marker in (
+                    "n_п_п",
+                    "идентификаторы_категорий",
+                    "наименование_отдельных_признаков",
+                    "наименование_значение_признаков",
+                    "принятие_решения",
+                    "предоставлении_компенсации",
+                )
+            ):
+                return None
+
+            # Если подчёркиваний слишком много, строка почти наверняка является
+            # техническим слепком таблицы, а не нормальным текстом.
+            underscore_chars = sum(token.count("_") for token in underscore_tokens)
+            if underscore_chars >= 4:
+                return None
+
+            text = re.sub(r"\b[а-яa-z0-9]+(?:_[а-яa-z0-9]+){1,}\b", " ", text, flags=re.IGNORECASE)
+            text = " ".join(text.split()).strip(" .;:-")
+            if not text:
+                return None
+
+        # Убираем короткие нумерационные хвосты вида "1; ...; результат: а".
+        if re.fullmatch(r"[0-9.;:\sабвгдезийклмнопрстуфхцчшщъыьэюя_-]+", lowered):
+            return None
+
+        return self._shorten_text(text, limit=360)
+
+    def _humanize_table_title(self, value: str) -> str:
+        text = " ".join(str(value or "").split()).strip()
+        if not text:
+            return "Найдена релевантная таблица."
+        lowered = text.lower().replace("ё", "е")
+        if "перечень документов" in lowered:
+            return "В найденной таблице перечислены документы по услуге."
+        if "перечень оснований" in lowered or "основан" in lowered:
+            return "В найденной таблице перечислены основания отказа или приостановления."
+        if "идентификаторы категорий" in lowered or "признак" in lowered:
+            return "В найденной таблице указаны категории заявителей по услуге."
+        return f"Найдена релевантная таблица: {text}."
+
+    def _is_technical_table_key(self, key: str) -> bool:
+        normalized = " ".join(str(key or "").lower().replace("ё", "е").split())
+        if not normalized:
+            return True
+        technical_exact = {
+            "n п/п",
+            "n п п",
+            "номер",
+            "колонка 1",
+            "колонка 2",
+            "колонка 3",
+            "колонка 4",
+            "колонка 5",
+            "колонка 6",
+            "колонка 7",
+            "идентификаторы категорий (признаков) заявителей",
+            "идентификатор категорий (признаков) заявителей",
+            "идентификаторы категорий признаков заявителей",
+            "идентификатор категорий признаков заявителей",
+        }
+        if normalized in technical_exact:
+            return True
+        if normalized.startswith("способ подачи"):
+            return True
+        if normalized.startswith("иные требования"):
+            return True
+        return False
+
+    def _humanize_table_key(self, key: str) -> str:
+        normalized = " ".join(str(key or "").lower().replace("ё", "е").split())
+        if "наименование документа" in normalized:
+            return "документ"
+        if "наименование признака" in normalized or "значение призна" in normalized:
+            return "категория заявителя"
+        if "перечень оснований" in normalized or "основание" in normalized:
+            return "основание"
+        if "результат" in normalized:
+            return "результат"
+        return ""
 
     def _normalize_sentence(
         self,

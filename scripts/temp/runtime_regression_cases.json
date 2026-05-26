@@ -230,7 +230,10 @@
     "forbidden_answer_modes": [
       "safe_no_answer"
     ],
-    "min_selected_candidates": 1
+    "min_selected_candidates": 1,
+    "forbidden_answer_terms_any": [
+      "инваоидам"
+    ]
   },
   {
     "id": "broad_vov_disabled_entitlement",
@@ -256,5 +259,148 @@
       "safe_no_answer"
     ],
     "min_selected_candidates": 1
+  },
+  {
+    "id": "crisis_fuel_money_discovery",
+    "question": "дайте денег на дрова",
+    "intent": "eligibility_question",
+    "description": "Бытовой кризисный запрос должен идти в подбор мер/ТЖС, а не в safe/no-answer или случайный список документов.",
+    "expected_service_resolution_statuses": [
+      "service_discovery"
+    ],
+    "expected_answer_modes": [
+      "grounded_narrative"
+    ],
+    "required_answer_terms_any": [
+      "дров",
+      "отоплен",
+      "материаль",
+      "трудн"
+    ],
+    "expected_auto_intents": [
+      "eligibility_question"
+    ],
+    "expected_requires_service_discovery": true,
+    "forbidden_answer_modes": [
+      "safe_no_answer"
+    ],
+    "min_selected_candidates": 1,
+    "forbidden_answer_terms_any": [
+      "жилищно-коммун",
+      "ЖКУ",
+      "жилье отдельным",
+      "зубопротез",
+      "почётный донор",
+      "почетный донор"
+    ]
+  },
+  {
+    "id": "crisis_food_help_discovery",
+    "question": "мне нечего есть, помогите",
+    "intent": "eligibility_question",
+    "description": "Запрос о еде/первой необходимости должен идти в подбор адресной помощи/ТЖС.",
+    "expected_service_resolution_statuses": [
+      "service_discovery"
+    ],
+    "expected_answer_modes": [
+      "grounded_narrative"
+    ],
+    "required_answer_terms_any": [
+      "еда",
+      "продукт",
+      "материаль",
+      "трудн",
+      "соцобслуж"
+    ],
+    "expected_auto_intents": [
+      "eligibility_question"
+    ],
+    "expected_requires_service_discovery": true,
+    "forbidden_answer_modes": [
+      "safe_no_answer"
+    ],
+    "min_selected_candidates": 1,
+    "forbidden_answer_terms_any": [
+      "санатор",
+      "лагер",
+      "путевк",
+      "жилищно-коммун",
+      "ЖКУ",
+      "утрат имущества",
+      "вред здоровью"
+    ]
+  },
+  {
+    "id": "crisis_school_help_discovery",
+    "question": "помогите собрать ребенка в школу",
+    "intent": "eligibility_question",
+    "description": "Запрос про сбор ребёнка в школу должен идти в подбор мер для школьников/семей с детьми, а не в произвольные документы по ребёнку-инвалиду.",
+    "expected_service_resolution_statuses": [
+      "service_discovery"
+    ],
+    "expected_answer_modes": [
+      "grounded_narrative"
+    ],
+    "required_answer_terms_any": [
+      "ежегодное пособие",
+      "ребенка школьного возраста",
+      "школьн",
+      "социальный контракт",
+      "материаль"
+    ],
+    "expected_auto_intents": [
+      "eligibility_question"
+    ],
+    "expected_requires_service_discovery": true,
+    "forbidden_answer_modes": [
+      "safe_no_answer"
+    ],
+    "min_selected_candidates": 1,
+    "forbidden_answer_terms_any": [
+      "санатор",
+      "лагер",
+      "путевк",
+      "жилищно-коммун",
+      "ЖКУ",
+      "жилье отдельным",
+      "зубопротез",
+      "детском саду",
+      "участника СВО"
+    ]
+  },
+  {
+    "id": "crisis_fire_home_discovery",
+    "question": "сгорел дом, нужна помощь",
+    "intent": "eligibility_question",
+    "description": "Пожар/утрата жилья должны вести в подбор помощи при ЧС/ТЖС, а не в техническую выдачу основания отказа.",
+    "expected_service_resolution_statuses": [
+      "service_discovery"
+    ],
+    "expected_answer_modes": [
+      "grounded_narrative"
+    ],
+    "required_answer_terms_any": [
+      "пожар",
+      "чрезвыч",
+      "утрат",
+      "материаль",
+      "помощ"
+    ],
+    "expected_auto_intents": [
+      "eligibility_question"
+    ],
+    "expected_requires_service_discovery": true,
+    "forbidden_answer_modes": [
+      "safe_no_answer"
+    ],
+    "min_selected_candidates": 1,
+    "forbidden_answer_terms_any": [
+      "политическ репресс",
+      "свидетельств о праве",
+      "почетный донор",
+      "почётный донор",
+      "санатор",
+      "лагер"
+    ]
   }
 ]

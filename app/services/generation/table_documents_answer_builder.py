@@ -165,6 +165,16 @@ class TableDocumentsAnswerBuilder:
                 )
                 continue
 
+            if self._is_noise_or_truncated_document_name(document_name):
+                dropped_rows_debug.append(
+                    {
+                        "row_id": row_id,
+                        "reason": "noise_or_truncated_document_name",
+                        "document_name": document_name,
+                    }
+                )
+                continue
+
             applicant_category_id = self._clean(cells.get("applicant_category_id"))
             submission_note = self._extract_submission_note(
                 cells=cells,
@@ -300,12 +310,48 @@ class TableDocumentsAnswerBuilder:
         if result.category_specific_items:
             lines.append("")
             lines.append("Для отдельных категорий заявителей могут потребоваться дополнительные документы:")
-            for item in result.category_specific_items:
+            visible_items = result.category_specific_items[:5]
+            for item in visible_items:
                 lines.append(self._render_bulleted_item(item, has_channel=has_channel))
+            hidden_count = len(result.category_specific_items) - len(visible_items)
+            if hidden_count > 0:
+                lines.append(f"— ещё {hidden_count} позиций зависят от конкретной категории заявителя.")
 
         lines.append("")
         lines.append("Итоговый перечень зависит от конкретной жизненной ситуации, основания обращения и категории заявителя.")
 
+        return "\n".join(lines)
+
+    def render_representative_text(
+        self,
+        *,
+        result: DocumentsAnswerBuildResult,
+        submission_channel: Optional[str],
+    ) -> Optional[str]:
+        if not result.can_answer:
+            return None
+
+        has_channel = bool(submission_channel)
+        representative_items = result.representative_items
+
+        lines: list[str] = [
+            "В найденном перечне документов предусмотрена подача через представителя.",
+        ]
+
+        if representative_items:
+            lines.append("Если документы подаёт представитель, нужен документ, подтверждающий его полномочия:")
+            for item in representative_items[:3]:
+                lines.append(self._render_bulleted_item(item, has_channel=has_channel))
+        else:
+            lines.append(
+                "В выбранных строках перечня не найден отдельный документ о полномочиях представителя. "
+                "Нужно проверить конкретный пункт регламента по этой услуге."
+            )
+
+        lines.append(
+            "Обычно основной комплект документов заявителя при этом сохраняется; "
+            "отдельно добавляется подтверждение полномочий представителя."
+        )
         return "\n".join(lines)
         
     def _normalize_display_name(
@@ -753,6 +799,22 @@ class TableDocumentsAnswerBuilder:
         if submission_channel == "mfc":
             return self._clean(cells.get("mfc_submission"))
         return None
+
+    def _is_noise_or_truncated_document_name(self, value: str) -> bool:
+        text = self._normalize(value)
+        if not text:
+            return True
+
+        # Частый дефект таблиц: ячейка оборвалась на союзе и в ответ попадало
+        # "сведения о прохождении заявителем и" / "сведения о нахождении заявителя и".
+        if text.endswith((" и", " или", " либо", " а также")):
+            if text.startswith(("сведения о", "документы о", "информация о")):
+                return True
+
+        if len(text.split()) <= 5 and text.startswith("сведения о") and text.endswith("заявителя и"):
+            return True
+
+        return False
 
     def _is_service_value(self, value: str) -> bool:
         text = self._normalize(value)

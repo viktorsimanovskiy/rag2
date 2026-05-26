@@ -676,6 +676,182 @@ def _apply_question_context_adjustments(
         adjusted *= 0.45
         accumulator.match_reasons.append("понижение: вопрос не про зубопротезирование")
 
+    # Разговорные формулировки, где общие слова вроде "ребёнок" или
+    # "выплата" раньше ошибочно тянули к пособию при рождении ребёнка.
+    # Эти правила не подменяют service_registry, а только помогают resolver'у
+    # не путать близкие по словам, но разные по смыслу услуги.
+    service_text = _normalize_text(
+        " ".join(
+            [
+                service_doc.service_name_short,
+                service_doc.service_name_full,
+                " ".join(service_doc.aliases),
+                service_doc.cleaned_filename,
+            ]
+        )
+    )
+
+    war_child_question = (
+        q_has_any({"войн", "переживш", "детств"})
+        and ("ребенок" in question_tokens or "дет" in question_tokens)
+    )
+    if war_child_question:
+        if any(marker in service_text for marker in ("переживш", "войн", "детств")):
+            adjusted += 46.0
+            accumulator.match_reasons.append("усиление: вопрос про граждан, переживших войну в детстве")
+        elif "рожд" in service_tokens or "рожд" in service_text:
+            adjusted *= 0.16
+            accumulator.match_reasons.append("сильное понижение: вопрос про детей войны, услуга про рождение ребёнка")
+
+    svo_child_question = (
+        ("сво" in question_tokens or "военнослужащ" in question_tokens)
+        and q_has_any({"погибш", "умерш", "отец", "родител", "семь"})
+        and question_has_child_context
+    )
+    if svo_child_question:
+        service_has_svo_child = (
+            "сво" in service_tokens
+            or "военнослужащ" in service_tokens
+            or ("погибш" in service_tokens and service_has_child_context)
+        )
+        if service_has_svo_child:
+            adjusted += 48.0
+            accumulator.match_reasons.append("усиление: вопрос про ребёнка погибшего участника СВО/военнослужащего")
+        elif "рожд" in service_tokens or "рожд" in service_text:
+            adjusted *= 0.14
+            accumulator.match_reasons.append("сильное понижение: вопрос про СВО, услуга про рождение ребёнка")
+
+    land_certificate_question = "сертификат" in question_tokens and "земельн" in question_tokens
+    land_use_question = land_certificate_question and any(
+        marker in question_text
+        for marker in ("использ", "распоряд", "потрат", "куп", "строит", "приобрест")
+    )
+    if land_use_question:
+        if "распоряж" in service_text:
+            adjusted += 44.0
+            accumulator.match_reasons.append("усиление: вопрос про распоряжение земельным сертификатом")
+        elif "получен" in service_text or "выдач" in service_text:
+            adjusted *= 0.40
+            accumulator.match_reasons.append("понижение: вопрос про использование сертификата, услуга про выдачу")
+
+    fallen_defender_question = (
+        "погибш" in question_tokens
+        and ("защитник" in question_tokens or "отечеств" in question_tokens)
+        and question_has_child_context
+    )
+    fallen_defender_travel_question = fallen_defender_question and q_has_any(
+        {"проезд", "захоронен", "гибел", "могил"}
+    )
+    if fallen_defender_travel_question:
+        if "проезд" in service_tokens or "проезд" in service_text:
+            adjusted += 42.0
+            accumulator.match_reasons.append("усиление: вопрос про проезд ребёнка погибшего защитника Отечества")
+        elif "статус" in service_tokens or "удостоверен" in service_tokens:
+            adjusted *= 0.50
+            accumulator.match_reasons.append("понижение: вопрос про проезд, услуга про статус/удостоверение")
+    elif fallen_defender_question and q_has_any({"статус", "выплат", "удостоверен"}):
+        if "проезд" in service_tokens or "проезд" in service_text:
+            adjusted *= 0.38
+            accumulator.match_reasons.append("сильное понижение: вопрос про статус/выплаты, услуга про проезд")
+        elif "статус" in service_tokens or "выплат" in service_tokens or "удостоверен" in service_tokens:
+            adjusted += 34.0
+            accumulator.match_reasons.append("усиление: вопрос про статус/выплаты детям погибших защитников Отечества")
+
+    # Простые бытовые формулировки, которые часто не совпадают с
+    # канцелярским названием услуги. Эти правила дают resolver'у
+    # предметный сигнал, но не подменяют registry: усиливаем только те
+    # услуги, где тот же смысл есть в названии/алиасах/файле.
+    dental_question = q_has_any({"зубопротезирование", "стоматологическ", "протез", "зубн"})
+    service_has_dental = s_has_any({"зубопротезирование", "стоматологическ", "протез", "зубн"})
+    if dental_question:
+        if service_has_dental:
+            adjusted += 42.0
+            accumulator.match_reasons.append("усиление: вопрос про зубопротезирование")
+        else:
+            adjusted *= 0.42
+            accumulator.match_reasons.append("понижение: вопрос про зубопротезирование, услуга не про зубы/протезы")
+
+    utility_question = q_has_any({"коммунальн", "жилищн", "квартплат", "жкх", "жку"})
+    service_has_utility = s_has_any({"коммунальн", "жилищн", "квартплат", "жкх", "жку"})
+    if utility_question:
+        if service_has_utility:
+            adjusted += 36.0
+            accumulator.match_reasons.append("усиление: вопрос про жильё/коммунальные услуги")
+        elif q_has_any({"компенсац", "оплат"}):
+            adjusted *= 0.50
+            accumulator.match_reasons.append("понижение: вопрос про ЖКУ, услуга не про жильё/коммунальные услуги")
+
+    burial_question = q_has_any({"погребен", "похорон", "могил", "памятник"})
+    service_has_burial = s_has_any({"погребен", "похорон", "могил", "памятник"})
+    if burial_question:
+        if service_has_burial:
+            adjusted += 40.0
+            accumulator.match_reasons.append("усиление: вопрос про погребение/памятник/могилу")
+        else:
+            adjusted *= 0.48
+            accumulator.match_reasons.append("понижение: вопрос про погребение/могилу, услуга не про это")
+
+    matcap_question = q_has_any({"материнск", "семейн", "капитал"})
+    service_has_matcap = s_has_any({"материнск", "семейн", "капитал"})
+    if matcap_question:
+        if service_has_matcap:
+            adjusted += 38.0
+            accumulator.match_reasons.append("усиление: вопрос про материнский/семейный капитал")
+        elif "земельн" in service_tokens and "сертификат" in service_tokens:
+            adjusted *= 0.42
+            accumulator.match_reasons.append("понижение: вопрос про маткапитал, услуга про земельный сертификат")
+
+    child_garden_question = question_has_child_context and q_has_any({"сад", "дошкольн"})
+    service_has_child_garden = service_has_child_context and s_has_any({"сад", "дошкольн"})
+    if child_garden_question:
+        if service_has_child_garden:
+            adjusted += 34.0
+            accumulator.match_reasons.append("усиление: вопрос про место в детском саду")
+        elif "школьн" in service_tokens:
+            adjusted *= 0.50
+            accumulator.match_reasons.append("понижение: вопрос про детский сад, услуга про школу")
+
+    camp_question = question_has_child_context and q_has_any({"лагерь", "оздоровительн"})
+    service_has_camp = service_has_child_context and s_has_any({"лагерь", "оздоровительн"})
+    if camp_question:
+        if service_has_camp:
+            adjusted += 38.0
+            accumulator.match_reasons.append("усиление: вопрос про детский оздоровительный лагерь")
+        elif "санаторн" in service_tokens and "курортн" in service_tokens:
+            adjusted *= 0.72
+            accumulator.match_reasons.append("понижение: вопрос про лагерь, услуга про санаторно-курортное лечение")
+
+    emergency_question = q_has_any({"чрезвычайн", "ситуац", "пожар", "утрат", "имущество", "травм"})
+    service_has_emergency = s_has_any({"чрезвычайн", "ситуац", "пожар", "утрат", "имущество", "вред", "здоров"})
+    if emergency_question and q_has_any({"чрезвычайн", "пожар", "утрат", "имущество", "травм"}):
+        if service_has_emergency:
+            adjusted += 36.0
+            accumulator.match_reasons.append("усиление: вопрос про ЧС/утрату имущества/вред здоровью")
+        elif not tjs_question:
+            adjusted *= 0.55
+            accumulator.match_reasons.append("понижение: вопрос про ЧС, услуга не про ЧС")
+
+    social_service_question = q_has_any({"социальн", "обслуживан", "соцработник", "уход", "быт"})
+    service_has_social_service = s_has_any({"социальн", "обслуживан", "соцработник", "уход", "быт"})
+    if social_service_question and q_has_any({"соцработник", "обслуживан", "уход"}):
+        if service_has_social_service:
+            adjusted += 34.0
+            accumulator.match_reasons.append("усиление: вопрос про социальное обслуживание/уход")
+        elif "выплат" in service_tokens or "компенсац" in service_tokens:
+            adjusted *= 0.70
+            accumulator.match_reasons.append("понижение: вопрос про уход/обслуживание, услуга про выплату/компенсацию")
+
+    computer_question = q_has_any({"компьютер", "дистанционн", "обучен"})
+    service_has_computer = s_has_any({"компьютер"})
+    if computer_question and "компьютер" in question_tokens:
+        if service_has_computer:
+            adjusted += 42.0
+            accumulator.match_reasons.append("усиление: вопрос про компьютер для инвалида")
+        elif "обучен" in service_tokens and "вождени" in service_tokens:
+            adjusted *= 0.55
+            accumulator.match_reasons.append("понижение: вопрос про компьютер, услуга про обучение вождению")
+
+
     # Чисто общий вопрос «ЕДВ» без уточняющих признаков лучше оставить
     # неоднозначным: таких услуг в корпусе несколько.
     if question_tokens == {"едв"} and "едв" in service_tokens:
@@ -724,10 +900,61 @@ def _choose_resolution_status(
         return "resolved", first
 
     second = candidates[1]
-    if second.score >= 45.0 and (first.score - second.score) < ambiguity_margin:
+    score_gap = first.score - second.score
+
+    # Раньше resolver слишком часто оставлял статус ambiguous даже когда
+    # первый кандидат имел 96-100 баллов и точное совпадение с длинным alias /
+    # коротким названием. В таком режиме retrieval не получал service_key и
+    # generation смешивал таблицы нескольких услуг. Оставляем осторожность для
+    # настоящих близких случаев, но закрепляем услугу при сильном предметном
+    # сигнале.
+    first_specificity = _candidate_specificity_score(first)
+    second_specificity = _candidate_specificity_score(second)
+    strong_exact_signal = _has_strong_exact_resolution_signal(first)
+
+    if strong_exact_signal:
+        if first.score >= 96.0 and score_gap >= 3.0:
+            return "resolved", first
+        if first.score >= 90.0 and score_gap >= 5.0:
+            return "resolved", first
+        if first.score >= 86.0 and score_gap >= 8.0:
+            return "resolved", first
+        if first.score >= 80.0 and score_gap >= 12.0:
+            return "resolved", first
+        if first.score >= 88.0 and first_specificity > second_specificity + 2.5:
+            return "resolved", first
+
+    if second.score >= 45.0 and score_gap < ambiguity_margin:
         return "ambiguous", None
 
     return "resolved", first
+
+
+def _has_strong_exact_resolution_signal(candidate: ServiceCandidate) -> bool:
+    if not any("точное совпадение" in reason for reason in candidate.match_reasons):
+        return False
+
+    for alias in candidate.matched_aliases:
+        tokens = _extract_tokens(alias)
+        if len(tokens) >= 3:
+            return True
+
+    service_tokens = _extract_tokens(candidate.service_name_short)
+    matched_specific = set(candidate.matched_terms).intersection(service_tokens)
+    return len(matched_specific) >= 3
+
+
+def _candidate_specificity_score(candidate: ServiceCandidate) -> float:
+    score = 0.0
+    score += min(8.0, len(candidate.matched_terms) * 1.1)
+    score += min(10.0, len(candidate.matched_aliases) * 2.5)
+    for alias in candidate.matched_aliases:
+        score += min(8.0, len(_extract_tokens(alias)) * 0.8)
+    if any("точное совпадение фразы" in reason for reason in candidate.match_reasons):
+        score += 4.0
+    if any("точное совпадение токенов" in reason for reason in candidate.match_reasons):
+        score += 2.0
+    return score
 
 
 def _confidence_from_score(score: float) -> str:
@@ -873,11 +1100,59 @@ _TOKEN_RE = re.compile(r"[а-яa-z0-9]+(?:[.,][0-9]+)?", re.IGNORECASE)
 def _normalize_text(value: str | None) -> str:
     if value is None:
         return ""
+
     text = str(value).lower().replace("ё", "е")
+    text = _expand_common_user_phrases(text)
     text = text.replace("\u00a0", " ")
     text = re.sub(r"[\"'«»„“”`]+", " ", text)
     text = re.sub(r"[^0-9a-zа-я.,]+", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _expand_common_user_phrases(value: str) -> str:
+    """
+    Expand common citizen wording before tokenization.
+
+    This is intentionally small and deterministic. It does not try to solve
+    morphology; it only bridges high-value everyday phrases with the wording
+    used in service_registry aliases and service names.
+    """
+    text = f" {value} "
+
+    replacements = (
+        (r"\bжкх\b", " жилищно коммунальные услуги "),
+        (r"\bжку\b", " жилищно коммунальные услуги "),
+        (r"\bкоммуналк[аеиуой]*\b", " жилищно коммунальные услуги "),
+        (r"\bквартплат[аеиуой]*\b", " оплата жилого помещения коммунальные услуги "),
+        (r"\bматкапитал[а-я]*\b", " материнский семейный капитал "),
+        (r"\bсадик[а-я]*\b", " детский сад "),
+        (r"\bдетсад[а-я]*\b", " детский сад "),
+        (r"\bавтошкол[аеиуой]*\b", " обучение вождению "),
+        (r"\bпохорон[а-я]*\b", " погребение "),
+        (r"\bпохороны\b", " погребение "),
+        (r"\bпамятник[а-я]*\b", " памятник благоустройство могил "),
+        (r"\bзубн[а-я]*\s+протез[а-я]*\b", " зубопротезирование стоматологические протезы "),
+        (r"\bзубопротез[а-я]*\b", " зубопротезирование стоматологические протезы "),
+        (r"\bделать\s+зуб[а-я]*\b", " зубопротезирование стоматологические протезы "),
+        (r"\bлечить\s+зуб[а-я]*\b", " зубопротезирование стоматологические протезы "),
+        (r"\bпечк[аеиуой]*\b", " печное отопление "),
+        (r"\bпроводк[аеиуой]*\b", " электропроводка "),
+        (r"\bтопить\b", " печное отопление "),
+        (r"\bтоплени[ея]\b", " печное отопление "),
+        (r"\bсоцработник[а-я]*\b", " социальное обслуживание "),
+        (r"\bсоцобслуживани[а-я]*\b", " социальное обслуживание "),
+        (r"\bчс\b", " чрезвычайная ситуация "),
+        (r"\bтср\b", " технические средства реабилитации "),
+        (r"\bчаэс\b", " чернобыльская аэс "),
+        (r"\bчернобыл[а-я]*\b", " чернобыльская аэс "),
+        (r"\bлагер[ьяеюям]*\b", " оздоровительный лагерь "),
+        (r"\bгемодиализ[а-я]*\b", " гемодиализ "),
+    )
+
+    for pattern, replacement in replacements:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
     return text
 
 

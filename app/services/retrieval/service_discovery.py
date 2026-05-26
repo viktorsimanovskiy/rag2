@@ -27,7 +27,7 @@ from app.services.retrieval.applicant_category_taxonomy import (
 )
 
 
-SERVICE_DISCOVERY_VERSION = "service_discovery_v3_row_filtering"
+SERVICE_DISCOVERY_VERSION = "service_discovery_v7_school_noise_filter"
 
 
 # ============================================================
@@ -50,6 +50,22 @@ class ApplicantSignal:
     matched_question_patterns: list[str]
     evidence_terms: list[str]
     weight: float
+
+
+@dataclass(slots=True)
+class ServiceDiscoveryProfile:
+    """
+    Narrowing profile for broad service discovery.
+
+    The profile is not a legal concept. It only helps keep demo answers
+    focused when the user's wording clearly describes a practical crisis
+    such as food, fuel, school expenses or fire.
+    """
+
+    code: str
+    label: str
+    max_services: int = 7
+    max_rows_per_service: int = 3
 
 
 @dataclass(slots=True)
@@ -142,6 +158,7 @@ class ServiceDiscovery:
         question_text = payload.question_text_normalized or payload.question_text_raw
         normalized_question = normalize_text(question_text)
         signals = self._extract_signals(normalized_question)
+        profile = self._build_discovery_profile(normalized_question, signals)
 
         if not signals:
             return self._build_no_signal_result(normalized_question)
@@ -152,12 +169,14 @@ class ServiceDiscovery:
             normalized_question=normalized_question,
             signals=signals,
             min_score=payload.min_score,
+            profile=profile,
         )
 
         candidates = self._group_rows_by_service(
             matched_rows,
-            max_services=payload.max_services,
-            max_rows_per_service=payload.max_rows_per_service,
+            max_services=min(payload.max_services, profile.max_services),
+            max_rows_per_service=min(payload.max_rows_per_service, profile.max_rows_per_service),
+            profile=profile,
         )
 
         if not candidates:
@@ -168,7 +187,7 @@ class ServiceDiscovery:
             )
 
         citations = self._build_citations(candidates)
-        answer_text = self._render_answer(candidates=candidates, signals=signals)
+        answer_text = self._render_answer(candidates=candidates, signals=signals, profile=profile)
         answer_text_short = _shorten(answer_text, limit=420)
 
         return ServiceDiscoveryResult(
@@ -188,6 +207,12 @@ class ServiceDiscovery:
                 "scanned_identifier_rows_count": len(rows),
                 "matched_identifier_rows_count": len(matched_rows),
                 "selected_services_count": len(candidates),
+                "profile": {
+                    "code": profile.code,
+                    "label": profile.label,
+                    "max_services": profile.max_services,
+                    "max_rows_per_service": profile.max_rows_per_service,
+                },
             },
             citations_json=citations,
         )
@@ -261,6 +286,7 @@ class ServiceDiscovery:
         normalized_question: str,
         signals: list[ApplicantSignal],
         min_score: float,
+        profile: ServiceDiscoveryProfile,
     ) -> list[ServiceDiscoveryMatchedRow]:
         question_terms = extract_meaningful_terms(normalized_question)
         scored_rows: list[ServiceDiscoveryMatchedRow] = []
@@ -334,10 +360,9 @@ class ServiceDiscovery:
                 score += min(2.5, len(set(lexical_matches)) * 0.35)
                 matched_terms.extend(lexical_matches)
 
-            territorial_context = normalize_text(
+            service_context = normalize_text(
                 " ".join(
                     [
-                        row_text,
                         str(row.get("service_name_short") or ""),
                         str(row.get("service_name_full") or ""),
                         str(row.get("document_name") or ""),
@@ -345,10 +370,30 @@ class ServiceDiscovery:
                     ]
                 )
             )
-            score = self._apply_territorial_penalty(
-                score=score,
-                row_text=territorial_context,
+
+            service_context_bonus = self._score_service_context_for_signals(
+                service_context=service_context,
                 normalized_question=normalized_question,
+                signals=signals,
+                matched_signal_codes=matched_signal_codes,
+                matched_signal_labels=matched_signal_labels,
+                matched_terms=matched_terms,
+            )
+            score += service_context_bonus
+
+            penalty_context = normalize_text(" ".join([row_text, service_context]))
+            score = self._apply_context_penalties(
+                score=score,
+                row_text=penalty_context,
+                normalized_question=normalized_question,
+            )
+
+            score = self._apply_profile_score_adjustments(
+                score=score,
+                row_text=penalty_context,
+                service_context=service_context,
+                profile=profile,
+                matched_terms=matched_terms,
             )
 
             if score < min_score:
@@ -390,6 +435,7 @@ class ServiceDiscovery:
         *,
         max_services: int,
         max_rows_per_service: int,
+        profile: ServiceDiscoveryProfile,
     ) -> list[ServiceDiscoveryCandidate]:
         grouped: dict[str, list[ServiceDiscoveryMatchedRow]] = {}
         for row in rows:
@@ -434,8 +480,82 @@ class ServiceDiscovery:
                 )
             )
 
-        candidates.sort(key=lambda item: (-item.score, item.service_name_short or ""))
+        candidates = self._apply_profile_candidate_priority(candidates, profile)
+        candidates = self._filter_candidates_by_profile(candidates, profile)
+        candidates = self._apply_profile_candidate_priority(candidates, profile)
         return candidates[:max_services]
+
+    def _apply_profile_candidate_priority(
+        self,
+        candidates: list[ServiceDiscoveryCandidate],
+        profile: ServiceDiscoveryProfile,
+    ) -> list[ServiceDiscoveryCandidate]:
+        if profile.code == "general" or not candidates:
+            candidates.sort(key=lambda item: (-item.score, item.service_name_short or ""))
+            return candidates
+
+        prioritized: list[tuple[float, ServiceDiscoveryCandidate]] = []
+        for candidate in candidates:
+            bonus = self._profile_candidate_priority_bonus(candidate, profile)
+            if bonus:
+                candidate.score = round(candidate.score + bonus, 4)
+            prioritized.append((bonus, candidate))
+
+        prioritized.sort(key=lambda pair: (-pair[1].score, pair[1].service_name_short or ""))
+        return [candidate for _, candidate in prioritized]
+
+    @staticmethod
+    def _profile_candidate_priority_bonus(
+        candidate: ServiceDiscoveryCandidate,
+        profile: ServiceDiscoveryProfile,
+    ) -> float:
+        context = normalize_text(
+            " ".join(
+                [
+                    candidate.service_name_short or "",
+                    candidate.service_name_full or "",
+                    candidate.document_name or "",
+                    candidate.original_filename or "",
+                    " ".join(candidate.matched_terms),
+                ]
+            )
+        )
+
+        if profile.code == "school_need":
+            # Прямой школьный вопрос должен в первую очередь показывать
+            # профильную услугу, даже если таблица identifiers в этой услуге
+            # описывает заявителей через многодетность/инвалидность родителей,
+            # а не повторяет слово «школа».
+            if ("ежегодн пособ" in context and "школьн" in context) or "пособие школьникам" in context:
+                return 12.0
+            if "ребенк школьн" in context or "ребенка школьн" in context or "школьн возраст" in context:
+                return 9.0
+            if "социальн контракт" in context:
+                return 4.0
+            if "материальн помощ" in context or "трудн жизненн" in context:
+                return 3.4
+            if "соцобслужив" in context:
+                return 1.2
+
+        if profile.code == "food_need":
+            if "материальн помощ" in context or "трудн жизненн" in context:
+                return 3.0
+            if "социальн контракт" in context:
+                return 2.2
+
+        if profile.code == "fuel_need":
+            if any(term in context for term in ("печн отоплен", "дров", "топлив")):
+                return 4.5
+            if "материальн помощ" in context or "трудн жизненн" in context:
+                return 2.4
+
+        if profile.code == "emergency_fire":
+            if any(term in context for term in ("утрат имущества", "вред здоров", "чрезвычайн", "чс")):
+                return 3.8
+            if "материальн помощ" in context or "трудн жизненн" in context:
+                return 2.2
+
+        return 0.0
 
     def _build_search_text(
         self,
@@ -507,8 +627,449 @@ class ServiceDiscovery:
 
         return False
 
+
+    def _build_discovery_profile(
+        self,
+        normalized_question: str,
+        signals: list[ApplicantSignal],
+    ) -> ServiceDiscoveryProfile:
+        """
+        Select a narrowing profile for broad service discovery.
+
+        This is intentionally conservative: profiles only narrow obviously
+        practical crisis questions. General entitlement questions still use
+        the regular broad behaviour.
+        """
+        signal_codes = {signal.code for signal in signals}
+        question = normalize_text(normalized_question)
+
+        if "emergency_victim" in signal_codes or "пожар" in question or "сгорел" in question:
+            return ServiceDiscoveryProfile(
+                code="emergency_fire",
+                label="пожар, ЧС или утрата имущества",
+                max_services=5,
+                max_rows_per_service=2,
+            )
+        if "fuel_need" in signal_codes:
+            return ServiceDiscoveryProfile(
+                code="fuel_need",
+                label="дрова, топливо или отопление",
+                max_services=4,
+                max_rows_per_service=1,
+            )
+        if "food_need" in signal_codes:
+            return ServiceDiscoveryProfile(
+                code="food_need",
+                label="еда, продукты или предметы первой необходимости",
+                max_services=4,
+                max_rows_per_service=1,
+            )
+        if "school_need" in signal_codes or ("школ" in question and "реб" in question):
+            return ServiceDiscoveryProfile(
+                code="school_need",
+                label="подготовка ребёнка к школе",
+                max_services=4,
+                max_rows_per_service=1,
+            )
+        if "honorary_donor" in signal_codes:
+            return ServiceDiscoveryProfile(
+                code="honorary_donor",
+                label="почётный донор",
+                max_services=3,
+                max_rows_per_service=2,
+            )
+        if signal_codes & {"vov_participant", "vov_disabled"}:
+            return ServiceDiscoveryProfile(
+                code="vov_status",
+                label="статус участника или инвалида ВОВ",
+                max_services=6,
+                max_rows_per_service=2,
+            )
+        return ServiceDiscoveryProfile(code="general", label="общий подбор мер")
+
     @staticmethod
-    def _apply_territorial_penalty(
+    def _apply_profile_score_adjustments(
+        *,
+        score: float,
+        row_text: str,
+        service_context: str,
+        profile: ServiceDiscoveryProfile,
+        matched_terms: list[str],
+    ) -> float:
+        if profile.code == "general":
+            return score
+
+        context = normalize_text(service_context)
+        combined = normalize_text(" ".join([row_text, context]))
+
+        preferred_terms: dict[str, tuple[str, ...]] = {
+            "fuel_need": (
+                "ремонт печн",
+                "печн отоплен",
+                "электропроводк",
+                "дров",
+                "топлив",
+                "отоплен",
+                "материальн помощ",
+                "трудн жизненн",
+                "социальн контракт",
+            ),
+            "food_need": (
+                "материальн помощ",
+                "трудн жизненн",
+                "адресн социальн помощ",
+                "социальн контракт",
+                "соцобслужив",
+                "нуждающимся в соцобслужив",
+            ),
+            "school_need": (
+                "школ",
+                "школьн",
+                "ежегодн пособ",
+                "ребенк школьн",
+                "социальн контракт",
+                "материальн помощ",
+                "трудн жизненн",
+            ),
+            "emergency_fire": (
+                "чрезвычайн",
+                "чс",
+                "пострадавш",
+                "утрат имущества",
+                "вред здоров",
+                "пожар",
+                "материальн помощ",
+                "трудн жизненн",
+            ),
+            "honorary_donor": (
+                "донор",
+                "почетн донор",
+                "ежегодн денежн выплат",
+                "льготн проезд",
+            ),
+            "vov_status": (
+                "вов",
+                "велик отечественн",
+                "зубопротез",
+                "жку",
+                "проезд",
+                "побед",
+                "жилье ветеранам",
+                "ремонт ветеранам",
+                "тревожн кнопк",
+            ),
+        }
+        negative_terms: dict[str, tuple[str, ...]] = {
+            "fuel_need": (
+                "жилье отдельным",
+                "жилищно коммунальн",
+                "жку",
+                "погибш",
+                "санаторн",
+                "лагер",
+                "зубопротез",
+                "донор",
+            ),
+            "food_need": (
+                "санаторн",
+                "лагер",
+                "путевк",
+                "чрезвычайн",
+                "погибш",
+                "вред здоров",
+                "утрат имущества",
+                "жилищно коммунальн",
+                "жку",
+                "жилье отдельным",
+            ),
+            "school_need": (
+                "санаторн",
+                "лагер",
+                "путевк",
+                "жилищно коммунальн",
+                "жку",
+                "жилье отдельным",
+                "чрезвычайн",
+                "погибш",
+                "зубопротез",
+            ),
+            "emergency_fire": (
+                "политическ репресс",
+                "свидетельств о праве",
+                "почетн донор",
+                "зубопротез",
+                "санаторн",
+                "лагер",
+            ),
+        }
+
+        hits = [term for term in preferred_terms.get(profile.code, ()) if term in context or term in combined]
+        if hits:
+            matched_terms.extend(hits)
+            score += min(4.5, 1.4 + len(set(hits)) * 0.7)
+
+        bad_hits = [term for term in negative_terms.get(profile.code, ()) if term in context]
+        if bad_hits:
+            score = max(0.0, score - min(5.5, 2.6 + len(set(bad_hits)) * 0.9))
+
+        # A low-income child category inside sanatorium/camp services is not
+        # enough evidence for an urgent food or school-expense request.
+        if profile.code in {"food_need", "school_need"} and any(term in context for term in ("санаторн", "лагер", "путевк")):
+            score = max(0.0, score - 4.0)
+
+        # For a fire/house loss, generic social service may be relevant but
+        # should not outrank direct emergency payments.
+        if profile.code == "emergency_fire" and "соцобслужив" in context:
+            score = max(0.0, score - 1.8)
+
+        return score
+
+    def _filter_candidates_by_profile(
+        self,
+        candidates: list[ServiceDiscoveryCandidate],
+        profile: ServiceDiscoveryProfile,
+    ) -> list[ServiceDiscoveryCandidate]:
+        if profile.code == "general" or not candidates:
+            return candidates
+
+        filtered = [candidate for candidate in candidates if not self._is_candidate_noise_for_profile(candidate, profile)]
+        if not filtered:
+            return candidates
+
+        # For practical crisis questions it is better to return fewer focused
+        # directions than a long list with obviously unrelated benefits.
+        if profile.code in {"fuel_need", "food_need", "school_need", "emergency_fire"}:
+            return filtered
+
+        # For status questions keep the original list if filtering would hide
+        # too much potentially relevant support.
+        if len(filtered) >= 2:
+            return filtered
+        return candidates
+
+    @staticmethod
+    def _is_candidate_noise_for_profile(
+        candidate: ServiceDiscoveryCandidate,
+        profile: ServiceDiscoveryProfile,
+    ) -> bool:
+        service_context = normalize_text(
+            " ".join(
+                [
+                    candidate.service_name_short or "",
+                    candidate.service_name_full or "",
+                    candidate.document_name or "",
+                    candidate.original_filename or "",
+                ]
+            )
+        )
+        terms_context = normalize_text(" ".join(candidate.matched_terms))
+        context = normalize_text(" ".join([service_context, terms_context]))
+
+        if profile.code == "fuel_need":
+            if any(term in service_context for term in ("жилищно коммунальн", "жку", "жилье отдельным", "погибш", "зубопротез", "донор")):
+                return not any(term in context for term in ("печн", "отоплен", "дров", "топлив", "материальн помощ", "трудн жизненн"))
+            return False
+
+        if profile.code == "food_need":
+            return any(
+                term in service_context
+                for term in (
+                    "санаторн",
+                    "лагер",
+                    "путевк",
+                    "чрезвычайн",
+                    "погибш",
+                    "вред здоров",
+                    "утрат имущества",
+                    "жилищно коммунальн",
+                    "жку",
+                    "жилье отдельным",
+                )
+            )
+
+        if profile.code == "school_need":
+            # Жёстко отсекаем дошкольные и СВО-специфичные услуги.
+            # Важно смотреть именно на название/документ услуги, а не на
+            # matched_terms: туда могут попасть школьные слова из вопроса,
+            # из-за чего шумная услуга ошибочно считается школьной.
+            has_kindergarten_context = (
+                ("дет" in service_context and "сад" in service_context)
+                or "дошколь" in service_context
+                or "не предоставлено место" in service_context
+            )
+            has_svo_context = (
+                "сво" in service_context
+                or "специальн военн" in service_context
+                or "участник" in service_context and "военн" in service_context
+            )
+            if has_kindergarten_context or has_svo_context:
+                return True
+
+            if "школ" in service_context or "школь" in service_context:
+                return False
+            if "социальн контракт" in service_context or "материальн помощ" in service_context or "трудн жизненн" in service_context:
+                return False
+            # Общие детские/семейные услуги без школьной, адресной или
+            # контрактной привязки для запроса «собрать ребёнка в школу»
+            # лучше не показывать в демо-ответе.
+            if any(term in service_context for term in ("ребен", "семь", "родител")):
+                return True
+            return any(
+                term in service_context
+                for term in (
+                    "санаторн",
+                    "лагер",
+                    "путевк",
+                    "жилищно коммунальн",
+                    "жку",
+                    "жилье отдельным",
+                    "чрезвычайн",
+                    "погибш",
+                    "зубопротез",
+                )
+            )
+
+        if profile.code == "emergency_fire":
+            return any(
+                term in service_context
+                for term in (
+                    "политическ репресс",
+                    "свидетельств о праве",
+                    "почетн донор",
+                    "зубопротез",
+                    "санаторн",
+                    "лагер",
+                )
+            )
+
+        return False
+
+    def _score_service_context_for_signals(
+        self,
+        *,
+        service_context: str,
+        normalized_question: str,
+        signals: list[ApplicantSignal],
+        matched_signal_codes: list[str],
+        matched_signal_labels: list[str],
+        matched_terms: list[str],
+    ) -> float:
+        """
+        Даёт ограниченный бонус по названию услуги только для узких жизненных
+        ситуаций. Основной подбор по-прежнему идёт по таблицам identifiers.
+
+        Это нужно для вопросов вроде "нечего есть", "дрова", "сгорел дом",
+        где конкретная цель помощи часто отражена в названии услуги/регламента,
+        а не в названии категории заявителя.
+        """
+        bonus = 0.0
+
+        for signal in signals:
+            matched_terms_for_signal = self._service_context_terms_for_signal(
+                signal_code=signal.code,
+                service_context=service_context,
+                normalized_question=normalized_question,
+            )
+            if not matched_terms_for_signal:
+                continue
+
+            if signal.code not in matched_signal_codes:
+                matched_signal_codes.append(signal.code)
+            if signal.label not in matched_signal_labels:
+                matched_signal_labels.append(signal.label)
+            matched_terms.extend(matched_terms_for_signal)
+            bonus += self._service_context_bonus_for_signal(signal.code)
+
+        return bonus
+
+    @staticmethod
+    def _service_context_terms_for_signal(
+        *,
+        signal_code: str,
+        service_context: str,
+        normalized_question: str,
+    ) -> list[str]:
+        context = normalize_text(service_context)
+        question = normalize_text(normalized_question)
+
+        signal_terms: dict[str, tuple[str, ...]] = {
+            "emergency_victim": (
+                "чрезвычайн",
+                "чс",
+                "пострадавш",
+                "стихийн",
+                "пожар",
+                "бедств",
+            ),
+            "hardship": (
+                "трудн жизненн",
+                "тжс",
+                "адресн материальн",
+                "материальн помощ",
+                "единовременн адресн",
+            ),
+            "food_need": (
+                "трудн жизненн",
+                "тжс",
+                "адресн материальн",
+                "материальн помощ",
+                "малоимущ",
+            ),
+            "fuel_need": (
+                "дров",
+                "угол",
+                "топлив",
+                "печн отоплен",
+                "отоплен",
+                "трудн жизненн",
+                "тжс",
+                "адресн материальн",
+            ),
+            "school_need": (
+                "школьн возраст",
+                "ребенк школьн",
+                "ребенка школьн",
+                "пособие на ребенк школьн",
+                "ежегодн пособ",
+                "школьн выплат",
+                "компенсац проезд",
+            ),
+            "low_income": (
+                "адресн социальн помощ",
+                "адресн материальн",
+                "малоимущ",
+                "социальн помощ",
+            ),
+        }
+
+        terms = signal_terms.get(signal_code)
+        if not terms:
+            return []
+
+        matched = [term for term in terms if term in context]
+
+        # Пожар в пользовательском вопросе должен особенно уверенно вести к
+        # помощи при ЧС/пожаре или ТЖС, даже если в категории стоит общий текст.
+        if signal_code == "emergency_victim" and "пожар" in question:
+            if "трудн жизненн" in context or "адресн материальн" in context:
+                matched.append("пожар / адресная материальная помощь")
+
+        return _stable_unique(matched)
+
+    @staticmethod
+    def _service_context_bonus_for_signal(signal_code: str) -> float:
+        bonuses = {
+            "emergency_victim": 3.4,
+            "hardship": 2.9,
+            "food_need": 2.7,
+            "fuel_need": 3.0,
+            "school_need": 3.1,
+            "low_income": 1.8,
+        }
+        return bonuses.get(signal_code, 0.0)
+
+    @staticmethod
+    def _apply_context_penalties(
         *,
         score: float,
         row_text: str,
@@ -518,7 +1079,14 @@ class ServiceDiscovery:
         question_mentions_territory = any(term in normalized_question for term in territorial_terms)
         row_mentions_territory = any(term in row_text for term in territorial_terms)
         if row_mentions_territory and not question_mentions_territory:
-            return max(0.0, score - 2.5)
+            score = max(0.0, score - 2.5)
+
+        memorial_terms = ("могил", "памятник", "надгроб", "погреб", "похорон")
+        question_mentions_memorial = any(term in normalized_question for term in memorial_terms)
+        row_mentions_memorial = any(term in row_text for term in memorial_terms)
+        if row_mentions_memorial and not question_mentions_memorial:
+            score = max(0.0, score - 4.0)
+
         return score
 
     @staticmethod
@@ -601,41 +1169,131 @@ class ServiceDiscovery:
         *,
         candidates: list[ServiceDiscoveryCandidate],
         signals: list[ApplicantSignal],
+        profile: ServiceDiscoveryProfile,
     ) -> str:
         signal_labels = ", ".join(signal.label for signal in signals)
-        lines: list[str] = [
-            "По указанным признакам я нашёл несколько мер, которые могут быть релевантны. "
-            "Это не означает, что право на них уже подтверждено: для точного вывода нужно проверить условия конкретной услуги по НПА.",
-        ]
+        signal_codes = {signal.code for signal in signals}
+
+        profile_intro = self._build_profile_intro(profile)
+        if profile_intro:
+            lines: list[str] = [profile_intro]
+        elif signal_codes & {"hardship", "food_need", "fuel_need", "school_need", "emergency_victim"}:
+            lines = [
+                "По описанной ситуации я нашёл несколько направлений помощи, которые стоит проверить. "
+                "Это не означает, что право уже подтверждено: условия нужно сверить по конкретной услуге и документам.",
+            ]
+        else:
+            lines = [
+                "По указанным признакам я нашёл несколько мер, которые могут быть релевантны. "
+                "Это не означает, что право на них уже подтверждено: для точного вывода нужно проверить условия конкретной услуги по НПА.",
+            ]
 
         if signal_labels:
             lines.append(f"Учтённые признаки из вопроса: {signal_labels}.")
 
         lines.append("Возможные направления для проверки:")
 
+        max_fragments = 1 if profile.code != "general" else 2
         for index, candidate in enumerate(candidates, start=1):
-            service_name = candidate.service_name_short or candidate.service_name_full or candidate.service_key
-            matched_labels = ", ".join(candidate.matched_signal_labels[:5])
-            row_fragments = self._render_candidate_row_fragments(candidate)
+            raw_service_name = candidate.service_name_short or candidate.service_name_full or candidate.service_key
+            service_name = _shorten(self._clean_service_display_name(raw_service_name), limit=170)
+            matched_labels = ", ".join(candidate.matched_signal_labels[:4])
+            row_fragments = self._render_candidate_row_fragments(candidate, max_fragments=max_fragments)
 
             line = f"{index}. {service_name}"
             if matched_labels:
                 line += f" — совпавшие признаки: {matched_labels}"
             if row_fragments:
-                line += f". В таблице категорий заявителей найдено: {row_fragments}"
+                if profile.code == "general":
+                    line += f". В таблице категорий заявителей найдено: {row_fragments}"
+                else:
+                    line += f". Категория для проверки: {row_fragments}"
             line += "."
             lines.append(line)
 
-        lines.append(
+        lines.append(self._build_clarification_hint(signal_codes))
+        return "\n".join(lines)
+
+
+    @staticmethod
+    def _build_profile_intro(profile: ServiceDiscoveryProfile) -> Optional[str]:
+        if profile.code == "fuel_need":
+            return (
+                "По вопросу о дровах, топливе или отоплении в первую очередь стоит проверить адресную материальную помощь, "
+                "помощь в трудной жизненной ситуации и специальные меры, связанные с печным отоплением. "
+                "Право на выплату нужно подтверждать условиями конкретной услуги и документами."
+            )
+        if profile.code == "food_need":
+            return (
+                "По вопросу о еде или предметах первой необходимости в первую очередь стоит проверить адресную материальную помощь, "
+                "помощь в трудной жизненной ситуации, соцобслуживание и социальный контракт. "
+                "Сам факт обращения ещё не подтверждает право на меру — нужны условия и документы по конкретной услуге."
+            )
+        if profile.code == "school_need":
+            return (
+                "По вопросу подготовки ребёнка к школе стоит проверить меры для семей с детьми, адресную помощь, "
+                "социальный контракт и специальные школьные выплаты, если они применимы к семье. "
+                "Точное право зависит от состава семьи, возраста ребёнка, дохода и подтверждённых статусов."
+            )
+        if profile.code == "emergency_fire":
+            return (
+                "По ситуации с пожаром, ЧС или утратой имущества в первую очередь стоит проверить материальную помощь пострадавшим, "
+                "выплаты при утрате имущества или вреде здоровью, а также помощь в трудной жизненной ситуации. "
+                "Точное право зависит от подтверждения события, места проживания и вида утраченного имущества."
+            )
+        return None
+
+    @staticmethod
+    def _clean_service_display_name(value: Optional[str]) -> str:
+        text = " ".join(str(value or "").strip().split())
+        replacements = {
+            "инваоидам": "инвалидам",
+            "Инваоидам": "Инвалидам",
+            "Проверка выплата": "Выплата",
+            "проверка выплата": "выплата",
+        }
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+        return text
+
+    @staticmethod
+    def _build_clarification_hint(signal_codes: set[str]) -> str:
+        if signal_codes & {"hardship", "food_need", "fuel_need", "emergency_victim"}:
+            return (
+                "Что нужно уточнить для точного ответа: где проживает заявитель, что именно произошло, "
+                "какая помощь уже предоставлялась в текущем году, есть ли подтверждающие документы и какой вид помощи нужен. "
+                "После уточнения можно проверять конкретную услугу отдельно."
+            )
+
+        if signal_codes & {"school_need", "family_with_children", "large_family", "single_parent"}:
+            return (
+                "Что нужно уточнить для точного ответа: состав семьи, возраст детей, место жительства, доход, "
+                "подтверждённые статусы семьи и цель обращения. После уточнения можно проверять каждую меру отдельно."
+            )
+
+        if signal_codes & {
+            "honorary_donor",
+            "vov_participant",
+            "vov_disabled",
+            "labor_veteran",
+            "regional_labor_veteran",
+            "combat_veteran",
+            "rehabilitated",
+        }:
+            return (
+                "Что нужно уточнить для точного ответа: подтверждённый статус, место жительства, возраст, "
+                "цель обращения и не получалась ли аналогичная мера ранее. После уточнения можно проверять каждую меру отдельно."
+            )
+
+        return (
             "Что нужно уточнить для точного ответа: состав семьи, возраст детей, место жительства, доход, "
             "наличие подтверждённых статусов и цель обращения. После уточнения можно проверять каждую меру отдельно."
         )
-        return "\n".join(lines)
 
     @staticmethod
-    def _render_candidate_row_fragments(candidate: ServiceDiscoveryCandidate) -> str:
+    def _render_candidate_row_fragments(candidate: ServiceDiscoveryCandidate, *, max_fragments: int = 2) -> str:
         fragments: list[str] = []
-        for row in candidate.matched_rows[:2]:
+        for row in candidate.matched_rows[:max_fragments]:
             category = row.applicant_category_name
             if not category and row.row_summary and not _looks_like_identifier_table_header(row.row_summary):
                 category = row.row_summary
@@ -646,7 +1304,7 @@ class ServiceDiscovery:
                 fragments.append(f"{row.applicant_category_id} — {category}")
             else:
                 fragments.append(category)
-        return "; ".join(fragments[:2])
+        return "; ".join(fragments[:max_fragments])
 
     def _build_citations(self, candidates: list[ServiceDiscoveryCandidate]) -> list[dict[str, Any]]:
         citations: list[dict[str, Any]] = []
