@@ -193,6 +193,7 @@ def extract_row(report: dict[str, Any], *, run_index: int, warmup: bool) -> dict
     answer_payload = dig(debug, ["answer_payload_json"], {}) or {}
     debug_payload = dig(debug, ["debug_payload_json"], {}) or {}
     orchestrator_timings = debug_payload.get("orchestrator_timings_sec") or {}
+    session_details = orchestrator_timings.get("session_resolution_details") or {}
 
     runtime_timings = answer_payload.get("runtime_answer_service_timings") or {}
     runtime_payload = answer_payload.get("runtime_answer_service_runtime_payload") or {}
@@ -252,6 +253,11 @@ def extract_row(report: dict[str, Any], *, run_index: int, warmup: bool) -> dict
         "orchestrator_unaccounted_sec": round(max(orchestrator_total - orchestrator_known, 0.0), 6),
         "orchestrator_validate_input_sec": as_float(orchestrator_timings.get("validate_input_sec")),
         "orchestrator_resolve_or_create_session_sec": as_float(orchestrator_timings.get("resolve_or_create_session_sec")),
+        "session_channel_lookup_sec": as_float(session_details.get("channel_lookup_sec")),
+        "session_lookup_sec": as_float(session_details.get("session_lookup_sec")),
+        "session_commit_refresh_sec": as_float(session_details.get("commit_refresh_sec")),
+        "session_created": session_details.get("session_created"),
+        "session_existing_fast_path": session_details.get("existing_session_fast_path"),
         "orchestrator_build_question_routing_sec": as_float(orchestrator_timings.get("build_question_routing_sec")),
         "orchestrator_create_question_event_sec": as_float(orchestrator_timings.get("create_question_event_sec")),
         "orchestrator_reuse_gate_sec": as_float(orchestrator_timings.get("reuse_gate_sec")),
@@ -314,6 +320,9 @@ def build_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     overhead = [as_float(r.get("http_overhead_or_persistence_sec")) for r in measured]
     orchestrator_total = [as_float(r.get("orchestrator_total_sec")) for r in measured]
     orchestrator_routing = [as_float(r.get("orchestrator_build_question_routing_sec")) for r in measured]
+    session_channel_lookup = [as_float(r.get("session_channel_lookup_sec")) for r in measured]
+    session_lookup = [as_float(r.get("session_lookup_sec")) for r in measured]
+    session_commit_refresh = [as_float(r.get("session_commit_refresh_sec")) for r in measured]
     orchestrator_persist = [as_float(r.get("orchestrator_persist_generated_answer_event_sec")) for r in measured]
     orchestrator_http_overhead = [as_float(r.get("orchestrator_http_overhead_sec")) for r in measured]
 
@@ -325,6 +334,9 @@ def build_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "elapsed_max_sec": round(max(elapsed), 6) if elapsed else 0.0,
         "orchestrator_total_avg_sec": round(statistics.mean(orchestrator_total), 6) if orchestrator_total else 0.0,
         "orchestrator_build_question_routing_avg_sec": round(statistics.mean(orchestrator_routing), 6) if orchestrator_routing else 0.0,
+        "session_channel_lookup_avg_sec": round(statistics.mean(session_channel_lookup), 6) if session_channel_lookup else 0.0,
+        "session_lookup_avg_sec": round(statistics.mean(session_lookup), 6) if session_lookup else 0.0,
+        "session_commit_refresh_avg_sec": round(statistics.mean(session_commit_refresh), 6) if session_commit_refresh else 0.0,
         "orchestrator_persist_generated_answer_event_avg_sec": round(statistics.mean(orchestrator_persist), 6) if orchestrator_persist else 0.0,
         "orchestrator_http_overhead_avg_sec": round(statistics.mean(orchestrator_http_overhead), 6) if orchestrator_http_overhead else 0.0,
         "retrieval_avg_sec": round(statistics.mean(retrieval), 6) if retrieval else 0.0,
@@ -354,6 +366,9 @@ def write_summary_md(path: Path, summary: dict[str, Any], rows: list[dict[str, A
         "",
         f"- orchestrator_total: {summary.get('orchestrator_total_avg_sec', 0.0)} сек.",
         f"- orchestrator_build_question_routing: {summary.get('orchestrator_build_question_routing_avg_sec', 0.0)} сек.",
+        f"- session_channel_lookup: {summary.get('session_channel_lookup_avg_sec', 0.0)} сек.",
+        f"- session_lookup: {summary.get('session_lookup_avg_sec', 0.0)} сек.",
+        f"- session_commit_refresh: {summary.get('session_commit_refresh_avg_sec', 0.0)} сек.",
         f"- orchestrator_persist_generated_answer_event: {summary.get('orchestrator_persist_generated_answer_event_avg_sec', 0.0)} сек.",
         f"- orchestrator_http_overhead: {summary.get('orchestrator_http_overhead_avg_sec', 0.0)} сек.",
         f"- service_resolution: {summary['service_resolution_avg_sec']} сек.",
@@ -368,6 +383,9 @@ def write_summary_md(path: Path, summary: dict[str, Any], rows: list[dict[str, A
         lines.append(
             f"- {row['elapsed_seconds']} сек. | orchestrator={row.get('orchestrator_total_sec')} | "
             f"routing={row.get('orchestrator_build_question_routing_sec')} | "
+            f"session={row.get('orchestrator_resolve_or_create_session_sec')} "
+            f"(lookup={row.get('session_lookup_sec')}, commit={row.get('session_commit_refresh_sec')}, "
+            f"fast={row.get('session_existing_fast_path')}) | "
             f"persist={row.get('orchestrator_persist_generated_answer_event_sec')} | "
             f"retrieval={row['retrieval_sec']} | resolver={row['service_resolution_sec']} | "
             f"generation={row['generation_sec']} | http_overhead={row.get('orchestrator_http_overhead_sec')} | "

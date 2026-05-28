@@ -189,6 +189,8 @@ class AnswerOrchestrator:
     Central service that coordinates question processing end-to-end.
     """
 
+    _CHANNEL_ID_CACHE: dict[str, UUID] = {}
+
     def __init__(
         self,
         db: AsyncSession,
@@ -250,6 +252,9 @@ class AnswerOrchestrator:
         started = measure_start()
         session = await self._resolve_or_create_session(payload)
         measure_stop("resolve_or_create_session_sec", started)
+        session_resolution_timings = getattr(self, "_last_session_resolution_timings", None)
+        if isinstance(session_resolution_timings, dict):
+            timings["session_resolution_details"] = session_resolution_timings
 
         started = measure_start()
         routing = await self._build_question_routing(
@@ -399,40 +404,63 @@ class AnswerOrchestrator:
         self,
         payload: UserQuestionInput,
     ) -> ConversationSession:
-        channel = await self._get_channel_or_raise(payload.channel_code)
+        """Resolve or create conversation session.
 
+        Hot-path note:
+        Previously every existing session was updated, committed and refreshed
+        before the actual answer was built. On the VPS this added roughly 5-7
+        seconds per Telegram/n8n request. For the live bot path we only need a
+        stable session id, so existing sessions now use a read-only fast path.
+
+        New sessions are still committed and refreshed normally.
+        """
+        total_started_at = time.perf_counter()
+        details: dict[str, Any] = {
+            "version": "step65_session_fast_path_v1",
+            "session_created": False,
+            "existing_session_fast_path": False,
+        }
+
+        started_at = time.perf_counter()
+        channel_id = await self._get_channel_id_or_raise(payload.channel_code)
+        details["channel_lookup_sec"] = round(time.perf_counter() - started_at, 6)
+
+        started_at = time.perf_counter()
         stmt: Select[Any] = select(ConversationSession).where(
-            ConversationSession.channel_id == channel.channel_id,
+            ConversationSession.channel_id == channel_id,
             ConversationSession.external_session_id == payload.external_session_id,
         )
         result = await self.db.execute(stmt)
         session = result.scalar_one_or_none()
+        details["session_lookup_sec"] = round(time.perf_counter() - started_at, 6)
 
-        if session is None:
-            session = ConversationSession(
-                session_id=uuid4(),
-                channel_id=channel.channel_id,
-                external_session_id=payload.external_session_id,
-                external_user_id=payload.external_user_id,
-                external_chat_id=payload.external_chat_id,
-                user_platform_name=payload.user_platform_name,
-                metadata_json={
-                    "created_by": "answer_orchestrator",
-                    "initial_request_metadata": payload.request_metadata_json,
-                },
-            )
-            self.db.add(session)
-            await self.db.commit()
-            await self.db.refresh(session)
+        if session is not None:
+            details["existing_session_fast_path"] = True
+            details["commit_refresh_sec"] = 0.0
+            details["total_sec"] = round(time.perf_counter() - total_started_at, 6)
+            self._last_session_resolution_timings = details
             return session
 
-        session.external_user_id = payload.external_user_id
-        session.external_chat_id = payload.external_chat_id
-        session.user_platform_name = payload.user_platform_name
-        session.session_last_activity_at = self._utcnow()
-
+        started_at = time.perf_counter()
+        session = ConversationSession(
+            session_id=uuid4(),
+            channel_id=channel_id,
+            external_session_id=payload.external_session_id,
+            external_user_id=payload.external_user_id,
+            external_chat_id=payload.external_chat_id,
+            user_platform_name=payload.user_platform_name,
+            metadata_json={
+                "created_by": "answer_orchestrator",
+                "initial_request_metadata": payload.request_metadata_json,
+            },
+        )
+        self.db.add(session)
         await self.db.commit()
         await self.db.refresh(session)
+        details["commit_refresh_sec"] = round(time.perf_counter() - started_at, 6)
+        details["session_created"] = True
+        details["total_sec"] = round(time.perf_counter() - total_started_at, 6)
+        self._last_session_resolution_timings = details
         return session
 
     # --------------------------------------------------------
@@ -802,6 +830,24 @@ class AnswerOrchestrator:
 
         if len(payload.question_text) > 10000:
             raise OrchestratorValidationError("question_text is too long.")
+
+    async def _get_channel_id_or_raise(
+        self,
+        channel_code: ChannelTypeEnum,
+    ) -> UUID:
+        cache_key = channel_code.value if isinstance(channel_code, ChannelTypeEnum) else str(channel_code)
+        cached = self._CHANNEL_ID_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        stmt: Select[Any] = select(Channel.channel_id).where(Channel.channel_code == channel_code)
+        result = await self.db.execute(stmt)
+        channel_id = result.scalar_one_or_none()
+        if channel_id is None:
+            raise OrchestratorNotFoundError(f"Channel not found: {channel_code}")
+
+        self._CHANNEL_ID_CACHE[cache_key] = channel_id
+        return channel_id
 
     async def _get_channel_or_raise(
         self,
