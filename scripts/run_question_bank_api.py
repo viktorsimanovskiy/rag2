@@ -1063,6 +1063,7 @@ def write_analysis(out_dir: Path, analysis: dict[str, Any], rows: list[dict[str,
     write_selected_cases(out_dir / "long_answers.tsv", rows, lambda row: bool(set(row_flags(row)) & {"answer_very_long", "answer_extremely_long"}))
     write_selected_cases(out_dir / "technical_table_dump.tsv", rows, lambda row: "answer_technical_table_dump" in row_flags(row))
     write_selected_cases(out_dir / "resolved_other_service.tsv", rows, lambda row: "resolver_resolved_other_service" in row_flags(row))
+    write_missing_alias_suggestions_tsv(out_dir / "missing_alias_suggestions.tsv", rows)
 
 
 def analysis_without_rows(analysis: dict[str, Any]) -> dict[str, Any]:
@@ -1147,6 +1148,7 @@ def write_summary_md(path: Path, analysis: dict[str, Any]) -> None:
     lines.append("- `long_answers.tsv` — слишком длинные ответы.")
     lines.append("- `technical_table_dump.tsv` — технические табличные дампы.")
     lines.append("- `resolved_other_service.tsv` — случаи выбора другой услуги.")
+    lines.append("- `missing_alias_suggestions.tsv` — подсказки, какие слова можно добавить в алиасы услуги или общий словарь живого языка.")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -1329,6 +1331,116 @@ def write_selected_cases(path: Path, rows: list[dict[str, Any]], predicate) -> N
     selected = [row for row in rows if predicate(row)]
     selected = sorted(selected, key=case_sort_key)
     write_issues_tsv(path, selected)
+
+
+def write_missing_alias_suggestions_tsv(path: Path, rows: list[dict[str, Any]]) -> None:
+    headers = [
+        "question_id",
+        "service_index",
+        "expected_service_name_short",
+        "category",
+        "question_text",
+        "issue_flags",
+        "resolver_status",
+        "top_candidate_name",
+        "top_candidate_score",
+        "expected_candidate_rank",
+        "suggested_service_aliases",
+        "suggested_runtime_vocabulary_terms",
+        "where_to_edit",
+    ]
+    problem_flags = {
+        "resolver_not_found",
+        "resolver_no_candidates",
+        "resolver_ambiguous_expected_top1",
+        "resolver_ambiguous_expected_in_candidates",
+        "resolver_ambiguous_expected_not_in_candidates",
+        "resolver_resolved_other_service",
+        "answer_safe_no_answer",
+        "answer_target_not_mentioned",
+    }
+    with path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=headers, delimiter="\t", lineterminator="\n")
+        writer.writeheader()
+        for row in rows:
+            flags = set(row_flags(row))
+            if not flags.intersection(problem_flags):
+                continue
+            suggestions = suggest_alias_terms(row)
+            runtime_terms = [term for term in suggestions if normalize_text(term) in _RUNTIME_VOCABULARY_HINTS]
+            if not suggestions and not runtime_terms:
+                continue
+            diagnostics = row.get("diagnostics") or {}
+            writer.writerow({
+                "question_id": row.get("question_id"),
+                "service_index": row.get("service_index"),
+                "expected_service_name_short": row.get("service_name_short"),
+                "category": row.get("category"),
+                "question_text": row.get("question_text"),
+                "issue_flags": "; ".join(row_flags(row)),
+                "resolver_status": diagnostics.get("resolver_status"),
+                "top_candidate_name": diagnostics.get("top_candidate_name"),
+                "top_candidate_score": diagnostics.get("top_candidate_score"),
+                "expected_candidate_rank": diagnostics.get("expected_candidate_rank"),
+                "suggested_service_aliases": "; ".join(suggestions),
+                "suggested_runtime_vocabulary_terms": "; ".join(runtime_terms),
+                "where_to_edit": choose_alias_edit_target(runtime_terms),
+            })
+
+
+_RUNTIME_VOCABULARY_HINTS = {
+    "коммуналка", "жкх", "жку", "квартплата", "садик", "детсад", "маткапитал",
+    "автошкола", "похороны", "памятник", "зуб", "зубы", "зубные", "протезы",
+    "печка", "дрова", "чс", "тжс", "тср", "чаэс", "чернобыль", "донор", "доноры",
+    "соцработник", "гемодиализ", "лагерь", "затопило", "сгорел", "холодильник",
+}
+
+
+def suggest_alias_terms(row: dict[str, Any]) -> list[str]:
+    question_text = str(row.get("question_text") or "")
+    existing_blob = normalize_text(" ".join([
+        str(row.get("aliases_hint") or ""),
+        str(row.get("service_name_short") or ""),
+        str(row.get("service_name_full") or ""),
+        str(row.get("expected_service_hint") or ""),
+    ]))
+
+    words = re.findall(r"[0-9a-zа-я]+", question_text.casefold().replace("ё", "е"))
+    normalized_words = [word for word in words if len(word) >= 4 and word not in _EVAL_ALIAS_GENERIC_WORDS]
+    suggestions: list[str] = []
+
+    for word in normalized_words:
+        if normalize_text(word) not in existing_blob:
+            suggestions.append(word)
+
+    for size in (3, 2):
+        for index in range(0, max(0, len(words) - size + 1)):
+            phrase_words = words[index:index + size]
+            if any(word in _EVAL_ALIAS_GENERIC_WORDS for word in phrase_words):
+                continue
+            phrase = " ".join(phrase_words)
+            phrase_norm = normalize_text(phrase)
+            if len(phrase_norm) < 8:
+                continue
+            if phrase_norm not in existing_blob:
+                suggestions.append(phrase)
+
+    return unique(suggestions)[:8]
+
+
+_EVAL_ALIAS_GENERIC_WORDS = {
+    "можно", "получить", "оформить", "положено", "положена", "положены", "помощь",
+    "помогите", "какие", "какой", "какая", "нужно", "надо", "соцзащита", "заявление",
+    "документы", "документ", "выплата", "выплаты", "компенсация", "пособие", "услуга",
+    "есть", "куда", "обращаться", "если", "меня", "хочу", "могу", "могут", "почему",
+    "нужна", "нужен", "нужны", "самому", "самой", "тяжело", "соцзащиты", "соцзащиту",
+}
+
+
+def choose_alias_edit_target(runtime_terms: list[str]) -> str:
+    if runtime_terms:
+        return "проверить оба места: общие слова — app/config/runtime_vocabulary.json; алиасы услуги — Актуальный_приказ5.xlsx"
+    return "Актуальный_приказ5.xlsx / колонка 'Ключевые слова / алиасы'"
 
 
 def resolver_problem_filter(row: dict[str, Any]) -> bool:

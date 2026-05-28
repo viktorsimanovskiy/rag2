@@ -13,8 +13,11 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
+from functools import lru_cache
+from pathlib import Path
 from time import perf_counter
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -231,6 +234,7 @@ class ServiceResolver:
             debug_payload_json={
                 "normalized_question": question_text,
                 "question_tokens": sorted(question_tokens),
+                "runtime_vocabulary": _runtime_vocabulary_debug(),
                 "active_services_count": len(service_docs),
                 "index_cache_hit": index_cache_hit,
                 "min_resolved_score": payload.min_resolved_score,
@@ -1114,13 +1118,119 @@ def _expand_common_user_phrases(value: str) -> str:
     """
     Expand common citizen wording before tokenization.
 
-    This is intentionally small and deterministic. It does not try to solve
-    morphology; it only bridges high-value everyday phrases with the wording
-    used in service_registry aliases and service names.
+    The data lives in app/config/runtime_vocabulary.json. This keeps generic
+    living-language vocabulary outside Python code. Service-specific aliases
+    still belong to ServiceRegistry.aliases_json, imported from
+    Актуальный_приказ5.xlsx.
     """
     text = f" {value} "
 
-    replacements = (
+    for pattern, replacement in _runtime_phrase_expansions():
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+
+    return text
+
+
+@dataclass(slots=True, frozen=True)
+class _RuntimeVocabulary:
+    version: str
+    source_path: str
+    phrase_expansions: tuple[tuple[str, str], ...]
+    errors: tuple[str, ...] = ()
+
+
+def _runtime_vocabulary_path() -> Path:
+    # app/services/retrieval/service_resolver.py -> app/config/runtime_vocabulary.json
+    return Path(__file__).resolve().parents[2] / "config" / "runtime_vocabulary.json"
+
+
+@lru_cache(maxsize=1)
+def _load_runtime_vocabulary() -> _RuntimeVocabulary:
+    path = _runtime_vocabulary_path()
+    fallback = _fallback_runtime_phrase_expansions()
+
+    if not path.exists():
+        return _RuntimeVocabulary(
+            version="fallback_missing_runtime_vocabulary_json",
+            source_path=str(path),
+            phrase_expansions=fallback,
+            errors=("runtime_vocabulary.json not found; fallback dictionary is used",),
+        )
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # pragma: no cover - defensive production guard
+        return _RuntimeVocabulary(
+            version="fallback_invalid_runtime_vocabulary_json",
+            source_path=str(path),
+            phrase_expansions=fallback,
+            errors=(f"cannot read runtime_vocabulary.json: {exc}",),
+        )
+
+    raw_items = data.get("phrase_expansions") if isinstance(data, dict) else None
+    if not isinstance(raw_items, list):
+        return _RuntimeVocabulary(
+            version=str(data.get("version") or "fallback_no_phrase_expansions") if isinstance(data, dict) else "fallback_bad_shape",
+            source_path=str(path),
+            phrase_expansions=fallback,
+            errors=("runtime_vocabulary.json has no list field phrase_expansions; fallback dictionary is used",),
+        )
+
+    result: list[tuple[str, str]] = []
+    errors: list[str] = []
+
+    for index, item in enumerate(raw_items, start=1):
+        if not isinstance(item, dict):
+            errors.append(f"phrase_expansions[{index}] is not an object")
+            continue
+
+        replacement = str(item.get("expansion") or item.get("replacement") or "").strip()
+        patterns = item.get("patterns")
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        if not replacement or not isinstance(patterns, list):
+            errors.append(f"phrase_expansions[{index}] has no expansion or patterns")
+            continue
+
+        for pattern in patterns:
+            pattern_text = str(pattern or "").strip()
+            if not pattern_text:
+                continue
+            try:
+                re.compile(pattern_text)
+            except re.error as exc:
+                errors.append(f"bad regex in phrase_expansions[{index}]: {pattern_text!r}: {exc}")
+                continue
+            result.append((pattern_text, f" {replacement} "))
+
+    if not result:
+        result = list(fallback)
+        errors.append("runtime_vocabulary.json produced no valid expansions; fallback dictionary is used")
+
+    return _RuntimeVocabulary(
+        version=str(data.get("version") or "runtime_vocabulary_json") if isinstance(data, dict) else "runtime_vocabulary_json",
+        source_path=str(path),
+        phrase_expansions=tuple(result),
+        errors=tuple(errors),
+    )
+
+
+def _runtime_phrase_expansions() -> tuple[tuple[str, str], ...]:
+    return _load_runtime_vocabulary().phrase_expansions
+
+
+def _runtime_vocabulary_debug() -> dict[str, Any]:
+    vocabulary = _load_runtime_vocabulary()
+    return {
+        "version": vocabulary.version,
+        "source_path": vocabulary.source_path,
+        "phrase_expansions_count": len(vocabulary.phrase_expansions),
+        "errors": list(vocabulary.errors),
+    }
+
+
+def _fallback_runtime_phrase_expansions() -> tuple[tuple[str, str], ...]:
+    return (
         (r"\bжкх\b", " жилищно коммунальные услуги "),
         (r"\bжку\b", " жилищно коммунальные услуги "),
         (r"\bкоммуналк[аеиуой]*\b", " жилищно коммунальные услуги "),
@@ -1134,7 +1244,7 @@ def _expand_common_user_phrases(value: str) -> str:
         (r"\bпамятник[а-я]*\b", " памятник благоустройство могил "),
         (r"\bзубн[а-я]*\s+протез[а-я]*\b", " зубопротезирование стоматологические протезы "),
         (r"\bзубопротез[а-я]*\b", " зубопротезирование стоматологические протезы "),
-        (r"\bделать\s+зуб[а-я]*\b", " зубопротезирование стоматологические протезы "),
+        (r"\b(?:делать|сделать|вставить|поставить)\s+зуб[а-я]*\b", " зубопротезирование стоматологические протезы "),
         (r"\bлечить\s+зуб[а-я]*\b", " зубопротезирование стоматологические протезы "),
         (r"\bпечк[аеиуой]*\b", " печное отопление "),
         (r"\bпроводк[аеиуой]*\b", " электропроводка "),
@@ -1149,12 +1259,6 @@ def _expand_common_user_phrases(value: str) -> str:
         (r"\bлагер[ьяеюям]*\b", " оздоровительный лагерь "),
         (r"\bгемодиализ[а-я]*\b", " гемодиализ "),
     )
-
-    for pattern, replacement in replacements:
-        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
-
-    return text
-
 
 def _extract_tokens(value: str) -> set[str]:
     tokens: set[str] = set()

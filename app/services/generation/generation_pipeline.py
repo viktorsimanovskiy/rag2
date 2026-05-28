@@ -283,7 +283,7 @@ class GenerationPipeline:
             )
 
         stage_started_at = perf_counter()
-        documents_answer_payload = self._prepare_documents_table_answer(
+        documents_answer_payload = await self._prepare_documents_table_answer(
             payload=payload,
             evidence_package=evidence_package,
         )
@@ -419,7 +419,7 @@ class GenerationPipeline:
             evidence_items=evidence_items,
             generation_model_name=None,
             generation_prompt_version="grounded_template_v1",
-            pipeline_version="generation_pipeline_v3_compact_narrative_cleanup",
+            pipeline_version="generation_pipeline_v5_compact_documents_mode",
         )
 
     def _extract_document_focus(
@@ -463,17 +463,152 @@ class GenerationPipeline:
 
         return None
 
-    def _wants_full_documents_list(self, question_text: str) -> bool:
-        normalized = " ".join(str(question_text or "").lower().split())
+    def _wants_strict_full_documents_list(self, question_text: str) -> bool:
+        """True only when the user explicitly asks for the full regulatory list.
+
+        Ordinary phrases like "какие документы нужны" or "список документов"
+        should produce a compact human list, not a full table dump.
+        """
+        normalized = " ".join(str(question_text or "").lower().replace("ё", "е").split())
         markers = (
             "полный перечень",
             "исчерпывающий перечень",
             "весь перечень",
             "все документы",
             "полный список",
+            "весь список",
+            "весь комплект",
+            "полный комплект",
             "по строкам таблицы",
+            "как в регламенте",
+            "полностью по регламенту",
         )
         return any(marker in normalized for marker in markers)
+
+    def _wants_document_list_from_full_table(
+        self,
+        question_text: str,
+        *,
+        submission_channel: Optional[str] = None,
+    ) -> bool:
+        """True when retrieval top-N is too narrow for a document answer.
+
+        Explicit list/package wording always needs the whole documents table and
+        compact rendering.  Ordinary "какие документы нужны" can stay focused on
+        retrieval rows, except when the user also names a submission channel
+        (МФЦ/ЕПГУ/РПГУ/лично/почта). In that case users expect a clean package
+        for the chosen channel, not several most similar fragments.
+        """
+        normalized = " ".join(str(question_text or "").lower().replace("ё", "е").split())
+        explicit_list_markers = (
+            "список документов",
+            "перечень документов",
+            "комплект документов",
+            "пакет документов",
+            "что надо принести",
+            "что нужно принести",
+            "что собрать",
+            "что подготовить",
+        )
+        if any(marker in normalized for marker in explicit_list_markers):
+            return True
+
+        has_channel = bool(submission_channel) or any(
+            marker in normalized
+            for marker in (
+                "через мфц",
+                "в мфц",
+                "через епгу",
+                "на епгу",
+                "через госуслуги",
+                "через рпгу",
+                "через региональный портал",
+                "через краевой портал",
+                "лично",
+                "на личном приеме",
+                "по почте",
+                "почтой",
+            )
+        )
+        if has_channel and any(
+            marker in normalized
+            for marker in (
+                "какие документы",
+                "какой документ",
+                "документы нужны",
+                "документы понадоб",
+                "что из документов",
+            )
+        ):
+            return True
+
+        return False
+
+    def _wants_document_submission_form_details(self, question_text: str) -> bool:
+        """Return True only when the user asks about the form of documents.
+
+        Mentioning a channel (МФЦ/ЕПГУ/лично) is not enough: for ordinary
+        questions like "какие документы нужны через МФЦ" we show only the list
+        of documents.  Form details are shown only for explicit questions about
+        originals, copies, scans, electronic images/documents, upload/attachment,
+        or the form in which papers must be submitted.
+        """
+        normalized = " ".join(str(question_text or "").lower().replace("ё", "е").split())
+        markers = (
+            "оригинал",
+            "подлинник",
+            "копия",
+            "копии",
+            "скан",
+            "сканы",
+            "электронный образ",
+            "электронного образа",
+            "электронном виде",
+            "электронный документ",
+            "электронного документа",
+            "форма документа",
+            "форме документа",
+            "в какой форме",
+            "каком виде",
+            "в каком виде",
+            "что загрузить",
+            "что загружать",
+            "что приложить",
+            "что прикрепить",
+            "загрузить на епгу",
+            "прикрепить на епгу",
+            "прикладывать скан",
+            "заверенная копия",
+            "заверенные копии",
+            "сверяется с подлинником",
+        )
+        return any(marker in normalized for marker in markers)
+
+    def _is_document_form_details_question(self, question_text: str) -> bool:
+        """True when a non-documents intent still asks about document form.
+
+        The intent classifier can route questions like "в какой форме подавать
+        документы" as FORM/PROCEDURE.  They still belong to the documents table,
+        because the answer must come from channel/form columns, not from a free
+        narrative block.
+        """
+        normalized = " ".join(str(question_text or "").lower().replace("ё", "е").split())
+        if not self._wants_document_submission_form_details(normalized):
+            return False
+        return any(
+            marker in normalized
+            for marker in (
+                "документ",
+                "заявлен",
+                "справк",
+                "копи",
+                "оригинал",
+                "подлинник",
+                "скан",
+                "электронный образ",
+                "электронный документ",
+            )
+        )
 
     def _infer_submission_channel_from_question(
         self,
@@ -499,18 +634,25 @@ class GenerationPipeline:
 
         return None
 
-    def _prepare_documents_table_answer(
+    async def _prepare_documents_table_answer(
             self,
             *,
             payload: GenerationRequest,
             evidence_package: EvidencePackage,
         ) -> dict[str, Any]:
-            if payload.intent_type != QuestionIntentEnum.DOCUMENTS_QUESTION:
+            question_text_for_document_mode = payload.question_text_normalized or payload.question_text_raw
+            document_form_details_question = self._is_document_form_details_question(
+                question_text_for_document_mode
+            )
+            if (
+                payload.intent_type != QuestionIntentEnum.DOCUMENTS_QUESTION
+                and not document_form_details_question
+            ):
                 return {
                     "answer_text": None,
                     "debug": {
                         "skipped": True,
-                        "reason": "not_documents_question",
+                        "reason": "not_documents_or_document_form_question",
                     },
                 }
 
@@ -519,12 +661,36 @@ class GenerationPipeline:
                 evidence_package=evidence_package,
             )
 
-            result = self.table_documents_answer_builder.build(
-                candidates=evidence_package.selected_candidates or [],
+            strict_full_list_mode = self._wants_strict_full_documents_list(
+                question_text_for_document_mode
+            )
+            include_submission_form_details = self._wants_document_submission_form_details(
+                question_text_for_document_mode
+            )
+            list_from_full_table_mode = self._wants_document_list_from_full_table(
+                question_text_for_document_mode,
                 submission_channel=submission_channel,
-                full_list_mode=self._wants_full_documents_list(
-                    payload.question_text_normalized or payload.question_text_raw
-                ),
+            )
+
+            # For document-list questions we hydrate the whole documents table from
+            # the resolved NPA, not only retrieval top-N rows. Rendering is compact
+            # by default and detailed only for explicit full-list/form questions.
+            full_table_mode = (
+                strict_full_list_mode
+                or include_submission_form_details
+                or list_from_full_table_mode
+            )
+
+            document_candidates = evidence_package.selected_candidates or []
+            if full_table_mode:
+                document_candidates = await self._expand_document_table_candidates_for_full_list(
+                    candidates=document_candidates,
+                )
+
+            result = self.table_documents_answer_builder.build(
+                candidates=document_candidates,
+                submission_channel=submission_channel,
+                full_list_mode=full_table_mode,
             )
 
             answer_text = None
@@ -534,23 +700,148 @@ class GenerationPipeline:
                     answer_text = self.table_documents_answer_builder.render_representative_text(
                         result=result,
                         submission_channel=submission_channel,
+                        include_submission_form_details=include_submission_form_details,
                     )
                 else:
                     answer_text = self.table_documents_answer_builder.render_text(
                         result=result,
                         submission_channel=submission_channel,
+                        include_submission_form_details=include_submission_form_details,
+                        compact_full_list=full_table_mode and not strict_full_list_mode,
                     )
 
             debug_payload = result.debug_payload(
                 submission_channel=submission_channel,
             )
             debug_payload["document_focus"] = document_focus
+            debug_payload["include_submission_form_details"] = include_submission_form_details
+            debug_payload["document_form_details_question"] = document_form_details_question
+            debug_payload["strict_full_list_mode"] = strict_full_list_mode
+            debug_payload["list_from_full_table_mode"] = list_from_full_table_mode
+            debug_payload["full_table_mode"] = full_table_mode
             debug_payload["can_answer"] = result.can_answer
 
             return {
                 "answer_text": answer_text,
                 "debug": debug_payload,
             }
+
+    async def _expand_document_table_candidates_for_full_list(
+        self,
+        *,
+        candidates: list[RetrievedCandidate],
+    ) -> list[RetrievedCandidate]:
+        """
+        Для запроса полного списка документов нельзя полагаться только на top-N
+        строк, выбранных retrieval. Иначе пользователь получает не весь комплект,
+        а несколько наиболее похожих строк таблицы.
+
+        Добираем все строки таблицы документов из того же активного НПА, который
+        уже попал в evidence. Это остаётся grounded-путём: строки берутся из
+        document_table_rows и затем проходят через тот же deterministic builder.
+        """
+        document_ids: list[UUID] = []
+        for candidate in candidates:
+            if (
+                getattr(candidate, "source_type", None) == "table_row"
+                and self._candidate_table_semantic_type(candidate) == "documents"
+                and candidate.document_id not in document_ids
+            ):
+                document_ids.append(candidate.document_id)
+
+        if not document_ids:
+            for candidate in candidates:
+                if candidate.document_id not in document_ids:
+                    document_ids.append(candidate.document_id)
+
+        if not document_ids:
+            return candidates
+
+        stmt = (
+            select(
+                DocumentTableRow.row_id,
+                DocumentTableRow.document_id,
+                DocumentRegistry.document_name,
+                DocumentRegistry.doc_uid_base,
+                DocumentRegistry.revision_date,
+                DocumentTableRow.row_order,
+                DocumentTableRow.row_summary,
+                DocumentTableRow.citation_json,
+                DocumentTableRow.metadata_json,
+            )
+            .join(DocumentRegistry, DocumentRegistry.document_id == DocumentTableRow.document_id)
+            .where(DocumentRegistry.status == "active")
+            .where(DocumentTableRow.document_id.in_(document_ids))
+            .where(DocumentTableRow.metadata_json["table_semantic_type"].astext == "documents")
+            .order_by(DocumentTableRow.document_id, DocumentTableRow.row_order)
+            .limit(300)
+        )
+
+        result = await self.db.execute(stmt)
+        rows = result.mappings().all()
+        if not rows:
+            return candidates
+
+        expanded: list[RetrievedCandidate] = []
+        seen: set[tuple[str, UUID]] = set()
+
+        for row in rows:
+            metadata = dict(row["metadata_json"] or {})
+            metadata.setdefault("row_order", row["row_order"])
+
+            expanded.append(
+                RetrievedCandidate(
+                    source_type="table_row",
+                    source_id=row["row_id"],
+                    document_id=row["document_id"],
+                    score=1.0,
+                    rerank_score=1.0,
+                    document_name=row["document_name"],
+                    doc_uid_base=row["doc_uid_base"],
+                    revision_date=self._datetime_to_iso(row["revision_date"]),
+                    title="table_row",
+                    snippet=row["row_summary"],
+                    citation_json=row["citation_json"] or {},
+                    metadata_json=metadata,
+                )
+            )
+            seen.add(("table_row", row["row_id"]))
+
+        # Сохраняем остальные evidence, но не дублируем строки таблицы документов.
+        for candidate in candidates:
+            key = (candidate.source_type, candidate.source_id)
+            if key in seen:
+                continue
+            expanded.append(candidate)
+
+        return expanded
+
+    def _datetime_to_iso(
+        self,
+        value: Any,
+    ) -> Optional[str]:
+        """Convert date/datetime/string DB values to an ISO string for RetrievedCandidate.
+
+        Full document-list mode hydrates additional rows directly from the database.
+        DocumentRegistry.revision_date can already be a string, date, datetime, or None
+        depending on the driver/model layer, so this helper must be deliberately tolerant.
+        """
+        if value is None:
+            return None
+
+        isoformat = getattr(value, "isoformat", None)
+        if callable(isoformat):
+            return isoformat()
+
+        text = str(value).strip()
+        return text or None
+
+    def _candidate_table_semantic_type(self, candidate: RetrievedCandidate) -> Optional[str]:
+        metadata = getattr(candidate, "metadata_json", None) or {}
+        value = metadata.get("table_semantic_type")
+        if value is None:
+            return None
+        return str(value).strip().lower() or None
 
     def _prepare_deadlines_table_answer(
         self,
@@ -1108,6 +1399,17 @@ class GenerationPipeline:
 
         # Для documents-question сначала всегда пробуем deterministic path.
         if payload.intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION:
+            deterministic_text = None
+            if isinstance(documents_answer_payload, dict):
+                deterministic_text = documents_answer_payload.get("answer_text")
+
+            if deterministic_text:
+                return deterministic_text
+
+        # Для вопросов о форме документов deterministic path тоже должен
+        # идти через таблицу документов, даже если intent классифицирован как
+        # FORM/PROCEDURE, а не как DOCUMENTS.
+        if payload.intent_type in {QuestionIntentEnum.FORM_QUESTION, QuestionIntentEnum.PROCEDURE_QUESTION}:
             deterministic_text = None
             if isinstance(documents_answer_payload, dict):
                 deterministic_text = documents_answer_payload.get("answer_text")
@@ -2003,7 +2305,7 @@ class GenerationPipeline:
             evidence_items=[],
             generation_model_name=None,
             generation_prompt_version="grounded_template_v1",
-            pipeline_version="generation_pipeline_v3_compact_narrative_cleanup",
+            pipeline_version="generation_pipeline_v5_compact_documents_mode",
         )
 
     def _compact_json_dict(

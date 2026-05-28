@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -231,36 +232,85 @@ class AnswerOrchestrator:
         8. Decide whether to ask for feedback
         9. Return transport-ready payload
         """
-        self._validate_user_question_input(payload)
+        timings_started_at = time.perf_counter()
+        timings: dict[str, Any] = {
+            "version": "step64_orchestrator_latency_v1",
+        }
 
+        def measure_start() -> float:
+            return time.perf_counter()
+
+        def measure_stop(key: str, started_at: float) -> None:
+            timings[key] = round(time.perf_counter() - started_at, 6)
+
+        started = measure_start()
+        self._validate_user_question_input(payload)
+        measure_stop("validate_input_sec", started)
+
+        started = measure_start()
         session = await self._resolve_or_create_session(payload)
+        measure_stop("resolve_or_create_session_sec", started)
+
+        started = measure_start()
         routing = await self._build_question_routing(
             payload.question_text,
             request_metadata_json=payload.request_metadata_json,
         )
+        measure_stop("build_question_routing_sec", started)
 
+        timings["question_embedding_skipped"] = bool(
+            (routing.routing_payload_json or {})
+            .get("question_embedding_skipped", {})
+            .get("enabled")
+        )
+        timings["intent_type"] = routing.intent_type.value
+
+        started = measure_start()
         question_event = await self._create_question_event(
             session_id=session.session_id,
             question_text_raw=payload.question_text,
             language_code=payload.language_code,
             routing=routing,
         )
+        measure_stop("create_question_event_sec", started)
 
-        reuse_decision = await self.reuse_gate.build_reuse_decision(
-            ReuseQueryInput(
-                question_event_id=question_event.question_event_id,
-                similarity_threshold=0.90,
-                max_candidates=20,
-                allow_subject_category_mismatch=False,
+        if self._should_skip_reuse_for_routing(routing):
+            reuse_decision = ReuseDecision(
+                should_reuse=False,
+                source_answer_event_id=None,
+                decision_code="reuse_skipped_for_unstable_answer_type",
+                confidence_score=0.0,
+                reason="Reuse отключён для вопросов по документам: формат таких ответов активно зависит от текущей версии builder'а.",
+                payload={
+                    "question_event_id": str(question_event.question_event_id),
+                    "intent_type": routing.intent_type.value,
+                    "reason_code": "documents_builder_version_sensitive",
+                },
             )
-        )
+            timings["reuse_gate_sec"] = 0.0
+            timings["reuse_skipped"] = True
+        else:
+            started = measure_start()
+            reuse_decision = await self.reuse_gate.build_reuse_decision(
+                ReuseQueryInput(
+                    question_event_id=question_event.question_event_id,
+                    similarity_threshold=0.90,
+                    max_candidates=20,
+                    allow_subject_category_mismatch=False,
+                )
+            )
+            measure_stop("reuse_gate_sec", started)
+            timings["reuse_skipped"] = False
 
         if reuse_decision.should_reuse and reuse_decision.source_answer_event_id:
+            started = measure_start()
             answer_event = await self._persist_reused_answer_event(
                 question_event=question_event,
                 reuse_decision=reuse_decision,
             )
+            measure_stop("persist_reused_answer_event_sec", started)
         else:
+            started = measure_start()
             generation_result = await self._run_full_generation(
                 payload=payload,
                 question_event=question_event,
@@ -268,11 +318,16 @@ class AnswerOrchestrator:
                 session=session,
                 reuse_decision=reuse_decision,
             )
+            measure_stop("run_full_generation_sec", started)
+
+            started = measure_start()
             answer_event = await self._persist_generated_answer_event(
                 question_event=question_event,
                 generation_result=generation_result,
             )
+            measure_stop("persist_generated_answer_event_sec", started)
 
+        started = measure_start()
         should_request_feedback = await self.sampling_policy.should_request_feedback(
             SamplingDecisionInput(
                 channel_code=payload.channel_code,
@@ -285,7 +340,9 @@ class AnswerOrchestrator:
                 request_metadata_json=payload.request_metadata_json,
             )
         )
+        measure_stop("sampling_policy_sec", started)
 
+        started = measure_start()
         result = self._build_outgoing_payload(
             session=session,
             question_event=question_event,
@@ -293,6 +350,31 @@ class AnswerOrchestrator:
             should_request_feedback=should_request_feedback,
             reuse_decision=reuse_decision,
         )
+        measure_stop("build_outgoing_payload_sec", started)
+
+        timings["total_sec"] = round(time.perf_counter() - timings_started_at, 6)
+        known_keys = [
+            "validate_input_sec",
+            "resolve_or_create_session_sec",
+            "build_question_routing_sec",
+            "create_question_event_sec",
+            "reuse_gate_sec",
+            "run_full_generation_sec",
+            "persist_generated_answer_event_sec",
+            "persist_reused_answer_event_sec",
+            "sampling_policy_sec",
+            "build_outgoing_payload_sec",
+        ]
+        timings["unaccounted_sec"] = round(
+            max(
+                timings["total_sec"] - sum(float(timings.get(key) or 0.0) for key in known_keys),
+                0.0,
+            ),
+            6,
+        )
+
+        result.debug_payload_json = dict(result.debug_payload_json or {})
+        result.debug_payload_json["orchestrator_timings_sec"] = timings
 
         logger.info(
             "Processed user question",
@@ -303,6 +385,8 @@ class AnswerOrchestrator:
                 "answer_mode": str(answer_event.answer_mode),
                 "reuse_approved": reuse_decision.should_reuse,
                 "feedback_requested": should_request_feedback,
+                "orchestrator_total_sec": timings["total_sec"],
+                "question_embedding_skipped": timings["question_embedding_skipped"],
             },
         )
         return result
@@ -355,6 +439,20 @@ class AnswerOrchestrator:
     # Question routing / understanding
     # --------------------------------------------------------
 
+    def _should_skip_reuse_for_intent(self, intent_type: QuestionIntentEnum) -> bool:
+        """Return True when answer reuse should be skipped for the intent.
+
+        Document answers are version-sensitive: the rendered text depends on the
+        current documents builder, channel wording and full-list/form-detail mode.
+        When reuse is skipped, the question embedding is also unnecessary because
+        it is only used by ReuseGate in the current runtime path.
+        """
+        return intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION
+
+    def _should_skip_reuse_for_routing(self, routing: QuestionRoutingResult) -> bool:
+        """Skip reuse for answer types whose rendering is version-sensitive."""
+        return self._should_skip_reuse_for_intent(routing.intent_type)
+
     async def _build_question_routing(
         self,
         question_text: str,
@@ -401,7 +499,14 @@ class AnswerOrchestrator:
         question_embedding: Optional[list[float]] = None
         embedding_model_name: Optional[str] = None
 
-        if self.question_embedding_service is not None:
+        should_skip_reuse = self._should_skip_reuse_for_intent(intent_type)
+        if should_skip_reuse:
+            routing_payload_json["question_embedding_skipped"] = {
+                "enabled": True,
+                "reason": "reuse_skipped_for_intent",
+                "intent_type": intent_type.value,
+            }
+        elif self.question_embedding_service is not None:
             question_embedding = await self.question_embedding_service.embed(normalized_text)
             embedding_model_name = classification.get("embedding_model_name")
 
@@ -573,7 +678,21 @@ class AnswerOrchestrator:
         )
 
         runtime_result = await self.runtime_answer_service.build_answer(runtime_input)
-        return runtime_result.generation_result
+
+        # Keep server-side runtime timings in the persisted answer payload.
+        # This is safe diagnostic metadata, not reasoning text. It helps
+        # distinguish slow service resolution, retrieval, generation and
+        # persistence when the API is called from n8n/Telegram.
+        generation_result = runtime_result.generation_result
+        answer_payload_json = dict(generation_result.answer_payload_json or {})
+        runtime_payload_json = dict(runtime_result.runtime_payload_json or {})
+        answer_payload_json["runtime_answer_service_timings"] = dict(
+            runtime_payload_json.get("timings_sec") or {}
+        )
+        answer_payload_json["runtime_answer_service_runtime_payload"] = runtime_payload_json
+        generation_result.answer_payload_json = answer_payload_json
+
+        return generation_result
 
     async def _persist_generated_answer_event(
         self,
