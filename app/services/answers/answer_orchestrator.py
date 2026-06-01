@@ -116,6 +116,17 @@ class OrchestratorNotFoundError(AnswerOrchestratorError):
 # ============================================================
 
 @dataclass(slots=True)
+class ResolvedConversationSession:
+    """Lightweight session reference used on the hot path.
+
+    For existing sessions the orchestrator only needs session_id. Selecting the
+    full ConversationSession ORM object may trigger relationship loaders and
+    become slow when the session has many question_events.
+    """
+    session_id: UUID
+
+
+@dataclass(slots=True)
 class UserQuestionInput:
     """
     Raw user question coming from a messenger adapter or API.
@@ -244,7 +255,7 @@ class AnswerOrchestrator:
         """
         timings_started_at = time.perf_counter()
         timings: dict[str, Any] = {
-            "version": "second_step_01_message_guard_v1",
+            "version": "second_step_03_deferred_question_event_commit_v1",
         }
 
         def measure_start() -> float:
@@ -590,16 +601,19 @@ class AnswerOrchestrator:
     async def _resolve_or_create_session(
         self,
         payload: UserQuestionInput,
-    ) -> ConversationSession:
+    ) -> ConversationSession | ResolvedConversationSession:
         """Resolve or create conversation session.
 
         Hot-path note:
-        Previously every existing session was updated, committed and refreshed
-        before the actual answer was built. On the VPS this added roughly 5-7
-        seconds per Telegram/n8n request. For the live bot path we only need a
-        stable session id, so existing sessions now use a read-only fast path.
+        Existing sessions are looked up by session_id only. Selecting the full
+        ConversationSession ORM object can trigger relationship loaders
+        (question_events / feedback_items) and becomes slow when a test or a
+        Telegram chat accumulates many messages in one session. The rest of the
+        orchestrator only needs session_id, so a lightweight reference is safer
+        and faster for the hot path.
 
-        New sessions are still committed and refreshed normally.
+        New sessions still use the ORM object and are flushed only; the next
+        QuestionEvent commit persists both rows together.
         """
         total_started_at = time.perf_counter()
         details: dict[str, Any] = {
@@ -613,20 +627,21 @@ class AnswerOrchestrator:
         details["channel_lookup_sec"] = round(time.perf_counter() - started_at, 6)
 
         started_at = time.perf_counter()
-        stmt: Select[Any] = select(ConversationSession).where(
+        stmt: Select[Any] = select(ConversationSession.session_id).where(
             ConversationSession.channel_id == channel_id,
             ConversationSession.external_session_id == payload.external_session_id,
         )
         result = await self.db.execute(stmt)
-        session = result.scalar_one_or_none()
+        existing_session_id = result.scalar_one_or_none()
         details["session_lookup_sec"] = round(time.perf_counter() - started_at, 6)
 
-        if session is not None:
+        if existing_session_id is not None:
             details["existing_session_fast_path"] = True
+            details["existing_session_lookup_mode"] = "session_id_only"
             details["commit_refresh_sec"] = 0.0
             details["total_sec"] = round(time.perf_counter() - total_started_at, 6)
             self._last_session_resolution_timings = details
-            return session
+            return ResolvedConversationSession(session_id=existing_session_id)
 
         started_at = time.perf_counter()
         session = ConversationSession(
@@ -776,8 +791,15 @@ class AnswerOrchestrator:
         )
 
         self.db.add(question_event)
-        await self.db.commit()
-        await self.db.refresh(question_event)
+
+        # second_step_03_deferred_question_event_commit_v1
+        # Do not commit/refresh QuestionEvent here. The following answer_event
+        # persistence path commits the whole transaction. On a long-lived test
+        # database the old commit+refresh step could take 2-4 seconds even when
+        # MessageGuard stopped the request before retrieval. question_event_id is
+        # generated application-side, and the same AsyncSession can use the
+        # flushed row for reuse/generation checks before the final commit.
+        await self.db.flush()
         return question_event
 
     # --------------------------------------------------------
@@ -874,7 +896,7 @@ class AnswerOrchestrator:
         payload: UserQuestionInput,
         question_event: QuestionEvent,
         routing: QuestionRoutingResult,
-        session: ConversationSession,
+        session: ConversationSession | ResolvedConversationSession,
         reuse_decision: ReuseDecision,
     ) -> GenerationResult:
         runtime_input = RuntimeAnswerInput(
