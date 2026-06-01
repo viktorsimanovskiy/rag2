@@ -27,9 +27,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.services.answers.answer_orchestrator import (
     AnswerOrchestrator,
     IntentClassifierProtocol,
+    MessageGuardProtocol,
     QuestionEmbeddingProtocol,
     QuestionNormalizerProtocol,
 )
+from app.services.answers.message_guard import RuleBasedMessageGuard
 from app.services.answers.runtime_answer_service import RuntimeAnswerService
 from app.services.channels.messenger_response_builder import MessengerResponseBuilder
 from app.services.feedback.feedback_service import FeedbackService
@@ -105,12 +107,14 @@ class ServiceFactory:
         *,
         intent_classifier: IntentClassifierProtocol,
         question_normalizer: QuestionNormalizerProtocol,
+        message_guard: Optional[MessageGuardProtocol] = None,
         question_embedding_service: Optional[QuestionEmbeddingProtocol] = None,
         config: Optional[ServiceFactoryConfig] = None,
     ) -> None:
         self.db = db
         self.intent_classifier = intent_classifier
         self.question_normalizer = question_normalizer
+        self.message_guard = message_guard or RuleBasedMessageGuard()
         self.question_embedding_service = question_embedding_service
         self.config = config or ServiceFactoryConfig()
 
@@ -203,6 +207,7 @@ class ServiceFactory:
                 reuse_gate=self.get_reuse_gate(),
                 intent_classifier=self.intent_classifier,
                 question_normalizer=self.question_normalizer,
+                message_guard=self.message_guard,
                 question_embedding_service=self.question_embedding_service,
                 runtime_answer_service=self.get_runtime_answer_service(),
                 sampling_policy=self.get_sampling_policy(),

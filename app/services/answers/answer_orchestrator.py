@@ -50,6 +50,7 @@ from app.services.feedback.feedback_service import (
     FeedbackService,
 )
 from app.services.generation.generation_pipeline import GenerationResult
+from app.services.answers.message_guard import MessageGuardResult
 from app.services.reuse.reuse_gate import (
     ReuseDecision,
     ReuseGate,
@@ -71,6 +72,11 @@ class IntentClassifierProtocol:
 
 class QuestionNormalizerProtocol:
     async def normalize(self, question_text: str) -> str:
+        raise NotImplementedError
+
+
+class MessageGuardProtocol:
+    async def check(self, message_text: str, *, channel_code: str | None = None) -> MessageGuardResult:
         raise NotImplementedError
 
 
@@ -199,6 +205,7 @@ class AnswerOrchestrator:
         reuse_gate: ReuseGate,
         intent_classifier: IntentClassifierProtocol,
         question_normalizer: QuestionNormalizerProtocol,
+        message_guard: Optional[MessageGuardProtocol],
         question_embedding_service: Optional[QuestionEmbeddingProtocol],
         runtime_answer_service: RuntimeAnswerServiceProtocol,
         sampling_policy: SamplingPolicyProtocol,
@@ -208,6 +215,7 @@ class AnswerOrchestrator:
         self.reuse_gate = reuse_gate
         self.intent_classifier = intent_classifier
         self.question_normalizer = question_normalizer
+        self.message_guard = message_guard
         self.question_embedding_service = question_embedding_service
         self.runtime_answer_service = runtime_answer_service
         self.sampling_policy = sampling_policy
@@ -236,7 +244,7 @@ class AnswerOrchestrator:
         """
         timings_started_at = time.perf_counter()
         timings: dict[str, Any] = {
-            "version": "step64_orchestrator_latency_v1",
+            "version": "second_step_01_message_guard_v1",
         }
 
         def measure_start() -> float:
@@ -257,9 +265,25 @@ class AnswerOrchestrator:
             timings["session_resolution_details"] = session_resolution_timings
 
         started = measure_start()
+        guard_result = await self._run_message_guard(payload)
+        measure_stop("message_guard_sec", started)
+
+        if guard_result is not None and not guard_result.should_run_rag:
+            return await self._handle_message_guard_blocked(
+                payload=payload,
+                session=session,
+                guard_result=guard_result,
+                timings=timings,
+                timings_started_at=timings_started_at,
+                measure_start=measure_start,
+                measure_stop=measure_stop,
+            )
+
+        started = measure_start()
         routing = await self._build_question_routing(
             payload.question_text,
             request_metadata_json=payload.request_metadata_json,
+            guard_result=guard_result,
         )
         measure_stop("build_question_routing_sec", started)
 
@@ -361,6 +385,7 @@ class AnswerOrchestrator:
         known_keys = [
             "validate_input_sec",
             "resolve_or_create_session_sec",
+            "message_guard_sec",
             "build_question_routing_sec",
             "create_question_event_sec",
             "reuse_gate_sec",
@@ -392,6 +417,168 @@ class AnswerOrchestrator:
                 "feedback_requested": should_request_feedback,
                 "orchestrator_total_sec": timings["total_sec"],
                 "question_embedding_skipped": timings["question_embedding_skipped"],
+            },
+        )
+        return result
+
+    # --------------------------------------------------------
+    # Message guard
+    # --------------------------------------------------------
+
+    async def _run_message_guard(
+        self,
+        payload: UserQuestionInput,
+    ) -> Optional[MessageGuardResult]:
+        """Run cheap pre-retrieval guard if it is configured."""
+        if self.message_guard is None:
+            return None
+        return await self.message_guard.check(
+            payload.question_text,
+            channel_code=(
+                payload.channel_code.value
+                if isinstance(payload.channel_code, ChannelTypeEnum)
+                else str(payload.channel_code)
+            ),
+        )
+
+    async def _handle_message_guard_blocked(
+        self,
+        *,
+        payload: UserQuestionInput,
+        session: ConversationSession,
+        guard_result: MessageGuardResult,
+        timings: dict[str, Any],
+        timings_started_at: float,
+        measure_start: Any,
+        measure_stop: Any,
+    ) -> OutgoingAnswerPayload:
+        """Persist and return a service answer without retrieval/generation."""
+        routing = QuestionRoutingResult(
+            question_text_normalized=guard_result.normalized_text or payload.question_text.strip(),
+            intent_type=QuestionIntentEnum.OTHER,
+            subject_category_code=None,
+            classifier_version=guard_result.guard_version,
+            embedding_model_name=None,
+            routing_payload_json={
+                "message_guard": guard_result.to_payload(),
+                "routing_mode": "no_retrieval",
+                "should_run_rag": False,
+            },
+            query_constraints_json={
+                "message_guard_blocked": True,
+                "message_guard_reason_code": guard_result.reason_code,
+            },
+            question_embedding=None,
+        )
+
+        started = measure_start()
+        question_event = await self._create_question_event(
+            session_id=session.session_id,
+            question_text_raw=payload.question_text,
+            language_code=payload.language_code,
+            routing=routing,
+        )
+        measure_stop("create_question_event_sec", started)
+
+        reuse_decision = ReuseDecision(
+            should_reuse=False,
+            source_answer_event_id=None,
+            decision_code="message_guard_no_retrieval",
+            confidence_score=guard_result.confidence_score,
+            reason="MessageGuard остановил сообщение до retrieval.",
+            payload={
+                "question_event_id": str(question_event.question_event_id),
+                "message_guard": guard_result.to_payload(),
+            },
+        )
+        timings["reuse_gate_sec"] = 0.0
+        timings["reuse_skipped"] = True
+        timings["run_full_generation_sec"] = 0.0
+
+        generation_result = GenerationResult(
+            answer_mode=AnswerModeEnum.SAFE_NO_ANSWER,
+            answer_text=(guard_result.answer_text or "Сообщение не передано в поиск по нормативным актам."),
+            answer_text_short=guard_result.answer_text,
+            confidence_score=guard_result.confidence_score,
+            trust_score_at_generation=1.0,
+            validation_status=ValidationStatusEnum.PASSED,
+            deterministic_validation_passed=True,
+            semantic_validation_passed=True,
+            reuse_allowed=False,
+            reuse_policy_version="reuse_gate_v1",
+            citations_json=[],
+            answer_payload_json={
+                "strategy_code": "message_guard_no_retrieval",
+                "pipeline_version": "second_step_01_message_guard_v1",
+                "message_guard": guard_result.to_payload(),
+                "runtime_answer_service_timings": {},
+                "runtime_answer_service_runtime_payload": {},
+            },
+            reuse_decision_payload_json={
+                "reuse_allowed": False,
+                "reuse_policy_version": "reuse_gate_v1",
+                "message_guard": guard_result.to_payload(),
+            },
+            evidence_items=[],
+            generation_model_name=None,
+            generation_prompt_version=None,
+            pipeline_version="second_step_01_message_guard_v1",
+        )
+
+        started = measure_start()
+        answer_event = await self._persist_generated_answer_event(
+            question_event=question_event,
+            generation_result=generation_result,
+        )
+        measure_stop("persist_generated_answer_event_sec", started)
+
+        timings["sampling_policy_sec"] = 0.0
+        started = measure_start()
+        result = self._build_outgoing_payload(
+            session=session,
+            question_event=question_event,
+            answer_event=answer_event,
+            should_request_feedback=False,
+            reuse_decision=reuse_decision,
+        )
+        measure_stop("build_outgoing_payload_sec", started)
+
+        timings["question_embedding_skipped"] = True
+        timings["intent_type"] = QuestionIntentEnum.OTHER.value
+        timings["message_guard_blocked"] = True
+        timings["message_guard_reason_code"] = guard_result.reason_code
+        timings["total_sec"] = round(time.perf_counter() - timings_started_at, 6)
+        known_keys = [
+            "validate_input_sec",
+            "resolve_or_create_session_sec",
+            "message_guard_sec",
+            "create_question_event_sec",
+            "reuse_gate_sec",
+            "run_full_generation_sec",
+            "persist_generated_answer_event_sec",
+            "sampling_policy_sec",
+            "build_outgoing_payload_sec",
+        ]
+        timings["unaccounted_sec"] = round(
+            max(
+                timings["total_sec"] - sum(float(timings.get(key) or 0.0) for key in known_keys),
+                0.0,
+            ),
+            6,
+        )
+
+        result.debug_payload_json = dict(result.debug_payload_json or {})
+        result.debug_payload_json["orchestrator_timings_sec"] = timings
+        result.debug_payload_json["message_guard"] = guard_result.to_payload()
+
+        logger.info(
+            "Message stopped by MessageGuard before retrieval",
+            extra={
+                "session_id": str(session.session_id),
+                "question_event_id": str(question_event.question_event_id),
+                "answer_event_id": str(answer_event.answer_event_id),
+                "message_guard_reason_code": guard_result.reason_code,
+                "orchestrator_total_sec": timings["total_sec"],
             },
         )
         return result
@@ -498,6 +685,7 @@ class AnswerOrchestrator:
         question_text: str,
         *,
         request_metadata_json: Optional[dict[str, Any]] = None,
+        guard_result: Optional[MessageGuardResult] = None,
     ) -> QuestionRoutingResult:
         """
         Build routing metadata for a user question.
@@ -520,6 +708,9 @@ class AnswerOrchestrator:
 
         routing_payload_json = dict(classification.get("routing_payload_json") or {})
         query_constraints_json = dict(classification.get("query_constraints_json") or {})
+
+        if guard_result is not None:
+            routing_payload_json["message_guard"] = guard_result.to_payload()
 
         forced_intent_value = request_metadata_json.get("forced_intent_type")
         if forced_intent_value:
