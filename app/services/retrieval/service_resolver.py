@@ -27,6 +27,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.services import ServiceRegistry
 
+RESOLVER_PATCH_VERSION = "first_step_fix_13_resolver_cache_and_travel_bugfix"
+
+# ServiceFactory is created per API request, therefore instance-level cache in
+# ServiceResolver is not enough for HTTP mode. Keep the immutable resolver index
+# at module level and refresh it by restarting the API service after registry /
+# vocabulary changes.
+_SHARED_SERVICE_DOCS_CACHE: list["_ServiceSearchDocument"] | None = None
+_SHARED_TOKEN_DOCUMENT_FREQUENCY_CACHE: dict[str, int] | None = None
+
 
 # ============================================================
 # DTOs
@@ -254,10 +263,23 @@ class ServiceResolver:
     async def _get_search_index(
         self,
     ) -> tuple[list[_ServiceSearchDocument], dict[str, int], bool]:
+        global _SHARED_SERVICE_DOCS_CACHE
+        global _SHARED_TOKEN_DOCUMENT_FREQUENCY_CACHE
+
+        if (
+            _SHARED_SERVICE_DOCS_CACHE is not None
+            and _SHARED_TOKEN_DOCUMENT_FREQUENCY_CACHE is not None
+        ):
+            self._service_docs_cache = _SHARED_SERVICE_DOCS_CACHE
+            self._token_document_frequency_cache = _SHARED_TOKEN_DOCUMENT_FREQUENCY_CACHE
+            return _SHARED_SERVICE_DOCS_CACHE, _SHARED_TOKEN_DOCUMENT_FREQUENCY_CACHE, True
+
         if (
             self._service_docs_cache is not None
             and self._token_document_frequency_cache is not None
         ):
+            _SHARED_SERVICE_DOCS_CACHE = self._service_docs_cache
+            _SHARED_TOKEN_DOCUMENT_FREQUENCY_CACHE = self._token_document_frequency_cache
             return self._service_docs_cache, self._token_document_frequency_cache, True
 
         raw_services = await self._load_active_services()
@@ -266,12 +288,19 @@ class ServiceResolver:
 
         self._service_docs_cache = service_docs
         self._token_document_frequency_cache = token_document_frequency
+        _SHARED_SERVICE_DOCS_CACHE = service_docs
+        _SHARED_TOKEN_DOCUMENT_FREQUENCY_CACHE = token_document_frequency
 
         return service_docs, token_document_frequency, False
 
     def clear_cache(self) -> None:
+        global _SHARED_SERVICE_DOCS_CACHE
+        global _SHARED_TOKEN_DOCUMENT_FREQUENCY_CACHE
+
         self._service_docs_cache = None
         self._token_document_frequency_cache = None
+        _SHARED_SERVICE_DOCS_CACHE = None
+        _SHARED_TOKEN_DOCUMENT_FREQUENCY_CACHE = None
 
     async def _load_active_services(self) -> list[_ServiceRegistryRecord]:
         """
@@ -695,6 +724,62 @@ def _apply_question_context_adjustments(
         )
     )
 
+    def q_text_has_any(markers: tuple[str, ...] | set[str]) -> bool:
+        return any(marker in question_text for marker in markers)
+
+    def service_text_has_any(markers: tuple[str, ...] | set[str]) -> bool:
+        return any(marker in service_text for marker in markers)
+
+    # fix_07: runtime_vocabulary может добавлять полезные общие слова,
+    # но слишком широкие расширения не должны делать профильную услугу
+    # уверенной, если в вопросе нет её ключевого контекста. Здесь стоят
+    # не алиасы конкретных услуг, а защитные развилки против устойчивого
+    # смешения: родитель/родился -> проезд беременных, средство
+    # реабилитации -> проезд на реабилитацию, субсидия -> компенсация ЖКУ.
+    trip_tokens = {"проезд", "ехать", "съездить", "поехать", "билет", "дорог"}
+    medical_trip_tokens = {"мсэ", "обследован", "лечен", "реабилитац"}
+    pregnancy_tokens = {"беременн", "рожать", "роды", "родов", "дородов"}
+
+    pregnancy_question = q_has_any(pregnancy_tokens)
+    trip_question = q_has_any(trip_tokens)
+    medical_trip_question = trip_question or q_has_any({"мсэ", "обследован", "лечен"})
+    service_has_pregnancy_trip = (
+        s_has_any({"беременн", "родов", "роды"})
+        and s_has_any({"проезд", "обследован", "медицинск", "мест"})
+    )
+
+    if service_has_pregnancy_trip:
+        if pregnancy_question:
+            adjusted += 36.0
+            accumulator.match_reasons.append("усиление: вопрос действительно про беременность/роды")
+        elif question_has_child_context or q_has_any({"родител", "школьник", "школьн", "двойн", "тройн", "рожд", "материнск", "капитал", "радиац"}):
+            adjusted = min(adjusted * 0.18, 42.0)
+            accumulator.match_reasons.append(
+                "сильное понижение: услуга про проезд беременных, вопрос не про беременность/роды"
+            )
+        elif not medical_trip_question:
+            adjusted = min(adjusted * 0.35, 55.0)
+            accumulator.match_reasons.append(
+                "понижение: услуга про медицинский проезд, в вопросе нет поездки/обследования"
+            )
+
+    tsr_question = (
+        q_has_any({"тср", "техническ", "средство", "средств", "коляск", "слухов", "аппарат"})
+        and q_has_any({"инвалид", "реабилитац", "ребенок", "дет"})
+    )
+    service_has_tsr = s_has_any({"тср", "техническ", "средство", "средств", "коляск", "слухов", "аппарат"})
+    service_is_travel_compensation = s_has_any({"проезд"}) or service_text_has_any({"проезд"})
+    service_has_medical_trip = service_is_travel_compensation and s_has_any(medical_trip_tokens.union({"мест", "медицинск"}))
+    if tsr_question:
+        if service_has_tsr:
+            adjusted += 44.0
+            accumulator.match_reasons.append("усиление: вопрос про техническое средство реабилитации")
+        elif service_has_medical_trip:
+            adjusted = min(adjusted * 0.30, 58.0)
+            accumulator.match_reasons.append(
+                "сильное понижение: вопрос про ТСР, услуга про проезд на лечение/обследование"
+            )
+
     war_child_question = (
         q_has_any({"войн", "переживш", "детств"})
         and ("ребенок" in question_tokens or "дет" in question_tokens)
@@ -741,7 +826,7 @@ def _apply_question_context_adjustments(
     fallen_defender_question = (
         "погибш" in question_tokens
         and ("защитник" in question_tokens or "отечеств" in question_tokens)
-        and question_has_child_context
+        and (question_has_child_context or q_has_any({"родител", "отец", "мать"}))
     )
     fallen_defender_travel_question = fallen_defender_question and q_has_any(
         {"проезд", "захоронен", "гибел", "могил"}
@@ -755,7 +840,7 @@ def _apply_question_context_adjustments(
             accumulator.match_reasons.append("понижение: вопрос про проезд, услуга про статус/удостоверение")
     elif fallen_defender_question and q_has_any({"статус", "выплат", "удостоверен"}):
         if "проезд" in service_tokens or "проезд" in service_text:
-            adjusted *= 0.38
+            adjusted = min(adjusted * 0.22, 70.0)
             accumulator.match_reasons.append("сильное понижение: вопрос про статус/выплаты, услуга про проезд")
         elif "статус" in service_tokens or "выплат" in service_tokens or "удостоверен" in service_tokens:
             adjusted += 34.0
@@ -836,7 +921,10 @@ def _apply_question_context_adjustments(
             accumulator.match_reasons.append("понижение: вопрос про ЧС, услуга не про ЧС")
 
     social_service_question = q_has_any({"социальн", "обслуживан", "соцработник", "уход", "быт"})
-    service_has_social_service = s_has_any({"социальн", "обслуживан", "соцработник", "уход", "быт"})
+    service_has_social_service = (
+        s_has_any({"социальн", "обслуживан", "соцработник", "уход", "быт"})
+        or service_text_has_any({"соцобслуживан", "социальном обслуживании", "социального обслуживания"})
+    )
     if social_service_question and q_has_any({"соцработник", "обслуживан", "уход"}):
         if service_has_social_service:
             adjusted += 34.0
@@ -855,6 +943,414 @@ def _apply_question_context_adjustments(
             adjusted *= 0.55
             accumulator.match_reasons.append("понижение: вопрос про компьютер, услуга про обучение вождению")
 
+
+    # Дополнительные смысловые развилки по массовому прогону живых вопросов.
+    # Это не алиасы конкретных услуг, а правила против устойчивых смешений
+    # близких направлений: субсидия vs компенсация ЖКУ, пособие на погребение
+    # vs возмещение спецслужбам, выдача vs распоряжение капиталом и т.п.
+    service_has_subsidy = "субсид" in service_tokens or "субсид" in service_text
+    service_has_jku_compensation = (
+        ("компенсац" in service_tokens or "возмещ" in service_tokens)
+        and ("жку" in service_text or "жилищно" in service_tokens or "коммунальн" in service_tokens)
+    )
+    if "субсид" in question_tokens:
+        if service_has_subsidy:
+            adjusted += 42.0
+            accumulator.match_reasons.append("усиление: вопрос прямо про субсидию")
+        elif service_has_jku_compensation:
+            adjusted = min(adjusted * 0.36, 68.0)
+            accumulator.match_reasons.append("сильное понижение: вопрос про субсидию, услуга про компенсацию ЖКУ")
+
+    burial_person_question = burial_question and q_has_any({"родственник", "человек", "деньг", "занимал", "умер"})
+    if burial_person_question:
+        if "специализированн" in service_text or "спецслужб" in service_text:
+            adjusted *= 0.42
+            accumulator.match_reasons.append("понижение: вопрос от гражданина, услуга для специализированной службы")
+        if "пособ" in service_tokens and "погребен" in service_tokens:
+            adjusted += 34.0
+            accumulator.match_reasons.append("усиление: вопрос гражданина про пособие на погребение")
+
+    repair_question = q_has_any({"ремонт", "жиль", "жил"})
+    stove_specific_question = q_has_any({"печк", "печн", "отоплен", "электропроводк", "проводк"})
+    service_has_stove_repair = s_has_any({"печн", "отоплен", "электропроводк", "проводк"})
+    if repair_question and service_has_stove_repair and not stove_specific_question:
+        adjusted *= 0.50
+        accumulator.match_reasons.append("понижение: вопрос про ремонт жилья без печного отопления/проводки")
+
+    oncology_question = q_has_any({"онколог", "онкобольн", "диабет"})
+    service_has_oncology = s_has_any({"онколог", "онкобольн", "диабет"})
+    if oncology_question:
+        if service_has_oncology:
+            adjusted += 40.0
+            accumulator.match_reasons.append("усиление: вопрос про онкологию/диабет")
+        elif service_has_social_service and not service_has_oncology:
+            adjusted *= 0.48
+            accumulator.match_reasons.append("понижение: вопрос про онкологию, услуга не содержит этот признак")
+
+    matcap_use_question = matcap_question and q_has_any({"использован", "использ", "распоряд", "потрат", "трат", "средств"})
+    if matcap_use_question:
+        if "распоряж" in service_text:
+            adjusted += 44.0
+            accumulator.match_reasons.append("усиление: вопрос про использование/распоряжение маткапиталом")
+        elif "предоставлен" in service_text or "выдач" in service_text:
+            adjusted *= 0.42
+            accumulator.match_reasons.append("понижение: вопрос про использование маткапитала, услуга про выдачу")
+
+    child_disabled_equipment_question = question_has_child_context and "инвалид" in question_tokens and q_has_any({"коляск", "слухов", "аппарат"})
+    service_has_child_disabled_equipment = service_has_child_context and "инвалид" in service_tokens and s_has_any({"коляск", "слухов", "аппарат"})
+    if child_disabled_equipment_question:
+        if service_has_child_disabled_equipment:
+            adjusted += 46.0
+            accumulator.match_reasons.append("усиление: вопрос про коляску/слуховой аппарат ребёнку-инвалиду")
+        elif service_doc.service_name_short.strip().lower() == "тср инвалидам":
+            adjusted *= 0.60
+            accumulator.match_reasons.append("понижение: вопрос про детскую АМП, не общий ТСР")
+
+    if fallen_defender_question:
+        if "рожд" in service_tokens or "рожд" in service_text:
+            adjusted *= 0.16
+            accumulator.match_reasons.append("сильное понижение: вопрос про погибшего защитника, услуга про рождение ребёнка")
+        if any(marker in service_text for marker in ("погибш", "защитник", "отечеств")):
+            adjusted += 36.0
+            accumulator.match_reasons.append("усиление: услуга про детей погибших защитников Отечества")
+
+    chs_family_question = q_has_any({"погибш", "умерш", "сем", "родственник", "член"}) and q_has_any({"чс", "чрезвычайн", "ситуац"})
+    chs_health_question = q_has_any({"травм", "здоров", "вред"}) and q_has_any({"чс", "чрезвычайн", "ситуац"})
+    chs_property_question = q_has_any({"имуществ", "утрат", "потер"}) and q_has_any({"чс", "чрезвычайн", "ситуац"})
+    if emergency_question:
+        if chs_family_question:
+            if s_has_any({"погибш", "умерш", "сем", "член"}):
+                adjusted += 44.0
+                accumulator.match_reasons.append("усиление: ЧС и погибший/члены семьи")
+            elif s_has_any({"имуществ", "здоров", "вред"}):
+                adjusted = min(adjusted * 0.48, 78.0)
+                accumulator.match_reasons.append("понижение: вопрос про семью погибшего при ЧС")
+        elif chs_health_question:
+            if s_has_any({"здоров", "вред", "травм"}):
+                adjusted += 44.0
+                accumulator.match_reasons.append("усиление: ЧС и вред здоровью")
+            elif s_has_any({"имуществ", "погибш", "умерш"}):
+                adjusted = min(adjusted * 0.48, 78.0)
+                accumulator.match_reasons.append("понижение: вопрос про вред здоровью при ЧС")
+        elif chs_property_question:
+            if s_has_any({"имуществ", "утрат"}):
+                adjusted += 44.0
+                accumulator.match_reasons.append("усиление: ЧС и утрата имущества")
+            elif s_has_any({"здоров", "вред", "погибш", "умерш"}):
+                adjusted = min(adjusted * 0.48, 78.0)
+                accumulator.match_reasons.append("понижение: вопрос про утрату имущества при ЧС")
+
+
+    # fix_08: точечные развилки по результатам полного прогона fix_07.
+    # Цель — не расширять словарь ещё сильнее, а разорвать устойчивые
+    # ложные связи между похожими услугами: медицинский проезд vs гемодиализ,
+    # ежемесячная выплата vs проезд, почётный гражданин/житель по территориям,
+    # текущий ремонт vs печное отопление, земельный сертификат: выдача vs
+    # распоряжение. Правила остаются контекстными, а не списком aliases услуг.
+
+    # fix_12: дополнительные развилки по полному прогону fix_11.
+    # Здесь не добавляются алиасы конкретных услуг; правила только разрывают
+    # устойчивые ложные связи между близкими услугами, когда вопрос содержит
+    # явно различающие признаки.
+
+    # Общий вопрос про ТСР/коляску без детского контекста не должен уходить
+    # в узкую детскую АМП на кресло-каталку / слуховой аппарат.
+    child_specific_equipment_service = (
+        service_has_child_context
+        and service_has_tsr
+        and service_text_has_any({"детей-инвалид", "ребенка-инвалида", "детям-инвалид"})
+    )
+    if tsr_question and child_specific_equipment_service and not question_has_child_context:
+        adjusted = min(adjusted * 0.38, 70.0)
+        accumulator.match_reasons.append(
+            "сильное понижение: вопрос про общий ТСР, услуга про детскую АМП"
+        )
+
+    # Если пользователь говорит про поездку к месту гибели/захоронения
+    # погибшего родителя/защитника, это про компенсацию проезда, а не про
+    # благоустройство могил участников ВОВ.
+    fallen_parent_travel_question = (
+        q_has_any({"погибш", "умерш"})
+        and q_has_any({"родител", "отец", "мать", "защитник", "отечеств"})
+        and q_has_any({"захоронен", "гибел", "могил", "съездить", "поехать", "проезд"})
+    )
+    if fallen_parent_travel_question:
+        if service_text_has_any({"проезд"}) and service_text_has_any({"погибш", "защитник", "отечеств"}):
+            adjusted += 70.0
+            accumulator.match_reasons.append(
+                "усиление: проезд к месту гибели/захоронения погибшего защитника"
+            )
+        elif service_text_has_any({"благоустрой", "могил", "памятник"}) and not service_text_has_any({"проезд"}):
+            adjusted = min(adjusted * 0.24, 62.0)
+            accumulator.match_reasons.append(
+                "сильное понижение: вопрос про поездку, услуга про благоустройство могил"
+            )
+
+    # Услуга по ребёнку участника СВО без места в детском саду должна
+    # побеждать обычную выплату за детсад и общие СВО-льготы, если в вопросе
+    # одновременно есть СВО + ребёнок + садик/место.
+    svo_kindergarten_question = (
+        q_has_any({"сво", "военнослужащ"})
+        and question_has_child_context
+        and q_has_any({"сад", "садик", "детск", "дошкольн", "место"})
+    )
+    if svo_kindergarten_question:
+        service_has_kindergarten = service_text_has_any({"сад", "садик", "дошкольн", "место"})
+        service_has_svo = service_text_has_any({"сво", "военнослужащ"})
+        if service_has_svo and service_has_kindergarten:
+            adjusted += 70.0
+            accumulator.match_reasons.append("усиление: ребёнок участника СВО без места в детском саду")
+        elif service_has_kindergarten and not service_has_svo:
+            adjusted = min(adjusted * 0.46, 72.0)
+            accumulator.match_reasons.append("понижение: вопрос про СВО, обычная выплата за детсад")
+        elif service_has_svo and not service_has_kindergarten:
+            adjusted = min(adjusted * 0.42, 70.0)
+            accumulator.match_reasons.append("понижение: вопрос про детсад, услуга СВО без детсадного условия")
+
+    # Чернобыльские удостоверения: общие, ликвидаторов и специальные
+    # удостоверения должны различаться по словам ликвидатор / специальное /
+    # гражданин-пострадавший.
+    chernobyl_question = q_has_any({"чернобыл", "чаэс", "радиац"}) and q_has_any({"удостоверен"})
+    if chernobyl_question:
+        liquidator_question = q_has_any({"ликвидатор", "ликвидац", "участник"})
+        special_certificate_question = q_has_any({"специальн", "един", "образц"})
+        general_victim_question = q_has_any({"гражданин", "пострадавш", "подвергш"}) and not liquidator_question and not special_certificate_question
+        service_liquidator = service_text_has_any({"ликвидатор", "ликвидац"})
+        service_special = service_text_has_any({"специальн", "единого образца", "един образц"})
+        service_general = service_text_has_any({"граждан", "пострадавш"}) and not service_liquidator and not service_special
+        if liquidator_question:
+            if service_liquidator:
+                adjusted += 64.0
+                accumulator.match_reasons.append("усиление: удостоверение ликвидатора ЧАЭС")
+            elif service_special or service_general:
+                adjusted = min(adjusted * 0.54, 78.0)
+                accumulator.match_reasons.append("понижение: вопрос про ликвидатора ЧАЭС")
+        elif special_certificate_question:
+            if service_special:
+                adjusted += 64.0
+                accumulator.match_reasons.append("усиление: специальное чернобыльское удостоверение")
+            elif service_liquidator or service_general:
+                adjusted = min(adjusted * 0.56, 80.0)
+                accumulator.match_reasons.append("понижение: вопрос про специальное удостоверение")
+        elif general_victim_question:
+            if service_general:
+                adjusted += 52.0
+                accumulator.match_reasons.append("усиление: удостоверение гражданина, пострадавшего от ЧАЭС")
+            elif service_special:
+                adjusted = min(adjusted * 0.60, 82.0)
+                accumulator.match_reasons.append("понижение: общий пострадавший, не специальное удостоверение")
+
+    # Разделяем зубопротезирование участников/инвалидов ВОВ и ветеранов труда.
+    war_dental_question = dental_question and q_has_any({"вов", "войн", "участник", "инвалид"})
+    if war_dental_question:
+        if service_text_has_any({"вов", "великой отечественной", "участник", "инвалидов войны"}):
+            adjusted += 54.0
+            accumulator.match_reasons.append("усиление: зубопротезирование участникам/инвалидам ВОВ")
+        elif service_text_has_any({"ветеран труда", "ветеранам труда"}):
+            adjusted = min(adjusted * 0.50, 78.0)
+            accumulator.match_reasons.append("понижение: вопрос про ВОВ, не ветеранов труда")
+
+    # Распоряжение маткапиталом и земельным сертификатом часто конкурирует
+    # с услугой выдачи сертификата. Если пользователь говорит «потратить»,
+    # «использовать», «распорядиться» — выбираем распоряжение.
+    certificate_use_question = q_has_any({"сертификат"}) and q_has_any({"использ", "распоряд", "потрат", "трат", "средств"})
+    if certificate_use_question:
+        if service_text_has_any({"распоряж", "использован", "средств"}):
+            adjusted += 50.0
+            accumulator.match_reasons.append("усиление: вопрос про распоряжение средствами сертификата")
+        elif service_text_has_any({"предоставлен", "выдач", "получен"}) and not service_text_has_any({"распоряж"}):
+            adjusted = min(adjusted * 0.46, 74.0)
+            accumulator.match_reasons.append("понижение: вопрос про распоряжение, услуга про выдачу сертификата")
+
+    hemodialysis_service = s_has_any({"гемодиализ", "диализ"}) or service_text_has_any({"гемодиализ", "диализ"})
+    hemodialysis_question = q_has_any({"гемодиализ", "диализ"})
+    if hemodialysis_service and not hemodialysis_question:
+        adjusted = min(adjusted * 0.22, 54.0)
+        accumulator.match_reasons.append("сильное понижение: услуга про гемодиализ, вопрос не про гемодиализ")
+
+    disabled_medical_trip_question = (
+        "инвалид" in question_tokens
+        and q_has_any({"мсэ", "обследован", "реабилитац", "лечен"})
+        and (trip_question or q_has_any({"компенсац", "проезд"}))
+    )
+    disabled_medical_trip_service = (
+        "инвалид" in service_tokens
+        and s_has_any({"проезд", "компенсац"})
+        and s_has_any({"обследован", "реабилитац", "лечен", "мсэ"})
+    )
+    if disabled_medical_trip_question:
+        if disabled_medical_trip_service and not hemodialysis_service:
+            adjusted += 46.0
+            accumulator.match_reasons.append("усиление: вопрос про проезд инвалида на обследование/реабилитацию")
+        elif hemodialysis_service:
+            adjusted = min(adjusted * 0.26, 58.0)
+            accumulator.match_reasons.append("понижение: вопрос про МСЭ/реабилитацию, не про гемодиализ")
+
+    evenkia_disabled_treatment_question = (
+        q_has_any({"эвенки"})
+        and "инвалид" in question_tokens
+        and q_has_any({"лечен", "проезд", "дорог", "компенсац"})
+    )
+    if evenkia_disabled_treatment_question:
+        if service_text_has_any({"эвенки"}) and service_text_has_any({"лечен", "проезд"}):
+            adjusted += 58.0
+            accumulator.match_reasons.append("усиление: проезд инвалида на лечение в Эвенкии")
+        elif service_is_travel_compensation and not service_text_has_any({"эвенки"}):
+            adjusted = min(adjusted * 0.50, 74.0)
+            accumulator.match_reasons.append("понижение: вопрос про лечение в Эвенкии, услуга не территориальная")
+
+    monthly_support_question = q_has_any({"едв", "ежемесячн", "выплат", "поддержк"}) and not trip_question
+    if monthly_support_question and service_is_travel_compensation:
+        if not q_has_any({"проезд", "ехать", "съездить", "поехать", "билет", "дорог"}):
+            adjusted = min(adjusted * 0.38, 72.0)
+            accumulator.match_reasons.append("понижение: вопрос про выплату/поддержку, услуга про проезд")
+
+    honorary_taimyr_question = q_has_any({"почетн"}) and q_has_any({"гражданин"}) and q_has_any({"таймыр"})
+    honorary_evenkia_question = q_has_any({"почетн"}) and q_has_any({"жител"}) and q_has_any({"эвенки"})
+    if honorary_taimyr_question:
+        if service_text_has_any({"почетн"}) and service_text_has_any({"граждан"}) and service_text_has_any({"таймыр"}):
+            adjusted += 54.0
+            accumulator.match_reasons.append("усиление: ЕДВ почётному гражданину Таймыра")
+        elif s_has_any({"ветеран"}) or not service_text_has_any({"почетн"}):
+            adjusted = min(adjusted * 0.42, 74.0)
+            accumulator.match_reasons.append("понижение: вопрос про почётного гражданина Таймыра")
+
+    if honorary_evenkia_question:
+        if service_text_has_any({"почетн"}) and service_text_has_any({"жител"}) and service_text_has_any({"эвенки"}):
+            adjusted += 54.0
+            accumulator.match_reasons.append("усиление: ЕДВ почётному жителю Эвенкии")
+        elif not (service_text_has_any({"почетн"}) and service_text_has_any({"эвенки"})):
+            adjusted = min(adjusted * 0.42, 74.0)
+            accumulator.match_reasons.append("понижение: вопрос про почётного жителя Эвенкии")
+
+    single_mother_question = (
+        question_has_child_context
+        and ("одинок" in question_tokens or q_text_has_any({"одна воспитываю", "один воспитываю", "мать одиноч"}))
+    )
+    birth_benefit_service = service_text_has_any({"рождением ребенка", "рождение ребенка", "новорожден"})
+    single_mother_service = service_text_has_any({"одинок"}) and (service_text_has_any({"мать"}) or service_text_has_any({"матери"}))
+    if single_mother_question:
+        if single_mother_service:
+            adjusted += 50.0
+            accumulator.match_reasons.append("усиление: вопрос про одинокую мать")
+        elif birth_benefit_service and not q_has_any({"родил", "рожд", "новорожден", "двойн", "тройн"}):
+            adjusted = min(adjusted * 0.34, 62.0)
+            accumulator.match_reasons.append("понижение: вопрос про одинокую мать, услуга про рождение ребёнка")
+
+    oncology_care_question = oncology_question and q_has_any({"материальн", "уход", "одинок", "одинокопроживающ"})
+    oncology_care_service = service_text_has_any({"онколог"}) and service_text_has_any({"материальн"})
+    if oncology_care_question:
+        if oncology_care_service:
+            adjusted += 50.0
+            accumulator.match_reasons.append("усиление: материальная помощь на уход при онкологии")
+        elif service_has_social_service:
+            adjusted = min(adjusted * 0.36, 70.0)
+            accumulator.match_reasons.append("понижение: вопрос про материальную помощь при онкологии, не соцобслуживание")
+
+    low_income_child_travel_question = (
+        question_has_child_context
+        and q_has_any({"малообеспеч", "малоимущ"})
+        and (q_has_any({"проезд", "ехать", "билет", "дорог"}) or "компенсац" in question_tokens)
+    )
+    low_income_child_travel_service = (
+        service_has_child_context
+        and service_text_has_any({"малообеспеч"})
+        and service_text_has_any({"проезд"})
+    )
+    if low_income_child_travel_question:
+        if low_income_child_travel_service:
+            adjusted += 54.0
+            accumulator.match_reasons.append("усиление: проезд ребёнка из малообеспеченной семьи")
+        elif service_text_has_any({"родители являются инвалидами", "родителей являются инвалидами"}):
+            adjusted = min(adjusted * 0.38, 68.0)
+            accumulator.match_reasons.append("понижение: вопрос про проезд ребёнка, не пособие семьям инвалидов")
+
+    jku_evenkia_question = utility_question and q_has_any({"эвенки"}) and q_has_any({"льготник", "поддержк", "мсп"})
+    if jku_evenkia_question:
+        if service_text_has_any({"эвенки"}) and service_text_has_any({"мсп"}) and service_text_has_any({"жилищ", "коммун"}):
+            adjusted += 48.0
+            accumulator.match_reasons.append("усиление: МСП по оплате ЖКУ в Эвенкии")
+        elif not service_text_has_any({"эвенки"}):
+            adjusted = min(adjusted * 0.55, 78.0)
+            accumulator.match_reasons.append("понижение: вопрос про ЖКУ в Эвенкии, услуга не территориальная")
+
+    honorary_funeral_question = burial_question and q_has_any({"почетн"}) and q_has_any({"гражданин"})
+    if honorary_funeral_question:
+        if service_text_has_any({"почетн"}) and service_text_has_any({"погреб", "памятник", "похорон"}):
+            adjusted += 52.0
+            accumulator.match_reasons.append("усиление: погребение/памятник почётному гражданину")
+        elif service_text_has_any({"вов", "участник"}) and service_text_has_any({"могил"}):
+            adjusted = min(adjusted * 0.30, 64.0)
+            accumulator.match_reasons.append("понижение: вопрос про почётного гражданина, услуга про могилы участников ВОВ")
+
+    edv_regional_question = q_has_any({"едв", "ежемесячн", "выплат"}) and q_has_any({"эвенки"})
+    if edv_regional_question and q_has_any({"житель", "гражданин", "льготн"}):
+        if service_text_has_any({"эвенки"}) and service_text_has_any({"ежемесячн", "едв"}) and not service_text_has_any({"почетн"}):
+            adjusted += 36.0
+            accumulator.match_reasons.append("усиление: ЕДВ гражданам в Эвенкии")
+        elif not service_text_has_any({"эвенки"}):
+            adjusted = min(adjusted * 0.45, 72.0)
+            accumulator.match_reasons.append("понижение: вопрос про ЕДВ в Эвенкии")
+
+    radiation_family_question = q_has_any({"радиац", "чернобыл"}) and q_has_any({"сем", "родственник", "член"})
+    if radiation_family_question:
+        if service_text_has_any({"член", "сем"}) and service_text_has_any({"ежемесячн"}):
+            adjusted += 46.0
+            accumulator.match_reasons.append("усиление: ежемесячная выплата членам семьи при радиационном воздействии")
+        elif service_text_has_any({"ежегодн"}) and not service_text_has_any({"член", "сем"}):
+            adjusted = min(adjusted * 0.56, 76.0)
+            accumulator.match_reasons.append("понижение: вопрос про семью/родственника, услуга ежегодная для гражданина")
+
+    current_repair_question = repair_question and not stove_specific_question
+    current_repair_service = service_text_has_any({"текущий ремонт", "ремонт жилого помещения"}) and not service_has_stove_repair
+    if current_repair_question:
+        if current_repair_service:
+            adjusted += 44.0
+            accumulator.match_reasons.append("усиление: текущий ремонт жилого помещения")
+        elif service_has_stove_repair:
+            adjusted = min(adjusted * 0.44, 62.0)
+            accumulator.match_reasons.append("сильное понижение: вопрос про общий ремонт жилья, не печное отопление")
+
+    pension_rest_travel_question = q_has_any({"пенсионер", "пенси"}) and q_has_any({"отдых", "проезд", "съездить", "поехать"})
+    if pension_rest_travel_question:
+        if service_text_has_any({"социальн"}) and service_text_has_any({"пенси"}) and service_text_has_any({"месту отдыха", "отдых"}):
+            adjusted += 50.0
+            accumulator.match_reasons.append("усиление: проезд получателя социальной пенсии к месту отдыха")
+        elif not service_text_has_any({"пенси"}) and service_is_travel_compensation:
+            adjusted = min(adjusted * 0.52, 70.0)
+            accumulator.match_reasons.append("понижение: вопрос про пенсионера к месту отдыха")
+
+    unemployed_travel_question = q_has_any({"безработн", "неработающ"}) and q_has_any({"проезд", "компенсир"})
+    if unemployed_travel_question:
+        if service_text_has_any({"безработн"}) and service_text_has_any({"проезд"}):
+            adjusted += 54.0
+            accumulator.match_reasons.append("усиление: проезд безработным гражданам")
+        elif service_is_travel_compensation:
+            adjusted = min(adjusted * 0.55, 72.0)
+            accumulator.match_reasons.append("понижение: вопрос про проезд безработного")
+
+    land_certificate_question_v2 = "сертификат" in question_tokens and q_has_any({"земл", "земельн"})
+    land_use_question_v2 = land_certificate_question_v2 and q_text_has_any({"распоряд", "использ", "потрат", "куп", "строит", "приобрест"})
+    if land_use_question_v2:
+        if service_text_has_any({"распоряж"}):
+            adjusted += 54.0
+            accumulator.match_reasons.append("усиление: распоряжение земельным сертификатом")
+        elif service_text_has_any({"получен", "выдач"}):
+            adjusted = min(adjusted * 0.38, 66.0)
+            accumulator.match_reasons.append("сильное понижение: вопрос про распоряжение, услуга про выдачу сертификата")
+
+    fallen_military_family_question = (
+        q_has_any({"погибш", "умерш"})
+        and q_has_any({"военнослужащ"})
+        and q_has_any({"родственник", "сем", "член", "ежемесячн", "поддержк", "выплат"})
+    )
+    if fallen_military_family_question:
+        if service_text_has_any({"погибш"}) and service_text_has_any({"военнослужащ"}) and service_text_has_any({"ежемесячн", "едв", "сем"}):
+            adjusted += 60.0
+            accumulator.match_reasons.append("усиление: ЕДВ членам семей погибших военнослужащих")
+        elif not service_text_has_any({"военнослужащ"}):
+            adjusted = min(adjusted * 0.45, 68.0)
+            accumulator.match_reasons.append("понижение: вопрос про погибшего военнослужащего")
 
     # Чисто общий вопрос «ЕДВ» без уточняющих признаков лучше оставить
     # неоднозначным: таких услуг в корпусе несколько.
@@ -927,6 +1423,24 @@ def _choose_resolution_status(
             return "resolved", first
         if first.score >= 88.0 and first_specificity > second_specificity + 2.5:
             return "resolved", first
+
+        # fix_12: из-за верхнего ограничения score=100 несколько точных
+        # кандидатов часто выглядели равными, хотя первый был предметно
+        # богаче: больше точных aliases / специфичных терминов. В таких
+        # случаях оставлять ambiguous вредно — дальше retrieval остаётся без
+        # service_key и ответ уходит в safe/no-answer. Правило применяем
+        # только при сильном точном сигнале у первого кандидата.
+        first_alias_count = len(first.matched_aliases)
+        second_alias_count = len(second.matched_aliases)
+        first_term_count = len(first.matched_terms)
+        second_term_count = len(second.matched_terms)
+        if first.score >= 98.0 and second.score >= 90.0:
+            if first_specificity >= second_specificity + 4.0:
+                return "resolved", first
+            if first_alias_count >= second_alias_count + 2:
+                return "resolved", first
+            if first_alias_count >= second_alias_count + 1 and first_term_count >= second_term_count + 2:
+                return "resolved", first
 
     if second.score >= 45.0 and score_gap < ambiguity_margin:
         return "ambiguous", None
@@ -1330,6 +1844,25 @@ def _normalize_token(token: str) -> str:
         "пожаре": "пожар",
         "дрова": "дрова",
         "дров": "дрова",
+        "инвалидности": "инвалид",
+        "инвалидностью": "инвалид",
+        "инвалидам": "инвалид",
+        "инвалида": "инвалид",
+        "инвалиду": "инвалид",
+        "инвалидом": "инвалид",
+        "родитель": "родител",
+        "родителя": "родител",
+        "родителю": "родител",
+        "родители": "родител",
+        "родителей": "родител",
+        "родителем": "родител",
+        "родилась": "рожд",
+        "родился": "рожд",
+        "родились": "рожд",
+        "родится": "рожд",
+        "новорожденных": "новорожденн",
+        "новорожденного": "новорожденн",
+        "новорожденные": "новорожденн",
     }
     if token in special:
         return special[token]

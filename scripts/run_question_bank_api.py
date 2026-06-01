@@ -588,6 +588,9 @@ def evaluate_result(row: dict[str, Any], resolver: ResolverInfo) -> DiagnosticRe
     if dump_score >= 3:
         flags.append("answer_technical_table_dump")
 
+    if eligibility_header_noise_score(answer) > 0:
+        flags.append("answer_identifier_header_noise")
+
     # Resolver diagnostics.
     if resolver.status in {"", "unknown"}:
         flags.append("resolver_status_missing")
@@ -627,9 +630,21 @@ def evaluate_result(row: dict[str, Any], resolver: ResolverInfo) -> DiagnosticRe
     if found_target_terms:
         notes.append("answer_mentions_target")
     else:
-        # Do not over-penalize service discovery, but for expected-service test cases it is useful.
-        if resolver.status in {"resolved", "ambiguous", "not_found"}:
-            flags.append("answer_target_not_mentioned")
+        if is_resolved_eligibility_category_answer(row, resolver, question_norm, answer_norm):
+            # Для вопросов «могу ли получить / подать заявление» нормальный
+            # ответ может перечислять категории заявителей, не повторяя
+            # формулировку expected_service_hint из банка вопросов.
+            notes.append("answer_has_applicant_category_evidence")
+        else:
+            # fix_08: если resolver уже не выбрал ожидаемую услугу или ушёл
+            # в ambiguous/not_found, отсутствие expected_service_hint в ответе
+            # является следствием resolver-дефекта и только шумит в сводке.
+            # Оставляем этот флаг для случая, когда услуга выбрана правильно,
+            # но сам текст ответа не отражает ожидаемую тему.
+            if resolver.status == "resolved" and resolver.resolved_matches_expected:
+                flags.append("answer_target_not_mentioned")
+            elif resolver.status in {"resolved", "ambiguous", "not_found"}:
+                notes.append("answer_target_check_skipped_due_resolver")
 
     if "документ" in question_norm and "документ" not in answer_norm:
         flags.append("answer_documents_question_without_document_word")
@@ -649,6 +664,40 @@ def evaluate_result(row: dict[str, Any], resolver: ResolverInfo) -> DiagnosticRe
     return DiagnosticResult(unique(flags), unique(notes), primary_issue_class(flags))
 
 
+def is_resolved_eligibility_category_answer(
+    row: dict[str, Any],
+    resolver: ResolverInfo,
+    question_norm: str,
+    answer_norm: str,
+) -> bool:
+    if resolver.status != "resolved" or not resolver.resolved_matches_expected:
+        return False
+
+    if "категория заявителей" not in answer_norm:
+        return False
+
+    if is_safe_or_uncertain(answer_norm):
+        return False
+
+    eligibility_markers = (
+        "могу ли",
+        "можно ли",
+        "положено",
+        "имею право",
+        "право на",
+        "получить помощь",
+        "подать заявление",
+    )
+    if any(marker in question_norm for marker in eligibility_markers):
+        return True
+
+    profile = str(row.get("question_profile") or "").strip().lower()
+    return bool(profile) and not any(
+        marker in profile
+        for marker in ("documents", "rejection", "deadline", "procedure", "form")
+    )
+
+
 def primary_issue_class(flags: list[str]) -> str:
     if not flags:
         return "ok"
@@ -663,6 +712,7 @@ def primary_issue_class(flags: list[str]) -> str:
         ("resolver_not_found", "resolver"),
         ("answer_safe_no_answer", "answer"),
         ("answer_technical_table_dump", "answer"),
+        ("answer_identifier_header_noise", "answer"),
         ("answer_extremely_long", "answer"),
         ("answer_very_long", "answer"),
         ("answer_target_not_mentioned", "answer"),
@@ -820,6 +870,18 @@ def is_safe_or_uncertain(answer_norm: str) -> bool:
         "не удалось надёжно",
     ]
     return any(marker in answer_norm for marker in safe_markers)
+
+
+def eligibility_header_noise_score(answer: str) -> int:
+    answer_norm = normalize_text(answer)
+    markers = [
+        "категория заявителей наименование признака заявителя",
+        "категория заявителей идентификаторы категорий",
+        "категория заявителей перечень результатов предоставления",
+        "категория заявителей результат предоставления государственной услуги",
+        "категория заявителей принятие решения",
+    ]
+    return sum(1 for marker in markers if marker in answer_norm)
 
 
 def technical_dump_score(answer: str) -> int:
@@ -1163,6 +1225,7 @@ def write_counter_tsv(path: Path, data: dict[str, dict[str, int]], *, key_name: 
         "answer_very_long",
         "answer_extremely_long",
         "answer_technical_table_dump",
+        "answer_identifier_header_noise",
         "answer_target_not_mentioned",
     ]
     headers = [key_name, "total", "ok", "with_flags"] + optional_flags

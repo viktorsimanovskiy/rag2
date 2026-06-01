@@ -416,7 +416,7 @@ class AnswerOrchestrator:
         """
         total_started_at = time.perf_counter()
         details: dict[str, Any] = {
-            "version": "step65_session_fast_path_v1",
+            "version": "step66_deferred_session_commit_v1",
             "session_created": False,
             "existing_session_fast_path": False,
         }
@@ -455,10 +455,22 @@ class AnswerOrchestrator:
             },
         )
         self.db.add(session)
-        await self.db.commit()
-        await self.db.refresh(session)
-        details["commit_refresh_sec"] = round(time.perf_counter() - started_at, 6)
+
+        # Do not commit/refresh the newly created session here.
+        #
+        # In the question-bank run every API call uses a fresh external_session_id.
+        # On the VPS the old commit+refresh path for a new ConversationSession
+        # sometimes took 30-50 seconds, while the actual RAG path stayed below
+        # one second. The session_id is generated application-side, so the next
+        # step can create QuestionEvent in the same transaction and commit both
+        # rows together. This keeps the hot path safe and avoids an unnecessary
+        # round trip before the answer is built.
+        await self.db.flush()
+
+        details["flush_sec"] = round(time.perf_counter() - started_at, 6)
+        details["commit_refresh_sec"] = 0.0
         details["session_created"] = True
+        details["session_persist_mode"] = "flush_only_deferred_commit"
         details["total_sec"] = round(time.perf_counter() - total_started_at, 6)
         self._last_session_resolution_timings = details
         return session

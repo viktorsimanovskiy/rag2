@@ -97,6 +97,7 @@ class DocumentsAnswerBuildResult:
         }
 
 
+# fix_10: формулировка заголовка документов без слова "обычно".
 class TableDocumentsAnswerBuilder:
     """
     Deterministic builder for document-list questions based on table rows.
@@ -318,10 +319,10 @@ class TableDocumentsAnswerBuilder:
         if result.base_items:
             if has_channel:
                 lines.append(
-                    f"Для предоставления услуги при подаче {channel_label} обычно требуются следующие документы:"
+                    f"Для предоставления услуги при подаче {channel_label} требуются следующие документы:"
                 )
             else:
-                lines.append("Для предоставления услуги обычно требуются следующие документы:")
+                lines.append("Для предоставления услуги требуются следующие документы:")
 
             counter = 1
             for item in result.base_items:
@@ -404,12 +405,37 @@ class TableDocumentsAnswerBuilder:
         if document_family == "identity_document":
             return "Паспорт или иной документ, удостоверяющий личность"
 
-        if "(" in text and ")" in text:
-            base = text.split("(")[0].strip()
-            if base:
-                return base
+        return self._normalize_user_facing_document_name(text)
 
-        return text
+    def _normalize_user_facing_document_name(self, value: str) -> str:
+        """first_step_fix_11_documents_readability.
+
+        Готовим название документа для короткого ответа пользователю.
+
+        Важно: нельзя отрезать всё после первой скобки. В НПА скобки часто
+        несут смысл, например "(расторжения) брака". Раньше такая строка
+        превращалась в "документ о государственной регистрации заключения",
+        что делало ответ непонятным.
+        """
+        text = self._clean(value) or ""
+        lower = text.lower().replace("ё", "е")
+
+        if (
+            "государственной регистрации" in lower
+            and "брак" in lower
+            and ("смен" in lower or "фамил" in lower or "отчеств" in lower)
+        ):
+            return (
+                "документ о заключении или расторжении брака либо о смене "
+                "фамилии, имени, отчества — при наличии"
+            )
+
+        # Убираем только служебные оговорки, которые не меняют наименование
+        # документа. Смысловые скобки вроде "(расторжения) брака" сохраняем.
+        text = re.sub(r"\s*\((?:при наличии|при их наличии)\)\s*", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*\((?:далее\s*[-—]\s*[^)]*)\)\s*", " ", text, flags=re.IGNORECASE)
+
+        return self._clean(text) or ""
 
     def _resolve_requested_channel_key(
         self,
@@ -1796,9 +1822,12 @@ class TableDocumentsAnswerBuilder:
         *,
         has_channel: bool,
     ) -> str:
+        # Use "1)" instead of "1." so Telegram/Markdown clients do not split
+        # the number and the document name into awkward list formatting.
+        name = self._normalize_user_facing_document_name(item.document_name)
         if has_channel and item.submission_note:
-            return f"{idx}. {item.document_name} — {item.submission_note}"
-        return f"{idx}. {item.document_name}"
+            return f"{idx}) {name} — {item.submission_note}"
+        return f"{idx}) {name}"
 
     def _render_bulleted_item(
         self,
@@ -1806,9 +1835,10 @@ class TableDocumentsAnswerBuilder:
         *,
         has_channel: bool,
     ) -> str:
+        name = self._normalize_user_facing_document_name(item.document_name)
         if has_channel and item.submission_note:
-            return f"— {item.document_name} — {item.submission_note}"
-        return f"— {item.document_name}"
+            return f"• {name} — {item.submission_note}"
+        return f"• {name}"
 
     def _extract_submission_note(
         self,

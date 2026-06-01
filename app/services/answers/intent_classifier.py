@@ -20,7 +20,7 @@ from typing import Any, Iterable
 from app.db.models.enums import QuestionIntentEnum
 
 
-CLASSIFIER_VERSION = "rule_based_intent_classifier_v2_demo_stabilization"
+CLASSIFIER_VERSION = "rule_based_intent_classifier_v3_documents_before_discovery"
 
 
 @dataclass(slots=True)
@@ -243,6 +243,15 @@ def _build_rules() -> list[IntentRule]:
                 r"\bпособи[яй]\s+для\b",
                 r"\bмне\s+нужна\s+помощь\b",
             ),
+            stop_patterns=(
+                # Если пользователь явно спрашивает документы, даже в фразе
+                # "выплата для ...", это не service_discovery, а documents path.
+                r"\bдокумент[а-я]*\b",
+                r"\bсписок\s+документ[а-я]*\b",
+                r"\bперечень\s+документ[а-я]*\b",
+                r"\bпакет\s+документ[а-я]*\b",
+                r"\bчто\s+(?:нужно|надо)\s+(?:приложить|предоставить|подать|донести)\b",
+            ),
             adds_constraints={
                 "requires_service_discovery": True,
                 "avoid_single_service_resolution": True,
@@ -282,7 +291,7 @@ def _build_rules() -> list[IntentRule]:
         IntentRule(
             code="documents_direct",
             intent_type=QuestionIntentEnum.DOCUMENTS_QUESTION,
-            weight=110,
+            weight=140,
             patterns=(
                 r"\bкакие\s+документ[а-я]*\b",
                 r"\bкакой\s+пакет\s+документ[а-я]*\b",
@@ -291,6 +300,9 @@ def _build_rules() -> list[IntentRule]:
                 r"\bчто\s+(?:нужно|надо)\s+(?:приложить|предоставить|подать|донести)\b",
                 r"\bнужн[а-я]*\s+ли\s+.*документ[а-я]*\b",
                 r"\bдокумент[а-я]*\s+нужн[а-я]*\b",
+                r"\bдокумент[а-я]*\s+для\s+(?:получени[яе]|оформлени[яе]|назначени[яе]|предоставлени[яе])\b",
+                r"\bдокумент[а-я]*\s+(?:на|для)\s+(?:выплат[а-я]*|едв|пособи[яе]|компенсаци[яи]|субсиди[яюи])\b",
+                r"\b(?:список|перечень)\s+документ[а-я]*\s+для\s+(?:получени[яе]|оформлени[яе]|назначени[яе]|предоставлени[яе])\b",
             ),
         ),
         IntentRule(
@@ -382,6 +394,26 @@ def _build_rules() -> list[IntentRule]:
                 r"\bперечень\s+категори[йи]\b",
                 r"\bуслови[яе]\s+(?:получени[яе]|назначени[яе]|предоставлени[яе])\b",
             ),
+        ),
+        IntentRule(
+            code="eligibility_apply_or_receive_specific",
+            intent_type=QuestionIntentEnum.ELIGIBILITY_QUESTION,
+            weight=100,
+            patterns=(
+                r"\bмогу\s+ли\s+(?:я\s+)?подать\s+заявлени[ея]\b",
+                r"\bмогу\s+ли\s+(?:я\s+)?(?:получить|оформить)\b",
+                r"\bможно\s+ли\s+(?:мне\s+)?(?:получить|оформить)\b",
+                r"\bможно\s+ли\s+получить\s+помощь\s+от\s+соцзащит[ыа]\b",
+                r"\bнужн[а-я]*\s+.*\bможно\s+ли\s+получить\s+помощь\b",
+                r"\bхочу\s+.*\bможно\s+ли\s+получить\s+помощь\b",
+            ),
+            stop_patterns=(
+                r"\bчерез\s+(?:мфц|епгу|госуслуг[аи]?|рпгу|региональный\s+портал|краевой\s+портал)\b",
+                r"\b(?:онлайн|почт[а-я]*|лично|личном\s+приеме)\b",
+            ),
+            adds_payload={
+                "routing_note": "вопрос о праве заявителя на конкретную услугу или выплату",
+            },
         ),
         IntentRule(
             code="procedure_how_to_get",

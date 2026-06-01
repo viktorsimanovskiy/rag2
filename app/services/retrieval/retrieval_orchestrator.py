@@ -429,14 +429,17 @@ class RetrievalOrchestrator:
         if intent == QuestionIntentEnum.ELIGIBILITY_QUESTION:
             return RetrievalStrategy(
                 strategy_code="eligibility_priority",
-                use_facts=True,
-                use_tables=True,
+                # Для вопросов о праве/категории заявителя источник ответа —
+                # строки identifiers. Факты, целые таблицы и блоки часто
+                # добавляют технические шапки или общие процедурные абзацы.
+                use_facts=False,
+                use_tables=False,
                 use_rows=True,
-                use_blocks=True,
-                facts_weight=1.30,
-                tables_weight=0.95,
-                rows_weight=1.00,
-                blocks_weight=1.10,
+                use_blocks=False,
+                facts_weight=0.00,
+                tables_weight=0.00,
+                rows_weight=1.45,
+                blocks_weight=0.00,
             )
 
         if intent == QuestionIntentEnum.PROCEDURE_QUESTION:
@@ -1325,7 +1328,246 @@ class RetrievalOrchestrator:
         metadata = candidate.metadata_json or {}
         actual = str(metadata.get("table_semantic_type") or "").strip().lower()
         return actual == expected_type.strip().lower()
-        
+
+    def _is_meaningful_identifier_row(self, candidate: RetrievedCandidate) -> bool:
+        """Return True only for real applicant-category rows.
+
+        Header rows inside identifiers tables often contain words like
+        "заявителей" in the column names, while result columns contain phrases
+        like "принятие решения о предоставлении".  Those values are not
+        applicant categories and must not be selected for eligibility answers.
+        """
+        if candidate.source_type != "table_row":
+            return False
+        if not self._has_table_semantic_type(candidate, "identifiers"):
+            return False
+
+        metadata = candidate.metadata_json or {}
+        category_values = self._identifier_category_values_from_metadata(metadata)
+
+        if not category_values and candidate.snippet:
+            # Last-resort fallback only for rows that explicitly look like a
+            # category row, not for full technical table dumps.
+            snippet = self._normalize_text(str(candidate.snippet).replace("_", " "))
+            if (
+                "колонки таблицы" not in snippet
+                and "идентификаторы категорий" not in snippet
+                and "наименование" not in snippet
+            ):
+                category_values.append(snippet)
+
+        for value in category_values:
+            text = " ".join(str(value).replace("_", " ").split()).strip(" .;:-")
+            if not text:
+                continue
+            normalized = self._normalize_text(text)
+            if not normalized:
+                continue
+            if self._is_identifier_header_value(normalized):
+                continue
+            if len(normalized) <= 3 and normalized.replace(".", "").isalnum():
+                continue
+            if self._looks_like_applicant_category_text(normalized):
+                return True
+
+        return False
+
+    def _identifier_category_values_from_metadata(self, metadata: dict[str, Any]) -> list[str]:
+        values: list[str] = []
+
+        def add_value(value: Any) -> None:
+            if value is None:
+                return
+            text = str(value).strip()
+            if text:
+                values.append(text)
+
+        semantic_keys = (
+            "applicant_category_name",
+            "applicant_category",
+            "category_name",
+            "наименование_значение_признаков_заявителей",
+            "наименование_отдельных_признаков_заявителей",
+            "наименование_признака_заявителя",
+            "наименование_признаков_заявителей",
+        )
+
+        for map_key in (
+            "cells_by_semantic_key",
+            "cells_by_header_normalized",
+            "cells_by_header_key",
+        ):
+            cell_map = metadata.get(map_key)
+            if not isinstance(cell_map, dict):
+                continue
+            for key in semantic_keys:
+                if key in cell_map:
+                    add_value(cell_map.get(key))
+
+        cell_map = metadata.get("cells_by_header")
+        if isinstance(cell_map, dict):
+            for key, value in cell_map.items():
+                key_norm = self._normalize_text(str(key).replace("_", " "))
+                if (
+                    "наименование" in key_norm
+                    and "признак" in key_norm
+                    and "заявител" in key_norm
+                ) or "категор" in key_norm:
+                    add_value(value)
+
+        if values:
+            return values
+
+        cells_text = metadata.get("cells_text")
+        if isinstance(cells_text, list) and len(cells_text) >= 2:
+            # Most identifiers tables have: N п/п | applicant category | result.
+            add_value(cells_text[1])
+
+        return values
+
+    def _is_identifier_header_value(self, normalized_text: str) -> bool:
+        text = " ".join(
+            str(normalized_text or "")
+            .replace("ё", "е")
+            .replace("_", " ")
+            .split()
+        ).strip()
+        if not text:
+            return True
+
+        exact_headers = {
+            "n",
+            "n п п",
+            "номер",
+            "колонка 1",
+            "колонка 2",
+            "колонка 3",
+            "идентификаторы категорий",
+            "идентификаторы категорий признаков заявителей",
+            "наименование признака заявителя",
+            "наименование значение признаков заявителей",
+            "наименование отдельных признаков заявителей",
+            "наименование признаков заявителей",
+            "категория заявителей",
+            "категории заявителей",
+            "перечень результатов предоставления государственной услуги",
+            "результат предоставления государственной услуги",
+            "принятие решения о предоставлении отказе в предоставлении мер социальной поддержки",
+            "принятие решения о предоставлении мер социальной поддержки в упреждающем проактивном порядке",
+        }
+        if text in exact_headers:
+            return True
+        if (
+            "идентификаторы категорий" in text
+            or ("наименование" in text and "признак" in text and "заявител" in text)
+        ):
+            return True
+        if "перечень результатов предоставления" in text:
+            return True
+        if "результат предоставления государственной услуги" in text:
+            return True
+        if text.startswith("принятие решения о предоставлении"):
+            return True
+        if text.startswith("принятие решения об отказе"):
+            return True
+        return False
+
+    def _looks_like_applicant_category_text(self, normalized_text: str) -> bool:
+        text = " ".join(
+            str(normalized_text or "")
+            .replace("ё", "е")
+            .replace("_", " ")
+            .split()
+        ).strip()
+        if not text:
+            return False
+        if self._is_identifier_header_value(text):
+            return False
+        if "принятие решения" in text and "предоставлен" in text:
+            return False
+
+        markers = (
+            "заявител",
+            "граждан",
+            "лиц",
+            "лицо",
+            "инвалид",
+            "ветеран",
+            "участник",
+            "труженик",
+            "пенсионер",
+            "сем",
+            "родител",
+            "ребенок",
+            "ребен",
+            "дет",
+            "женщин",
+            "мужчин",
+            "вдов",
+            "реабилит",
+            "награжден",
+            "пострадав",
+            "подвергш",
+            "проживающ",
+            "нуждающ",
+            "одинок",
+            "отсутствие",
+            "умерш",
+            "погибш",
+            "удостоенн",
+            "имеющ",
+            "получател",
+            "служб",
+            "узник",
+            "концлагер",
+            "выпускник",
+            "специалист",
+            "почетн",
+            "жител",
+            "сирот",
+            "учащ",
+            "студент",
+            "безработн",
+            "неработающ",
+            "молод",
+            "матер",
+            "мать",
+        )
+        if any(marker in text for marker in markers):
+            return True
+
+        # fix_08: в части регламентов таблица identifiers содержит
+        # категории без привычных слов «гражданин/заявитель/инвалид»,
+        # например «бывшие несовершеннолетние узники...» или
+        # «выпускники вузов...». Если значение взято именно из колонки
+        # категории заявителя, не является шапкой и не похоже на
+        # процедурный результат, принимаем его как осмысленную строку.
+        hard_noise_markers = (
+            "документ",
+            "заявлен",
+            "срок",
+            "уведом",
+            "жалоб",
+            "административн",
+            "приложен",
+            "регламент",
+            "работник",
+            "уполномоченн",
+            "межведомствен",
+            "приняти",
+            "решен",
+            "предоставлен",
+            "отказ",
+        )
+        if (
+            2 <= len(text.split()) <= 80
+            and not any(marker in text for marker in hard_noise_markers)
+            and any(ch.isalpha() for ch in text)
+        ):
+            return True
+
+        return False
+
     def _looks_like_service_documents_row(self, candidate: RetrievedCandidate) -> bool:
         text = self._candidate_text_blob(candidate)
 
@@ -1445,6 +1687,17 @@ class RetrievalOrchestrator:
                 "required_documents",
                 "documents_for_service",
             ]
+
+        if intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION:
+            return [
+                "identifiers",
+                "applicant_categories",
+                "категории заявителей",
+                "признаки заявителей",
+                "имеет право",
+                "заявители",
+            ]
+
         return []
 
     # --------------------------------------------------------
@@ -1602,14 +1855,18 @@ class RetrievalOrchestrator:
             )
 
         if payload.intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION:
-            # Для eligibility нельзя брать формы заявлений: они длинные, совпадают по
-            # общим словам и затем превращаются в мусорный grounded narrative.
+            # Для вопросов о праве на меру главный структурный источник —
+            # таблица идентификаторов категорий заявителей. Документные таблицы
+            # здесь дают шум: вместо ответа о праве пользователь получает
+            # фрагменты перечня документов.
             stmt = stmt.where(
-                DocumentTable.metadata_json["table_semantic_type"].astext.notin_(
-                    ["form_fields", "forms", "form"]
+                or_(
+                    DocumentTable.metadata_json["table_semantic_type"].astext.in_(
+                        ["identifiers", "applicant_categories", "categories"]
+                    ),
+                    DocumentTable.table_type == "identifiers",
                 )
             )
-            stmt = stmt.where(DocumentTable.table_type != "form_table")
 
         if payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION:
             stmt = stmt.where(
@@ -1674,6 +1931,20 @@ class RetrievalOrchestrator:
                 else_=0.0,
             )
 
+        if payload.intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION:
+            # Даже если в конкретной строке таблицы 1 нет всех слов вопроса,
+            # принадлежность к identifiers уже является сильным сигналом: это
+            # регламентная таблица категорий заявителей.
+            row_score_expr = row_score_expr + case(
+                (
+                    DocumentTableRow.metadata_json["table_semantic_type"].astext.in_(
+                        ["identifiers", "applicant_categories", "categories"]
+                    ),
+                    0.75,
+                ),
+                else_=0.0,
+            )
+
         if (
             payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION
             and question_rejection_scope
@@ -1712,11 +1983,12 @@ class RetrievalOrchestrator:
             )
 
         if payload.intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION:
-            # Не допускаем строки форм заявлений в eligibility-path.
-            # Они дают длинные персональные шаблоны вместо условий права на меру.
+            # В текущем корпусе для ответа о праве на конкретную услугу
+            # используем строки таблицы identifiers. Это предотвращает уход
+            # в документы/формы и даёт пользователю категории заявителей.
             stmt = stmt.where(
-                DocumentTableRow.metadata_json["table_semantic_type"].astext.notin_(
-                    ["form_fields", "forms", "form"]
+                DocumentTableRow.metadata_json["table_semantic_type"].astext.in_(
+                    ["identifiers", "applicant_categories", "categories"]
                 )
             )
 
@@ -2322,6 +2594,7 @@ class RetrievalOrchestrator:
         is_documents_question = payload.intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION
         is_deadline_question = payload.intent_type == QuestionIntentEnum.DEADLINE_QUESTION
         is_rejection_question = payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION
+        is_eligibility_question = payload.intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION
         wants_full_documents_list = bool(query_bundle.get("wants_full_documents_list"))
         resolved_service_key = self._get_resolved_service_key(payload)
 
@@ -2359,6 +2632,16 @@ class RetrievalOrchestrator:
                 "legal_fact": 0,
                 "table": 1,
                 "table_row": min(max(8, payload.final_top_k), 12),
+                "block": 0,
+            }
+        elif is_eligibility_question:
+            # Для вопросов «могу ли получить / подать заявление» источник
+            # ответа — строки таблицы identifiers. Табличная шапка, block-и
+            # и legal_fact-и часто добавляют в ответ технический или общий шум.
+            type_caps = {
+                "legal_fact": 0,
+                "table": 0,
+                "table_row": min(max(6, payload.final_top_k), 10),
                 "block": 0,
             }
         else:
@@ -2403,6 +2686,21 @@ class RetrievalOrchestrator:
                         question_rejection_scope=question_rejection_scope,
                         priority_document_set=priority_document_set,
                     ),
+                    -self._candidate_effective_score(candidate),
+                )
+            )
+        elif is_eligibility_question:
+            ordered_candidates.sort(
+                key=lambda candidate: (
+                    0 if (
+                        candidate.document_id in priority_document_set
+                        and candidate.source_type == "table_row"
+                        and self._has_table_semantic_type(candidate, "identifiers")
+                    ) else 1 if (
+                        candidate.source_type == "table_row"
+                        and self._has_table_semantic_type(candidate, "identifiers")
+                    ) else 2,
+                    int((candidate.metadata_json or {}).get("row_order") or 10**9),
                     -self._candidate_effective_score(candidate),
                 )
             )
@@ -2487,8 +2785,15 @@ class RetrievalOrchestrator:
                 if candidate.source_type in {"block", "legal_fact"} and resolved_service_key:
                     continue
 
-            if payload.intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION and self._is_form_candidate(candidate):
-                continue
+            if is_eligibility_question:
+                if self._is_form_candidate(candidate):
+                    continue
+                if candidate.source_type != "table_row":
+                    continue
+                if not self._has_table_semantic_type(candidate, "identifiers"):
+                    continue
+                if not self._is_meaningful_identifier_row(candidate):
+                    continue
 
             if is_deadline_question:
                 has_temporal_markers = self._has_temporal_deadline_markers(candidate)
@@ -2516,6 +2821,8 @@ class RetrievalOrchestrator:
                 max_per_document = 8 if candidate.document_id in priority_document_set else 1
             elif is_rejection_question:
                 max_per_document = 10 if candidate.document_id in priority_document_set else 3
+            elif is_eligibility_question:
+                max_per_document = 8 if candidate.document_id in priority_document_set else 2
             else:
                 max_per_document = 6 if candidate.document_id in priority_document_set else 3
 
@@ -2575,8 +2882,15 @@ class RetrievalOrchestrator:
                     if candidate.source_type in {"block", "legal_fact"} and resolved_service_key:
                         continue
 
-                if payload.intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION and self._is_form_candidate(candidate):
-                    continue
+                if is_eligibility_question:
+                    if self._is_form_candidate(candidate):
+                        continue
+                    if candidate.source_type != "table_row":
+                        continue
+                    if not self._has_table_semantic_type(candidate, "identifiers"):
+                        continue
+                    if not self._is_meaningful_identifier_row(candidate):
+                        continue
 
                 if is_deadline_question:
                     has_temporal_markers = self._has_temporal_deadline_markers(candidate)
@@ -2592,8 +2906,35 @@ class RetrievalOrchestrator:
                 selected.append(candidate)
                 selected_keys.add(candidate_key)
 
+        if is_eligibility_question:
+            selected = self._hard_filter_eligibility_candidates(selected)
+
         return selected
-            
+
+    def _hard_filter_eligibility_candidates(
+        self,
+        candidates: list[RetrievedCandidate],
+    ) -> list[RetrievedCandidate]:
+        """Keep only real identifiers table rows for eligibility answers."""
+        filtered: list[RetrievedCandidate] = []
+        seen: set[tuple[str, UUID]] = set()
+
+        for candidate in candidates:
+            if candidate.source_type != "table_row":
+                continue
+            if not self._has_table_semantic_type(candidate, "identifiers"):
+                continue
+            if not self._is_meaningful_identifier_row(candidate):
+                continue
+
+            key = (candidate.source_type, candidate.source_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            filtered.append(candidate)
+
+        return filtered
+
     def _build_evidence_package(
         self,
         *,
@@ -2607,6 +2948,9 @@ class RetrievalOrchestrator:
         document_stats: dict[UUID, dict[str, Any]],
         priority_document_ids: list[UUID],
     ) -> EvidencePackage:
+        if strategy.strategy_code == "eligibility_priority":
+            final_candidates = self._hard_filter_eligibility_candidates(final_candidates)
+
         fact_ids: list[UUID] = []
         table_ids: list[UUID] = []
         row_ids: list[UUID] = []

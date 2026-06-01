@@ -397,6 +397,8 @@ class GenerationPipeline:
             citations_json=citations,
             answer_payload_json={
                 "strategy_code": plan.strategy_code,
+                "pipeline_version": "generation_pipeline_v6_eligibility_hard_filter",
+                "eligibility_cleanup_version": "v6_hard_filter",
                 "plan_warnings": plan.warnings,
                 "plan_no_answer_reason_code": plan.no_answer_reason_code,
                 "plan_context_json": plan.context_json,
@@ -419,7 +421,7 @@ class GenerationPipeline:
             evidence_items=evidence_items,
             generation_model_name=None,
             generation_prompt_version="grounded_template_v1",
-            pipeline_version="generation_pipeline_v5_compact_documents_mode",
+            pipeline_version="generation_pipeline_v6_eligibility_hard_filter",
         )
 
     def _extract_document_focus(
@@ -1264,13 +1266,29 @@ class GenerationPipeline:
         points: list[str] = []
 
         for candidate in primary_candidates:
+            if payload.intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION:
+                if candidate.source_type != "table_row":
+                    continue
+                candidate_metadata = candidate.metadata_json or {}
+                if self._metadata_table_semantic_type(candidate_metadata) not in {
+                    "identifiers",
+                    "applicant_categories",
+                    "categories",
+                }:
+                    continue
+
             point = self._candidate_to_answer_point(
                 candidate=candidate,
                 hydrated_objects=hydrated_objects,
                 intent_type=payload.intent_type,
             )
+            if payload.intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION:
+                point = self._clean_eligibility_answer_point(point)
             if point and point not in points:
                 points.append(point)
+
+        if payload.intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION:
+            return self._finalize_eligibility_answer_points(points)[:6]
 
         return points[:6]
 
@@ -1328,9 +1346,36 @@ class GenerationPipeline:
         elif candidate.source_type == "table_row":
             row = hydrated_objects["rows"].get(candidate.source_id)
             if row is None:
+                if (
+                    intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION
+                    and self._metadata_table_semantic_type(candidate.metadata_json or {}) in {
+                        "identifiers",
+                        "applicant_categories",
+                        "categories",
+                    }
+                ):
+                    point = self._identifier_row_to_answer_point(candidate.metadata_json or {})
+                    if point:
+                        return self._normalize_sentence(point)
                 return self._normalize_sentence(
                     self._clean_answer_point(candidate.snippet, intent_type=intent_type)
                 )
+
+            metadata_json = getattr(row, "metadata_json", {}) or {}
+            if (
+                intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION
+                and self._metadata_table_semantic_type(metadata_json) in {
+                    "identifiers",
+                    "applicant_categories",
+                    "categories",
+                }
+            ):
+                point = self._identifier_row_to_answer_point(metadata_json)
+                if point:
+                    return self._normalize_sentence(point)
+                # Для identifiers не падаем в row_summary: там часто лежит
+                # техническая шапка таблицы, а не категория заявителя.
+                return None
 
             row_summary = str(getattr(row, "row_summary", "") or "").strip()
             row_summary = self._clean_answer_point(row_summary, intent_type=intent_type)
@@ -1344,6 +1389,8 @@ class GenerationPipeline:
                     return self._normalize_sentence(compact)
 
         elif candidate.source_type == "table":
+            if intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION:
+                return None
             table = hydrated_objects["tables"].get(candidate.source_id)
             if table is None:
                 return self._normalize_sentence(
@@ -1362,6 +1409,8 @@ class GenerationPipeline:
                 )
 
         elif candidate.source_type == "block":
+            if intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION:
+                return None
             block = hydrated_objects["blocks"].get(candidate.source_id)
             if block is None:
                 return self._normalize_sentence(candidate.snippet)
@@ -1455,7 +1504,11 @@ class GenerationPipeline:
         intro = self._select_intro_by_intent(payload.intent_type)
         lines = [intro]
 
-        for point in plan.direct_answer_points[:5]:
+        answer_points = plan.direct_answer_points[:5]
+        if payload.intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION:
+            answer_points = self._finalize_eligibility_answer_points(answer_points)[:5]
+
+        for point in answer_points:
             lines.append(f"— {point}")
 
         lines.append("Ниже приведены источники, на которых основан ответ.")
@@ -1468,9 +1521,14 @@ class GenerationPipeline:
         plan: AnswerPlan,
     ) -> str:
         intro = self._select_intro_by_intent(payload.intent_type)
+
+        answer_points = plan.direct_answer_points[:4]
+        if payload.intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION:
+            answer_points = self._finalize_eligibility_answer_points(answer_points)[:4]
+
         body = " ".join(
             self._normalize_sentence(point)
-            for point in plan.direct_answer_points[:4]
+            for point in answer_points
             if point
         )
 
@@ -2305,8 +2363,389 @@ class GenerationPipeline:
             evidence_items=[],
             generation_model_name=None,
             generation_prompt_version="grounded_template_v1",
-            pipeline_version="generation_pipeline_v5_compact_documents_mode",
+            pipeline_version="generation_pipeline_v6_eligibility_hard_filter",
         )
+
+    def _metadata_table_semantic_type(self, metadata: dict[str, Any]) -> str:
+        value = ""
+        if isinstance(metadata, dict):
+            value = str(metadata.get("table_semantic_type") or "").strip().lower()
+        return value
+
+    def _finalize_eligibility_answer_points(self, points: list[str]) -> list[str]:
+        """Final hard cleanup for eligibility answer points.
+
+        This method is intentionally defensive. Some legacy runs can still
+        pass block/table snippets or header rows into generation. For
+        eligibility answers we expose only applicant-category points and
+        remove internal table headers/procedural fragments.
+        """
+        cleaned_points: list[str] = []
+
+        for raw_point in points:
+            text = " ".join(str(raw_point or "").split()).strip()
+            if not text:
+                continue
+
+            # A single extracted point can accidentally contain several
+            # "Категория заявителей:" fragments. Split it and validate each
+            # fragment separately so a good first category is not discarded
+            # together with a later header fragment.
+            fragments: list[str]
+            if text.lower().replace("ё", "е").count("категория заявителей:") > 1:
+                parts = re.split(
+                    r"(?i)(?=категория заявителей\s*:)",
+                    text,
+                )
+                fragments = [part.strip() for part in parts if part.strip()]
+            else:
+                fragments = [text]
+
+            for fragment in fragments:
+                fragment = self._strip_eligibility_noise_tail(fragment)
+                cleaned = self._clean_eligibility_answer_point(fragment)
+                if not cleaned:
+                    continue
+                if cleaned not in cleaned_points:
+                    cleaned_points.append(cleaned)
+
+        return cleaned_points
+
+    def _strip_eligibility_noise_tail(self, value: str) -> str:
+        text = " ".join(str(value or "").split()).strip()
+        if not text:
+            return ""
+
+        # Remove clearly procedural fragments that are not applicant
+        # categories. They usually enter through block snippets.
+        noise_starts = (
+            "В найденной таблице",
+            "Работник органа",
+            "Работник, ответственный",
+            "Руководитель уполномоченного",
+            "В упреждающем",
+            "В проактивном",
+            "51.",
+            "56.",
+        )
+        for marker in noise_starts:
+            pos = text.find(marker)
+            if pos > 0:
+                text = text[:pos].rstrip(" .;:-")
+                break
+            if pos == 0:
+                return ""
+
+        lowered = text.lower().replace("ё", "е")
+        hard_noise_fragments = (
+            "категория заявителей: наименование признака заявителя",
+            "категория заявителей: идентификаторы категорий",
+            "категория заявителей: перечень результатов предоставления",
+            "категория заявителей: результат предоставления государственной услуги",
+            "категория заявителей: принятие решения",
+        )
+        cut_positions = [
+            lowered.find(fragment)
+            for fragment in hard_noise_fragments
+            if lowered.find(fragment) >= 0
+        ]
+        if cut_positions:
+            cut = min(cut_positions)
+            if cut <= 0:
+                return ""
+            text = text[:cut].rstrip(" .;:-")
+
+        return text
+
+    def _clean_eligibility_answer_point(self, value: Optional[str]) -> Optional[str]:
+        """Keep eligibility answers focused on real applicant categories.
+
+        The identifiers table can contain header/service rows that look like
+        ordinary table rows after DOCX extraction.  If they reach generation,
+        the user sees noise such as "Наименование признака заявителя" or
+        unrelated procedural paragraphs.  For the current deterministic
+        eligibility path we only keep points that are actually category rows.
+        """
+        if value is None:
+            return None
+
+        text = " ".join(str(value).split()).strip()
+        if not text:
+            return None
+
+        lowered = text.lower().replace("ё", "е")
+        normalized = re.sub(r"[^0-9a-zа-я]+", " ", lowered).strip()
+
+        bad_fragments = (
+            "категория заявителей: наименование",
+            "категория заявителей: идентификаторы категорий",
+            "категория заявителей: категории заявителей",
+            "наименование признака заявителя",
+            "наименование значение признаков заявителей",
+            "наименование отдельных признаков заявителей",
+            "идентификаторы категорий",
+            "результат предоставления государственной услуги",
+            "перечень результатов предоставления",
+            "принятие решения о предоставлении",
+            "работник органа",
+            "работник ответственный",
+            "день регистрации нового документа",
+            "уведомления об отсутствии ошибок",
+        )
+        if any(fragment in lowered for fragment in bad_fragments):
+            return None
+
+        if "категория заявителей:" not in lowered:
+            return None
+
+        category_part = lowered.split("категория заявителей:", 1)[1].strip(" .;:-")
+        if not category_part:
+            return None
+        category_part_norm = re.sub(r"[^0-9a-zа-я]+", " ", category_part).strip()
+        if not category_part_norm:
+            return None
+
+        category_markers = (
+            "заявител",
+            "граждан",
+            "лиц",
+            "лицо",
+            "инвалид",
+            "ветеран",
+            "участник",
+            "труженик",
+            "пенсионер",
+            "сем",
+            "родител",
+            "ребен",
+            "дет",
+            "женщин",
+            "мужчин",
+            "вдов",
+            "реабилит",
+            "награжден",
+            "пострадав",
+            "подвергш",
+            "проживающ",
+            "нуждающ",
+            "одинок",
+            "умерш",
+            "погибш",
+            "удостоенн",
+            "имеющ",
+            "получател",
+            "служб",
+        )
+        if not any(marker in category_part_norm for marker in category_markers):
+            return None
+
+        return text
+
+    def _identifier_row_to_answer_point(self, metadata: dict[str, Any]) -> Optional[str]:
+        """Build a human eligibility point from identifiers table row metadata.
+
+        Rows of table 1 often have technical summaries like
+        "Таблица: ИДЕНТИФИКАТОРЫ... Колонка 2: ...".  For eligibility
+        questions the useful part is the applicant-category cell, not the
+        whole technical row dump.
+        """
+        if not isinstance(metadata, dict):
+            return None
+
+        cells = (
+            metadata.get("cells_by_semantic_key")
+            or metadata.get("cells_by_header_key")
+            or metadata.get("cells_by_header_normalized")
+            or metadata.get("cells_by_header")
+            or {}
+        )
+        if not isinstance(cells, dict):
+            cells = {}
+
+        category_text = self._extract_identifier_category_text(cells)
+        if not category_text:
+            cells_text = metadata.get("cells_text")
+            if isinstance(cells_text, list) and cells_text:
+                category_text = self._extract_identifier_category_from_cells_text(cells_text)
+
+        if not category_text:
+            return None
+
+        category_text = self._shorten_text(category_text, limit=420) or category_text
+        result_text = self._extract_identifier_result_text(cells)
+
+        if result_text:
+            return f"Категория заявителей: {category_text}. Идентификатор категории в регламенте: {result_text}."
+
+        return f"Категория заявителей: {category_text}."
+
+    def _extract_identifier_category_text(self, cells: dict[str, Any]) -> Optional[str]:
+        # Сначала ищем строго выделенную смысловую колонку категории заявителя.
+        # Не перебираем все значения подряд: в соседних колонках identifiers
+        # часто лежит "Принятие решения...", которое не является категорией.
+        semantic_keys = (
+            "applicant_category_name",
+            "applicant_category",
+            "category_name",
+            "наименование_значение_признаков_заявителей",
+            "наименование_отдельных_признаков_заявителей",
+            "наименование_признака_заявителя",
+            "наименование_признаков_заявителей",
+        )
+        for key in semantic_keys:
+            if key in cells:
+                cleaned = self._clean_identifier_cell_value(cells.get(key))
+                if self._looks_like_identifier_category_value(cleaned):
+                    return cleaned
+
+        preferred_markers = (
+            "applicant_category_name",
+            "applicant_category",
+            "category_name",
+            "наименование_значение_признаков",
+            "наименование_отдельных_признаков",
+            "наименование_признака",
+            "категор",
+            "признак",
+            "заявител",
+        )
+
+        for key, value in cells.items():
+            key_text = str(key or "").strip().lower().replace("ё", "е")
+            if not key_text:
+                continue
+            if any(marker in key_text for marker in preferred_markers):
+                cleaned = self._clean_identifier_cell_value(value)
+                if self._looks_like_identifier_category_value(cleaned):
+                    return cleaned
+
+        generic_second_column = cells.get("колонка_2") or cells.get("Колонка 2")
+        cleaned = self._clean_identifier_cell_value(generic_second_column)
+        if self._looks_like_identifier_category_value(cleaned):
+            return cleaned
+
+        return None
+
+    def _extract_identifier_category_from_cells_text(self, cells_text: list[Any]) -> Optional[str]:
+        for value in cells_text:
+            cleaned = self._clean_identifier_cell_value(value)
+            if not self._looks_like_identifier_category_value(cleaned):
+                continue
+            return cleaned
+        return None
+
+    def _looks_like_identifier_category_value(self, value: Optional[str]) -> bool:
+        if value is None:
+            return False
+
+        normalized = " ".join(str(value).split()).strip().lower().replace("ё", "е")
+        if not normalized:
+            return False
+        if len(normalized) <= 3 and re.fullmatch(r"[0-9абвгдa-z. -]+", normalized):
+            return False
+
+        bad_fragments = (
+            "наименование признака заявителя",
+            "наименование значение признаков заявителей",
+            "наименование отдельных признаков заявителей",
+            "идентификаторы категорий",
+            "результат предоставления государственной услуги",
+            "перечень результатов предоставления",
+            "принятие решения о предоставлении",
+            "принятие решения об отказе",
+            "предоставлении об отказе",
+        )
+        if any(fragment in normalized for fragment in bad_fragments):
+            return False
+
+        markers = (
+            "заявител",
+            "граждан",
+            "лиц",
+            "лицо",
+            "инвалид",
+            "ветеран",
+            "участник",
+            "труженик",
+            "пенсионер",
+            "сем",
+            "родител",
+            "ребен",
+            "дет",
+            "женщин",
+            "мужчин",
+            "вдов",
+            "реабилит",
+            "награжден",
+            "пострадав",
+            "подвергш",
+            "проживающ",
+            "нуждающ",
+            "одинок",
+            "умерш",
+            "погибш",
+            "удостоенн",
+            "имеющ",
+            "получател",
+            "служб",
+        )
+        return any(marker in normalized for marker in markers)
+
+    def _extract_identifier_result_text(self, cells: dict[str, Any]) -> Optional[str]:
+        for key, value in cells.items():
+            key_text = str(key or "").strip().lower().replace("ё", "е")
+            if "результат" not in key_text and "идентификатор" not in key_text:
+                continue
+            cleaned = self._clean_identifier_cell_value(value)
+            if cleaned and len(cleaned) <= 20:
+                return cleaned
+        return None
+
+    def _clean_identifier_cell_value(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = " ".join(str(value).replace("_", " ").split()).strip(" .;:-")
+        if not text:
+            return None
+
+        lowered = text.lower().replace("ё", "е")
+        normalized_for_header = re.sub(r"[^0-9a-zа-я]+", " ", lowered).strip()
+        header_like_values = {
+            "n",
+            "n п п",
+            "номер",
+            "колонка 1",
+            "колонка 2",
+            "колонка 3",
+            "идентификаторы категорий",
+            "идентификаторы категорий признаков заявителей",
+            "наименование признака заявителя",
+            "наименование значение признаков заявителей",
+            "наименование отдельных признаков заявителей",
+            "наименование признаков заявителей",
+            "категория заявителей",
+            "категории заявителей",
+            "результат предоставления государственной услуги",
+        }
+        if lowered in {"n", "n п/п", "n п п", "номер", "колонка 1", "колонка 2", "колонка 3"}:
+            return None
+        if normalized_for_header in header_like_values:
+            return None
+        if (
+            "идентификаторы категорий" in normalized_for_header
+            or (
+                "наименование" in normalized_for_header
+                and "признак" in normalized_for_header
+                and "заявител" in normalized_for_header
+            )
+        ):
+            return None
+        if re.fullmatch(r"[0-9.]+", lowered):
+            return None
+        if len(lowered) <= 2 and re.fullmatch(r"[абвгдa-z]", lowered):
+            return None
+
+        return text
 
     def _compact_json_dict(
         self,
