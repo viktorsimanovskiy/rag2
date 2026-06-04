@@ -397,8 +397,9 @@ class GenerationPipeline:
             citations_json=citations,
             answer_payload_json={
                 "strategy_code": plan.strategy_code,
-                "pipeline_version": "generation_pipeline_v6_eligibility_hard_filter",
+                "pipeline_version": "generation_pipeline_v11_eligibility_overview_context_brief_docs",
                 "eligibility_cleanup_version": "v6_hard_filter",
+                "eligibility_overview_version": "second_step_16_eligibility_overview_context_brief_docs_v1",
                 "plan_warnings": plan.warnings,
                 "plan_no_answer_reason_code": plan.no_answer_reason_code,
                 "plan_context_json": plan.context_json,
@@ -421,7 +422,7 @@ class GenerationPipeline:
             evidence_items=evidence_items,
             generation_model_name=None,
             generation_prompt_version="grounded_template_v1",
-            pipeline_version="generation_pipeline_v6_eligibility_hard_filter",
+            pipeline_version="generation_pipeline_v11_eligibility_overview_context_brief_docs",
         )
 
     def _extract_document_focus(
@@ -464,6 +465,44 @@ class GenerationPipeline:
             return inferred_channel
 
         return None
+
+    def _should_prepare_documents_for_eligibility_overview(
+        self,
+        *,
+        payload: GenerationRequest,
+        evidence_package: EvidencePackage,
+    ) -> bool:
+        """Return True for concrete eligibility questions where a short next-step package helps.
+
+        A natural question like "я инвалид, живу в Эвенкии, надо ехать на лечение"
+        is not only asking "am I in a category".  It is usually a request for
+        a practical overview of the likely measure: what measure was found, who
+        it applies to, and what documents may be needed next.
+
+        We do this only when resolver selected one concrete service.  Broad
+        "что мне положено" questions must stay in service_discovery and must not
+        get a document package for an arbitrary measure.
+        """
+        if payload.intent_type != QuestionIntentEnum.ELIGIBILITY_QUESTION:
+            return False
+
+        debug_payload = evidence_package.debug_payload_json or {}
+        service_resolution = debug_payload.get("service_resolution") or {}
+        if not isinstance(service_resolution, dict):
+            return False
+
+        if str(service_resolution.get("resolution_status") or "").strip().lower() != "resolved":
+            return False
+
+        metrics = evidence_package.metrics_json or {}
+        if metrics.get("service_filter_applied") is False:
+            return False
+
+        routing_payload = payload.routing_payload_json or {}
+        if isinstance(routing_payload, dict) and routing_payload.get("routing_mode") == "service_discovery":
+            return False
+
+        return True
 
     def _wants_strict_full_documents_list(self, question_text: str) -> bool:
         """True only when the user explicitly asks for the full regulatory list.
@@ -646,15 +685,20 @@ class GenerationPipeline:
             document_form_details_question = self._is_document_form_details_question(
                 question_text_for_document_mode
             )
+            eligibility_overview_documents = self._should_prepare_documents_for_eligibility_overview(
+                payload=payload,
+                evidence_package=evidence_package,
+            )
             if (
                 payload.intent_type != QuestionIntentEnum.DOCUMENTS_QUESTION
                 and not document_form_details_question
+                and not eligibility_overview_documents
             ):
                 return {
                     "answer_text": None,
                     "debug": {
                         "skipped": True,
-                        "reason": "not_documents_or_document_form_question",
+                        "reason": "not_documents_or_document_form_or_eligibility_overview_question",
                     },
                 }
 
@@ -673,6 +717,14 @@ class GenerationPipeline:
                 question_text_for_document_mode,
                 submission_channel=submission_channel,
             )
+            if eligibility_overview_documents:
+                # Для конкретного eligibility-вопроса пользователь обычно хочет
+                # не регламентную простыню, а короткий практический пакет
+                # «что это за мера / кто подходит / какие документы дальше».
+                # Поэтому добираем всю documents-таблицу, но рендерим компактно.
+                list_from_full_table_mode = True
+                strict_full_list_mode = False
+                include_submission_form_details = False
 
             # For document-list questions we hydrate the whole documents table from
             # the resolved NPA, not only retrieval top-N rows. Rendering is compact
@@ -716,6 +768,7 @@ class GenerationPipeline:
                 submission_channel=submission_channel,
             )
             debug_payload["document_focus"] = document_focus
+            debug_payload["eligibility_overview_documents"] = eligibility_overview_documents
             debug_payload["include_submission_form_details"] = include_submission_form_details
             debug_payload["document_form_details_question"] = document_form_details_question
             debug_payload["strict_full_list_mode"] = strict_full_list_mode
@@ -1490,10 +1543,489 @@ class GenerationPipeline:
                 plan=plan,
             )
 
+        if payload.intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION:
+            eligibility_overview_text = self._compose_eligibility_measure_overview_answer(
+                payload=payload,
+                plan=plan,
+                evidence_package=evidence_package,
+                documents_answer_payload=documents_answer_payload,
+            )
+            if eligibility_overview_text:
+                return eligibility_overview_text
+
         return self._compose_grounded_narrative_answer(
             payload=payload,
             plan=plan,
         )
+
+    def _compose_eligibility_measure_overview_answer(
+        self,
+        *,
+        payload: GenerationRequest,
+        plan: AnswerPlan,
+        evidence_package: EvidencePackage,
+        documents_answer_payload: Optional[dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Compose a practical overview for a concrete eligibility question.
+
+        This is intentionally deterministic and evidence-bound.  It does not
+        invent application links or conditions.  It only uses:
+        - resolved service metadata from resolver debug;
+        - applicant-category rows already selected as evidence;
+        - compact documents table answer, if the documents table was hydrated.
+        """
+        if payload.intent_type != QuestionIntentEnum.ELIGIBILITY_QUESTION:
+            return None
+
+        service_resolution = (evidence_package.debug_payload_json or {}).get("service_resolution") or {}
+        if not isinstance(service_resolution, dict):
+            service_resolution = {}
+        if str(service_resolution.get("resolution_status") or "").strip().lower() != "resolved":
+            return None
+
+        service_name_short = str(service_resolution.get("service_name_short") or "").strip()
+        service_name_full = str(service_resolution.get("service_name_full") or "").strip()
+        service_name = service_name_short or service_name_full
+
+        category_points = self._finalize_eligibility_answer_points(
+            [point for point in (plan.direct_answer_points or []) if point]
+        )[:4]
+
+        if not service_name and not category_points:
+            return None
+
+        lines: list[str] = []
+
+        if service_name:
+            lines.append(f"По вопросу найдена мера поддержки: {service_name}.")
+        else:
+            lines.append("По вопросу найдена мера поддержки, связанная с указанной категорией заявителя.")
+
+        if service_name_full and service_name_full != service_name:
+            lines.append(
+                "Что предусматривает мера: "
+                + self._normalize_sentence(self._shorten_text(service_name_full, limit=420))
+            )
+
+        if category_points:
+            lines.append("")
+            lines.append("По найденным категориям заявителей мера может относиться к:")
+            for point in category_points:
+                cleaned = point
+                if cleaned.lower().startswith("категория заявителей:"):
+                    cleaned = cleaned.split(":", 1)[1].strip()
+                # Identifier codes are useful for audit, but noisy in a practical
+                # first answer.  The row itself remains in citations/evidence.
+                cleaned = re.sub(
+                    r"\s*Идентификатор категории в регламенте:\s*[^.]+\.?",
+                    "",
+                    cleaned,
+                    flags=re.IGNORECASE,
+                ).strip(" .")
+                if cleaned:
+                    lines.append(f"• {cleaned}")
+
+        document_lines = self._render_embedded_documents_for_eligibility_overview(
+            documents_answer_payload,
+            payload=payload,
+        )
+        if document_lines:
+            lines.append("")
+            lines.append("Основные документы по описанной ситуации:")
+            lines.extend(document_lines)
+        else:
+            documents_text = None
+            if isinstance(documents_answer_payload, dict):
+                documents_text = documents_answer_payload.get("answer_text")
+            if isinstance(documents_text, str) and documents_text.strip():
+                lines.append("")
+                lines.append("Основные документы по описанной ситуации:")
+                lines.append(self._prepare_embedded_documents_text(documents_text))
+
+        lines.append("")
+        lines.append(
+            "Точный вывод о праве на меру зависит от всех условий регламента "
+            "и подтверждающих документов. Ответ сформирован только по найденным источникам."
+        )
+
+        return "\n".join(line for line in lines if line is not None).strip()
+
+    def _render_embedded_documents_for_eligibility_overview(
+        self,
+        documents_answer_payload: Optional[dict[str, Any]],
+        *,
+        payload: GenerationRequest,
+    ) -> list[str]:
+        """Render a compact, context-aware document subsection for measure overview.
+
+        Direct document questions can show a broader compact list.  A practical
+        eligibility overview should instead show the user the most useful next
+        documents for the exact situation in the question.  The selection remains
+        grounded in the documents table: this function only reorders and groups
+        rows already returned by the deterministic documents builder.
+        """
+        if not isinstance(documents_answer_payload, dict):
+            return []
+
+        debug_payload = documents_answer_payload.get("debug")
+        if not isinstance(debug_payload, dict):
+            return []
+
+        raw_items = debug_payload.get("items")
+        if not isinstance(raw_items, list):
+            return []
+
+        context_text = self._build_overview_document_context(payload)
+        ranked_items: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        application_seen = False
+
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("row_kind") or "").strip().lower() not in {"document", "row"}:
+                continue
+
+            normalized_name = self._normalize_overview_document_name(
+                item.get("document_name"),
+                item=item,
+            )
+            if not normalized_name:
+                continue
+
+            document_family = str(item.get("document_family") or "").strip().lower()
+            if document_family == "application_request" or re.fullmatch(
+                r"заявлени[ея](?:\s*\d+)?",
+                normalized_name.lower(),
+            ):
+                normalized_name = "заявление (форма зависит от категории заявителя)"
+                if application_seen:
+                    continue
+                application_seen = True
+
+            key = " ".join(normalized_name.lower().replace("ё", "е").split())
+            if not key or key in seen:
+                continue
+            seen.add(key)
+
+            applicability = str(item.get("applicability") or "").strip().lower()
+            score = self._score_overview_document_relevance(
+                normalized_name,
+                context_text=context_text,
+                document_family=document_family,
+                applicability=applicability,
+            )
+            group = self._classify_overview_document_group(
+                normalized_name,
+                context_text=context_text,
+                document_family=document_family,
+                applicability=applicability,
+                score=score,
+            )
+            ranked_items.append(
+                {
+                    "name": normalized_name,
+                    "group": group,
+                    "score": score,
+                    "applicability": applicability,
+                    "document_family": document_family,
+                }
+            )
+
+        if not ranked_items:
+            return []
+
+        grouped: dict[str, list[dict[str, Any]]] = {
+            "base": [],
+            "context": [],
+            "conditional": [],
+        }
+        for item in ranked_items:
+            grouped.setdefault(item["group"], []).append(item)
+
+        for values in grouped.values():
+            values.sort(key=lambda x: (-float(x.get("score") or 0), x.get("name") or ""))
+
+        lines: list[str] = []
+        hidden_conditional_count = 0
+        hidden_context_count = 0
+
+        if grouped["base"]:
+            lines.append("Базовые документы:")
+            for item in grouped["base"]:
+                lines.append(f"• {item['name']}")
+
+        if grouped["context"]:
+            lines.append("Документы по обстоятельствам обращения:")
+            # This is an overview answer, not a full document-list answer.  Keep
+            # all highly relevant context documents, but do not silently turn a
+            # practical answer into a huge regulatory table dump.  Anything not
+            # shown is explicitly disclosed below.
+            context_to_show = [
+                item for item in grouped["context"] if float(item.get("score") or 0) >= 45.0
+            ]
+            if not context_to_show:
+                context_to_show = grouped["context"][:6]
+            if len(context_to_show) > 8:
+                hidden_context_count = len(context_to_show) - 8
+                context_to_show = context_to_show[:8]
+            for item in context_to_show:
+                lines.append(f"• {item['name']}")
+
+        if grouped["conditional"]:
+            # Conditional documents are often for representatives, alternate
+            # applicant categories or exceptional situations.  Show a limited
+            # practical subset and explicitly say that the full regulatory list
+            # should be requested separately if needed.
+            conditional_to_show = grouped["conditional"][:5]
+            hidden_conditional_count = max(0, len(grouped["conditional"]) - len(conditional_to_show))
+            if conditional_to_show:
+                lines.append("Дополнительно при соответствующей ситуации:")
+                for item in conditional_to_show:
+                    lines.append(f"• {item['name']}")
+
+        if not lines:
+            return []
+
+        if hidden_context_count or hidden_conditional_count:
+            lines.append(
+                "Это обзорный список по описанной ситуации; в регламенте есть дополнительные документы "
+                "для отдельных случаев."
+            )
+
+        lines.append(
+            "Если нужен исчерпывающий перечень с формами подачи и подпунктами регламента, "
+            "задай отдельный вопрос: полный перечень документов по этой мере."
+        )
+
+        return lines
+
+    def _build_overview_document_context(self, payload: GenerationRequest) -> str:
+        values: list[str] = [
+            payload.question_text_raw or "",
+            payload.question_text_normalized or "",
+        ]
+        constraints = payload.query_constraints_json or {}
+        if isinstance(constraints, dict):
+            terms = constraints.get("resolver_query_expansion_terms")
+            if isinstance(terms, list):
+                values.extend(str(term) for term in terms if term)
+        routing = payload.routing_payload_json or {}
+        if isinstance(routing, dict):
+            understanding = routing.get("message_understanding")
+            if isinstance(understanding, dict):
+                for key in ("topic", "service_hint", "territory"):
+                    if understanding.get(key):
+                        values.append(str(understanding.get(key)))
+                for key in ("applicant_facts", "user_needs"):
+                    raw = understanding.get(key)
+                    if isinstance(raw, list):
+                        values.extend(str(value) for value in raw if value)
+        return " ".join(" ".join(values).lower().replace("ё", "е").split())
+
+    def _score_overview_document_relevance(
+        self,
+        document_name: str,
+        *,
+        context_text: str,
+        document_family: str,
+        applicability: str,
+    ) -> float:
+        name = " ".join(str(document_name or "").lower().replace("ё", "е").split())
+        score = 0.0
+
+        if "заявлен" in name:
+            score += 100.0
+        if document_family == "identity_document":
+            score += 70.0
+        if document_family in {"status_certificate", "residency_proof"}:
+            score += 35.0
+        if document_family == "authority_document":
+            score += 20.0
+
+        has_travel_need = any(
+            token in context_text
+            for token in ("ехать", "доехать", "добраться", "дорог", "поезд", "проезд", "билет")
+        )
+        has_treatment_need = any(
+            token in context_text
+            for token in ("лечен", "медицин", "обслед", "реабилитац", "оздоров")
+        )
+        if has_travel_need and any(
+            token in name
+            for token in ("проезд", "билет", "стоимость", "оплат", "дорог", "проездн")
+        ):
+            score += 80.0
+        if has_treatment_need and any(
+            token in name
+            for token in ("лечен", "медицин", "направлен", "реабилитац", "оздоров", "путевк", "курсовк")
+        ):
+            score += 70.0
+        if "инвалид" in context_text and any(token in name for token in ("инвалид", "инвалидности")):
+            score += 35.0
+        if any(token in context_text for token in ("эвенк", "таймыр", "место жительства", "проживан")) and any(
+            token in name for token in ("жительств", "проживан", "регистрац")
+        ):
+            score += 25.0
+
+        if self._is_conditional_overview_document(document_name, applicability=applicability):
+            score -= 5.0
+        if "представител" in name:
+            score -= 15.0
+        if "сопровождающ" in name and "сопровождающ" not in context_text:
+            score -= 10.0
+        return score
+
+    def _classify_overview_document_group(
+        self,
+        document_name: str,
+        *,
+        context_text: str,
+        document_family: str,
+        applicability: str,
+        score: float,
+    ) -> str:
+        name = " ".join(str(document_name or "").lower().replace("ё", "е").split())
+
+        if "заявлен" in name:
+            return "base"
+        if document_family == "identity_document" and "представител" not in name and "сопровождающ" not in name:
+            return "base"
+
+        has_travel_or_treatment_need = any(
+            token in context_text
+            for token in (
+                "ехать",
+                "доехать",
+                "добраться",
+                "дорог",
+                "поезд",
+                "проезд",
+                "лечен",
+                "медицин",
+                "обслед",
+                "реабилитац",
+                "оздоров",
+            )
+        )
+        if has_travel_or_treatment_need and any(
+            token in name
+            for token in (
+                "проезд",
+                "билет",
+                "стоимость",
+                "оплат",
+                "направлен",
+                "лечен",
+                "медицин",
+                "путевк",
+                "курсовк",
+                "талон",
+                "оздоров",
+                "реабилитац",
+            )
+        ):
+            return "context"
+
+        if score >= 55.0 and document_family in {"status_certificate", "residency_proof", "other"}:
+            return "context"
+
+        return "conditional"
+
+    def _normalize_overview_document_name(
+        self,
+        value: Any,
+        *,
+        item: dict[str, Any],
+    ) -> Optional[str]:
+        text = " ".join(str(value or "").replace("ё", "е").split()).strip()
+        if not text:
+            return None
+
+        text = re.sub(r"^\d+(?:\.\d+)*\.?\s*", "", text).strip()
+        text = re.sub(r"\s+", " ", text).strip(" ;,.—-")
+        if not text:
+            return None
+
+        lower = text.lower()
+        technical_markers = (
+            "наименование документа",
+            "способы подачи",
+            "форма подачи",
+            "исчерпывающий перечень",
+            "результат предоставления",
+        )
+        if any(marker in lower for marker in technical_markers):
+            return None
+
+        if re.fullmatch(r"заявлени[ея](?:\s*\d+)?", lower):
+            return "заявление (форма зависит от категории заявителя)"
+
+        if lower.startswith("паспорт гражданина российской федерации или иной документ, удостоверяющий личность"):
+            text = re.sub(
+                r"^паспорт гражданина российской федерации или иной документ, удостоверяющий личность",
+                "паспорт или иной документ, удостоверяющий личность",
+                text,
+                flags=re.IGNORECASE,
+            )
+
+        # Keep meaningful parentheses, but avoid overlong technical tails.
+        text = self._shorten_multiline_preserving_text(text, limit=260)
+        return text.strip(" .") if text else None
+
+    def _is_conditional_overview_document(
+        self,
+        document_name: str,
+        *,
+        applicability: str,
+    ) -> bool:
+        normalized = " ".join(str(document_name or "").lower().replace("ё", "е").split())
+        if applicability and applicability not in {"always", "required"}:
+            return True
+        conditional_markers = (
+            "если ",
+            "при наличии",
+            "при обращении",
+            "представител",
+            "сопровождающ",
+            "ребенка-инвалида",
+            "решение суда",
+            "факте проживания",
+            "свидетельство о рождении",
+            "переводом на русский язык",
+        )
+        return any(marker in normalized for marker in conditional_markers)
+
+    def _shorten_multiline_preserving_text(
+        self,
+        value: str,
+        *,
+        limit: int,
+    ) -> str:
+        text = " ".join(str(value or "").split()).strip()
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 3)].rstrip(" ,;.—-") + "..."
+
+    def _prepare_embedded_documents_text(self, value: str) -> str:
+        """Make a documents-builder answer suitable as a subsection.
+
+        The documents builder is also used for direct document questions, where
+        its own intro is appropriate.  Inside an eligibility overview we remove
+        the repeated final disclaimer and keep the compact document package.
+        """
+        lines = [line.rstrip() for line in str(value or "").splitlines()]
+        cleaned: list[str] = []
+        skip_prefixes = (
+            "Итоговый перечень зависит",
+            "Детальные подпункты не раскрыты",
+        )
+        for line in lines:
+            if any(line.strip().startswith(prefix) for prefix in skip_prefixes):
+                continue
+            cleaned.append(line)
+        text = "\n".join(cleaned).strip()
+        return self._shorten_text(text, limit=1400) or text
 
     def _compose_direct_structured_answer(
         self,
@@ -2363,7 +2895,7 @@ class GenerationPipeline:
             evidence_items=[],
             generation_model_name=None,
             generation_prompt_version="grounded_template_v1",
-            pipeline_version="generation_pipeline_v6_eligibility_hard_filter",
+            pipeline_version="generation_pipeline_v7_eligibility_measure_overview",
         )
 
     def _metadata_table_semantic_type(self, metadata: dict[str, Any]) -> str:

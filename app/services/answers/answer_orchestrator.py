@@ -51,6 +51,7 @@ from app.services.feedback.feedback_service import (
 )
 from app.services.generation.generation_pipeline import GenerationResult
 from app.services.answers.message_guard import MessageGuardResult
+from app.services.answers.message_understanding import MessageUnderstandingResult
 from app.services.reuse.reuse_gate import (
     ReuseDecision,
     ReuseGate,
@@ -77,6 +78,17 @@ class QuestionNormalizerProtocol:
 
 class MessageGuardProtocol:
     async def check(self, message_text: str, *, channel_code: str | None = None) -> MessageGuardResult:
+        raise NotImplementedError
+
+
+class MessageUnderstandingProtocol:
+    async def understand(
+        self,
+        question_text: str,
+        *,
+        deterministic_classification: Optional[dict[str, Any]] = None,
+        channel_code: Optional[str] = None,
+    ) -> MessageUnderstandingResult:
         raise NotImplementedError
 
 
@@ -218,6 +230,7 @@ class AnswerOrchestrator:
         question_normalizer: QuestionNormalizerProtocol,
         message_guard: Optional[MessageGuardProtocol],
         question_embedding_service: Optional[QuestionEmbeddingProtocol],
+        message_understanding_service: Optional[MessageUnderstandingProtocol],
         runtime_answer_service: RuntimeAnswerServiceProtocol,
         sampling_policy: SamplingPolicyProtocol,
     ) -> None:
@@ -228,6 +241,7 @@ class AnswerOrchestrator:
         self.question_normalizer = question_normalizer
         self.message_guard = message_guard
         self.question_embedding_service = question_embedding_service
+        self.message_understanding_service = message_understanding_service
         self.runtime_answer_service = runtime_answer_service
         self.sampling_policy = sampling_policy
 
@@ -255,7 +269,7 @@ class AnswerOrchestrator:
         """
         timings_started_at = time.perf_counter()
         timings: dict[str, Any] = {
-            "version": "second_step_03_deferred_question_event_commit_v1",
+            "version": "second_step_17_assist_call_policy_narrow_broad_help_v1",
         }
 
         def measure_start() -> float:
@@ -695,6 +709,503 @@ class AnswerOrchestrator:
         """Skip reuse for answer types whose rendering is version-sensitive."""
         return self._should_skip_reuse_for_intent(routing.intent_type)
 
+    async def _run_message_understanding(
+        self,
+        normalized_text: str,
+        *,
+        deterministic_classification: dict[str, Any],
+    ) -> Optional[MessageUnderstandingResult]:
+        """Run optional LLM understanding layer.
+
+        The service is intentionally optional. If it is not configured or fails,
+        the deterministic classifier remains the source of routing.
+        """
+        if self.message_understanding_service is None:
+            return None
+
+        return await self.message_understanding_service.understand(
+            normalized_text,
+            deterministic_classification=deterministic_classification,
+        )
+
+    def _apply_message_understanding_to_routing(
+        self,
+        *,
+        understanding_result: MessageUnderstandingResult,
+        rule_intent_type: QuestionIntentEnum,
+        routing_payload_json: dict[str, Any],
+        query_constraints_json: dict[str, Any],
+    ) -> QuestionIntentEnum:
+        """Merge optional LLM understanding into routing metadata.
+
+        Modes:
+        - shadow: store diagnostics only;
+        - assist: apply intent only when the rule route is weak/conflicting,
+          and use neutral semantic slots as resolver hints;
+        - enforce: apply if the model is confident enough.
+
+        The LLM never becomes a legal evidence source. It may only route the
+        question and add neutral search hints such as topic, applicant facts,
+        user_needs and territory.
+        """
+        payload = understanding_result.to_payload()
+        routing_payload_json["message_understanding"] = payload
+
+        mode = (understanding_result.mode or "shadow").strip().lower()
+        mapped_intent = understanding_result.mapped_intent_type
+        min_confidence = _message_understanding_min_confidence(payload)
+
+        intent_apply_reason = "shadow_mode"
+        should_apply_intent = False
+        should_apply_hints = False
+        hints_apply_reason = "shadow_mode"
+
+        provider_ok = understanding_result.provider_status == "ok"
+        supported_ok = bool(understanding_result.is_supported_domain)
+        confidence_ok = understanding_result.confidence >= min_confidence
+        medium_confidence_ok = understanding_result.confidence >= 0.65
+        hint_confidence_ok = understanding_result.confidence >= 0.55
+        mapped_ok = mapped_intent is not None and mapped_intent != QuestionIntentEnum.OTHER
+        rule_is_weak_or_conflicting = self._is_weak_or_conflicting_rule_route(
+            rule_intent_type=rule_intent_type,
+            routing_payload_json=routing_payload_json,
+        )
+
+        if not provider_ok:
+            intent_apply_reason = "provider_not_ok"
+            hints_apply_reason = "provider_not_ok"
+        elif not supported_ok:
+            intent_apply_reason = "unsupported_domain"
+            hints_apply_reason = "unsupported_domain"
+        elif mapped_intent is None:
+            intent_apply_reason = "unknown_intent"
+            hints_apply_reason = "unknown_intent"
+        elif mode == "enforce":
+            if confidence_ok:
+                should_apply_intent = mapped_intent is not None
+                should_apply_hints = self._has_message_understanding_expansion_terms(understanding_result)
+                intent_apply_reason = "enforce_mode_high_confidence"
+                hints_apply_reason = "enforce_mode_high_confidence"
+            else:
+                intent_apply_reason = "low_confidence"
+                hints_apply_reason = "low_confidence"
+        elif mode == "assist":
+            if confidence_ok:
+                should_apply_intent = self._should_apply_message_understanding_assist(
+                    rule_intent_type=rule_intent_type,
+                    understanding_result=understanding_result,
+                    routing_payload_json=routing_payload_json,
+                )
+                intent_apply_reason = (
+                    "assist_mode_rule_is_weak_or_conflicting"
+                    if should_apply_intent
+                    else "assist_mode_rule_is_strong"
+                )
+            elif medium_confidence_ok and rule_is_weak_or_conflicting and mapped_ok:
+                # second_step_17_assist_call_policy_narrow_broad_help_v1
+                # If the deterministic route is essentially empty/ambiguous,
+                # medium-confidence LLM intent is useful enough to route the
+                # question to the correct deterministic builder. This still does
+                # not create evidence and is limited to weak rule cases.
+                should_apply_intent = self._should_apply_message_understanding_assist_medium(
+                    rule_intent_type=rule_intent_type,
+                    understanding_result=understanding_result,
+                    routing_payload_json=routing_payload_json,
+                )
+                intent_apply_reason = (
+                    "assist_mode_medium_confidence_weak_rule_intent"
+                    if should_apply_intent
+                    else "assist_mode_medium_confidence_intent_not_safe"
+                )
+            else:
+                intent_apply_reason = "low_confidence"
+
+            should_apply_hints = bool(
+                mapped_ok
+                and self._has_message_understanding_expansion_terms(understanding_result)
+                and (confidence_ok or (hint_confidence_ok and rule_is_weak_or_conflicting))
+            )
+            hints_apply_reason = (
+                "assist_mode_high_confidence_resolver_hints"
+                if should_apply_hints and confidence_ok
+                else "assist_mode_medium_confidence_weak_rule_resolver_hints"
+                if should_apply_hints
+                else "assist_mode_no_safe_hints"
+            )
+        else:
+            intent_apply_reason = "shadow_mode"
+            hints_apply_reason = "shadow_mode"
+
+        routing_payload_json["message_understanding_application"] = {
+            "version": "second_step_17_assist_call_policy_narrow_broad_help_v1",
+            "mode": mode,
+            "applied": bool(should_apply_intent or should_apply_hints),
+            "intent_applied": should_apply_intent,
+            "intent_reason": intent_apply_reason,
+            "resolver_hints_applied": should_apply_hints,
+            "resolver_hints_reason": hints_apply_reason,
+            "rule_intent_type": rule_intent_type.value,
+            "llm_intent_type": mapped_intent.value if mapped_intent is not None else None,
+            "confidence": understanding_result.confidence,
+            "min_confidence": min_confidence,
+            "medium_intent_confidence": 0.65,
+            "medium_hint_confidence": 0.55,
+            "rule_is_weak_or_conflicting": rule_is_weak_or_conflicting,
+        }
+
+        expansion_terms = self._message_understanding_expansion_terms(understanding_result)
+        if should_apply_hints and expansion_terms:
+            query_constraints_json["message_understanding_hints_applied"] = True
+            query_constraints_json["resolver_query_expansion_terms"] = expansion_terms
+
+        if not should_apply_intent or mapped_intent is None:
+            return rule_intent_type
+
+        query_constraints_json["message_understanding_applied"] = True
+        query_constraints_json["message_understanding_intent"] = mapped_intent.value
+
+        if self._should_apply_message_understanding_service_discovery(
+            understanding_result=understanding_result,
+            rule_intent_type=rule_intent_type,
+            routing_payload_json=routing_payload_json,
+        ):
+            query_constraints_json["requires_service_discovery"] = True
+            query_constraints_json["avoid_single_service_resolution"] = True
+            query_constraints_json["routing_mode"] = "service_discovery"
+
+        if understanding_result.needs_clarification and understanding_result.clarification_question:
+            query_constraints_json["needs_clarification"] = True
+            query_constraints_json["clarification_question"] = understanding_result.clarification_question
+
+        return mapped_intent
+
+    @staticmethod
+    def _is_weak_or_conflicting_rule_route(
+        *,
+        rule_intent_type: QuestionIntentEnum,
+        routing_payload_json: dict[str, Any],
+    ) -> bool:
+        if rule_intent_type in {QuestionIntentEnum.OTHER, QuestionIntentEnum.AMBIGUOUS_QUESTION}:
+            return True
+
+        rule_confidence = _to_float(
+            (routing_payload_json or {}).get("confidence"),
+            default=0.0,
+        )
+        if rule_confidence and rule_confidence < 0.72:
+            return True
+
+        query_constraints = (routing_payload_json or {}).get("query_constraints_json") or {}
+        if query_constraints.get("requires_service_discovery"):
+            return True
+
+        chosen_rules = (routing_payload_json or {}).get("chosen_rules") or []
+        if isinstance(chosen_rules, list) and len(chosen_rules) > 1:
+            return True
+
+        return False
+
+    @staticmethod
+    def _should_apply_message_understanding_assist(
+        *,
+        rule_intent_type: QuestionIntentEnum,
+        understanding_result: MessageUnderstandingResult,
+        routing_payload_json: dict[str, Any],
+    ) -> bool:
+        mapped_intent = understanding_result.mapped_intent_type
+        if mapped_intent is None or mapped_intent == QuestionIntentEnum.OTHER:
+            return False
+
+        if rule_intent_type in {QuestionIntentEnum.OTHER, QuestionIntentEnum.AMBIGUOUS_QUESTION}:
+            return True
+
+        rule_confidence = _to_float(
+            (routing_payload_json or {}).get("confidence"),
+            default=0.0,
+        )
+        if rule_confidence and rule_confidence < 0.72:
+            return True
+
+        # In assist mode the LLM should change the intent only when it
+        # genuinely disagrees with a weak/conflicting rule result. If it returns
+        # the same intent as the rule layer, keep the rule intent and use only
+        # neutral resolver hints. This makes diagnostics truthful: intent_applied
+        # means that routing actually changed.
+        if mapped_intent == rule_intent_type:
+            return False
+
+        # Generic precedence rule: an explicit document intent may override a
+        # broad/weak rule result, but not a strong non-document route.
+        if mapped_intent == QuestionIntentEnum.DOCUMENTS_QUESTION:
+            return True
+
+        return False
+
+    @staticmethod
+    def _should_apply_message_understanding_assist_medium(
+        *,
+        rule_intent_type: QuestionIntentEnum,
+        understanding_result: MessageUnderstandingResult,
+        routing_payload_json: dict[str, Any],
+    ) -> bool:
+        """Allow medium-confidence LLM intent only for weak rule routes.
+
+        This is intentionally narrower than the high-confidence assist path.
+        It is meant for cases where the rule layer returned OTHER/AMBIGUOUS or
+        another weak result, while the model extracted a supported domain intent
+        plus semantic slots. The model still does not produce legal content.
+        """
+        mapped_intent = understanding_result.mapped_intent_type
+        if mapped_intent is None or mapped_intent == QuestionIntentEnum.OTHER:
+            return False
+        if mapped_intent == rule_intent_type:
+            return False
+        if not AnswerOrchestrator._is_weak_or_conflicting_rule_route(
+            rule_intent_type=rule_intent_type,
+            routing_payload_json=routing_payload_json,
+        ):
+            return False
+        if not AnswerOrchestrator._has_message_understanding_expansion_terms(understanding_result):
+            return False
+        return mapped_intent in {
+            QuestionIntentEnum.DOCUMENTS_QUESTION,
+            QuestionIntentEnum.ELIGIBILITY_QUESTION,
+            QuestionIntentEnum.DEADLINE_QUESTION,
+            QuestionIntentEnum.PAYMENT_TIMING_QUESTION,
+            QuestionIntentEnum.AMOUNT_QUESTION,
+            QuestionIntentEnum.REJECTION_QUESTION,
+            QuestionIntentEnum.PROCEDURE_QUESTION,
+            QuestionIntentEnum.APPEAL_QUESTION,
+            QuestionIntentEnum.FORM_QUESTION,
+            QuestionIntentEnum.MIXED_QUESTION,
+        }
+
+    @staticmethod
+    def _should_apply_message_understanding_service_discovery(
+        *,
+        understanding_result: MessageUnderstandingResult,
+        rule_intent_type: QuestionIntentEnum,
+        routing_payload_json: dict[str, Any],
+    ) -> bool:
+        """Decide whether LLM may force service_discovery.
+
+        LLMs often mark broad eligibility as needs_service_discovery=true. That
+        is correct for questions like "what am I entitled to?". It is not safe
+        to force discovery when the user already gave a specific semantic bundle
+        such as applicant category + territory + concrete need. In those cases
+        resolver hints are better: let deterministic service_resolver choose one
+        concrete service.
+        """
+        if not understanding_result.needs_service_discovery:
+            return False
+
+        constraints = (routing_payload_json or {}).get("query_constraints_json") or {}
+        if constraints.get("requires_service_discovery"):
+            return True
+        if str(constraints.get("routing_mode") or "").strip().lower() == "service_discovery":
+            return True
+
+        if understanding_result.service_hint:
+            return False
+        if understanding_result.territory and understanding_result.user_needs:
+            return False
+        if understanding_result.requested_channel and understanding_result.user_needs:
+            return False
+
+        # A broad weak eligibility route with applicant facts but no concrete
+        # need should remain service_discovery: this is the usual "what am I
+        # entitled to?" scenario.
+        return True
+
+
+    @staticmethod
+    def _is_broad_eligibility_help_question(
+        *,
+        rule_intent_type: QuestionIntentEnum,
+        routing_payload_json: dict[str, Any],
+    ) -> bool:
+        """True for broad natural help questions where LLM semantic slots help resolver.
+
+        second_step_17_assist_call_policy_narrow_broad_help_v1
+
+        The previous policy was too broad: it called the LLM for virtually every
+        eligibility question in the live-question bank, including explicit
+        questions like "могу ли подать заявление на ...".  That increased latency
+        while adding little value, because such questions already contain enough
+        service-specific terms for the deterministic resolver.
+
+        This predicate is intentionally narrower.  It calls the LLM for broad
+        real-life help messages where the user describes a situation/need, but
+        avoids doing so for explicit application questions that already name the
+        measure or service.
+        """
+        if rule_intent_type != QuestionIntentEnum.ELIGIBILITY_QUESTION:
+            return False
+
+        payload = routing_payload_json or {}
+        normalized = str(payload.get("normalized_for_classification") or "").lower()
+        if not normalized:
+            return False
+
+        # Do not call the LLM for explicit deterministic sub-routes.
+        blocked_markers = (
+            "какие документы",
+            "список документов",
+            "перечень документов",
+            "полный перечень",
+            "срок",
+            "когда",
+            "причин",
+            "основан",
+            "отказ",
+            "обжал",
+        )
+        if any(marker in normalized for marker in blocked_markers):
+            return False
+
+        # Explicit "apply for X" questions usually already contain service terms.
+        # Let the deterministic resolver handle them first; LLM fallback should
+        # be added later after resolver_result=ambiguous/not_found, not before.
+        explicit_application_markers = (
+            "могу ли подать заявление",
+            "можно ли подать заявление",
+            "могу подать заявление",
+            "подать заявление на",
+            "оформить заявление на",
+        )
+        if any(marker in normalized for marker in explicit_application_markers):
+            return False
+
+        broad_help_markers = (
+            "можно ли получить помощь",
+            "можно ли получить поддержку",
+            "помощь от соцзащит",
+            "нужна помощь",
+            "помогите",
+            "не хватает денег",
+            "денег не хватает",
+            "денег нет",
+            "случилась беда",
+            "трудная ситуация",
+            "сгорел",
+            "нечего есть",
+            "дров",
+            "собрать детей в школу",
+        )
+        if any(marker in normalized for marker in broad_help_markers):
+            return True
+
+        chosen_rules = payload.get("chosen_rules") or []
+        if isinstance(chosen_rules, list) and any(
+            str(rule) in {
+                "service_discovery_crisis_or_material_help",
+                "service_discovery_broad_entitlement",
+            }
+            for rule in chosen_rules
+        ):
+            return len(normalized.split()) >= 7
+
+        return False
+
+    def _message_understanding_mode(self) -> str:
+        """Return configured message-understanding mode without calling the LLM."""
+        service = self.message_understanding_service
+        if service is None:
+            return "disabled"
+        config = getattr(service, "config", None)
+        mode = getattr(config, "mode", "shadow")
+        return str(mode or "shadow").strip().lower()
+
+    def _should_call_message_understanding(
+        self,
+        *,
+        rule_intent_type: QuestionIntentEnum,
+        routing_payload_json: dict[str, Any],
+        query_constraints_json: dict[str, Any],
+        request_metadata_json: Optional[dict[str, Any]] = None,
+    ) -> tuple[bool, str, str]:
+        """Decide whether the optional LLM understanding layer should be called.
+
+        The expensive call is useful for diagnostics in shadow mode and for
+        weak/conflicting routes in assist mode. Strong deterministic routes,
+        especially ordinary document/deadline/refusal questions, should not pay
+        the LLM latency on every request.
+        """
+        if self.message_understanding_service is None:
+            return False, "disabled", "service_not_configured"
+
+        mode = self._message_understanding_mode()
+        request_metadata_json = dict(request_metadata_json or {})
+
+        forced = request_metadata_json.get("force_message_understanding")
+        if forced is True or str(forced).strip().lower() in {"1", "true", "yes", "да"}:
+            return True, mode, "forced_by_request_metadata"
+
+        if mode == "shadow":
+            return True, mode, "shadow_mode_observe_all"
+
+        if mode == "enforce":
+            return True, mode, "enforce_mode_evaluate_all"
+
+        if mode != "assist":
+            return False, mode, "unsupported_mode"
+
+        if self._is_weak_or_conflicting_rule_route(
+            rule_intent_type=rule_intent_type,
+            routing_payload_json=routing_payload_json,
+        ):
+            return True, mode, "assist_mode_weak_or_conflicting_rule_route"
+
+        if query_constraints_json.get("requires_service_discovery"):
+            return True, mode, "assist_mode_service_discovery_route"
+
+        if str(query_constraints_json.get("routing_mode") or "").strip().lower() == "service_discovery":
+            return True, mode, "assist_mode_service_discovery_route"
+
+        # second_step_20_post_resolver_llm_policy_v1
+        # Do not call the LLM upfront for every broad eligibility/help question.
+        # The broad-question detector remains useful as a cheap signal, but the
+        # expensive LLM call should be moved closer to the resolver fallback path.
+        # This prevents the pattern observed in the 220-question bank where every
+        # Qxx_01 triggered the model before we even knew whether the deterministic
+        # resolver could handle the question.
+        if self._is_broad_eligibility_help_question(
+            rule_intent_type=rule_intent_type,
+            routing_payload_json=routing_payload_json,
+        ):
+            return False, mode, "assist_mode_broad_help_deferred_until_after_resolver"
+
+        return False, mode, "assist_mode_strong_rule_route_skipped"
+
+    @staticmethod
+    def _has_message_understanding_expansion_terms(
+        understanding_result: MessageUnderstandingResult,
+    ) -> bool:
+        return bool(AnswerOrchestrator._message_understanding_expansion_terms(understanding_result))
+
+    @staticmethod
+    def _message_understanding_expansion_terms(
+        understanding_result: MessageUnderstandingResult,
+    ) -> list[str]:
+        result: list[str] = []
+        for value in (
+            understanding_result.service_hint,
+            understanding_result.topic,
+            understanding_result.territory,
+            understanding_result.requested_channel,
+            *list(understanding_result.applicant_facts or []),
+            *list(getattr(understanding_result, "user_needs", []) or []),
+        ):
+            if value is None:
+                continue
+            text = " ".join(str(value).strip().split())
+            if not text:
+                continue
+            if text.lower() in {item.lower() for item in result}:
+                continue
+            result.append(text[:160])
+        return result[:10]
+
     async def _build_question_routing(
         self,
         question_text: str,
@@ -726,6 +1237,32 @@ class AnswerOrchestrator:
 
         if guard_result is not None:
             routing_payload_json["message_guard"] = guard_result.to_payload()
+
+        should_call_understanding, understanding_mode, understanding_call_reason = self._should_call_message_understanding(
+            rule_intent_type=intent_type,
+            routing_payload_json=routing_payload_json,
+            query_constraints_json=query_constraints_json,
+            request_metadata_json=request_metadata_json,
+        )
+        routing_payload_json["message_understanding_call_policy"] = {
+            "version": "second_step_20_post_resolver_llm_policy_v1",
+            "mode": understanding_mode,
+            "should_call": should_call_understanding,
+            "reason": understanding_call_reason,
+        }
+
+        if should_call_understanding:
+            understanding_result = await self._run_message_understanding(
+                normalized_text,
+                deterministic_classification=classification,
+            )
+            if understanding_result is not None:
+                intent_type = self._apply_message_understanding_to_routing(
+                    understanding_result=understanding_result,
+                    rule_intent_type=intent_type,
+                    routing_payload_json=routing_payload_json,
+                    query_constraints_json=query_constraints_json,
+                )
 
         forced_intent_value = request_metadata_json.get("forced_intent_type")
         if forced_intent_value:
@@ -927,6 +1464,7 @@ class AnswerOrchestrator:
                     if routing.subject_category_code
                     else []
                 ),
+                *list((routing.query_constraints_json or {}).get("resolver_query_expansion_terms") or []),
             ],
         )
 
@@ -1011,7 +1549,11 @@ class AnswerOrchestrator:
             },
         }
 
+        routing_payload_json = dict(question_event.routing_payload_json or {})
+        query_constraints_json = dict(question_event.query_constraints_json or {})
+
         debug_payload_json = {
+            "version": "second_step_20_post_resolver_llm_policy_v1",
             "reuse_gate": {
                 "should_reuse": reuse_decision.should_reuse,
                 "decision_code": reuse_decision.decision_code,
@@ -1021,7 +1563,25 @@ class AnswerOrchestrator:
                 "validation_status": str(answer_event.validation_status),
                 "answer_mode": str(answer_event.answer_mode),
             },
+            "question_routing": {
+                "intent_type": str(question_event.intent_type),
+                "subject_category_code": question_event.subject_category_code,
+                "classifier_version": question_event.classifier_version,
+                "routing_payload_json": routing_payload_json,
+                "query_constraints_json": query_constraints_json,
+            },
         }
+
+        # second_step_05_message_understanding_smoke_and_debug_v1
+        # Expose LLM-understanding diagnostics in API debug output. The data was
+        # already stored in QuestionEvent.routing_payload_json, but the HTTP
+        # response did not surface it, which made shadow-mode checks opaque.
+        if "message_understanding_call_policy" in routing_payload_json:
+            debug_payload_json["message_understanding_call_policy"] = routing_payload_json.get("message_understanding_call_policy")
+        if "message_understanding" in routing_payload_json:
+            debug_payload_json["message_understanding"] = routing_payload_json.get("message_understanding")
+        if "message_understanding_application" in routing_payload_json:
+            debug_payload_json["message_understanding_application"] = routing_payload_json.get("message_understanding_application")
 
         return OutgoingAnswerPayload(
             answer_event_id=answer_event.answer_event_id,
@@ -1100,3 +1660,19 @@ class AnswerOrchestrator:
 
     def _utcnow(self) -> datetime:
         return datetime.now(timezone.utc)
+
+# ============================================================
+# Message understanding helpers
+# ============================================================
+
+def _message_understanding_min_confidence(payload: dict[str, Any]) -> float:
+    raw = (payload or {}).get("min_confidence_to_apply")
+    value = _to_float(raw, default=0.72)
+    return max(0.0, min(value, 1.0))
+
+
+def _to_float(value: Any, *, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default

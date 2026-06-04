@@ -45,9 +45,12 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = load_settings()
+    message_understanding_service = _build_message_understanding_service(settings)
+
     runtime = AppRuntime(
         AppRuntimeConfig(
             database=settings.database,
+            message_understanding_service=message_understanding_service,
         )
     )
 
@@ -209,6 +212,39 @@ app = create_app()
 # ============================================================
 # Helpers
 # ============================================================
+
+def _build_message_understanding_service(settings: AppSettings) -> Any | None:
+    """Build optional LLM understanding service.
+
+    Disabled by default. When disabled, no model calls are made and the previous
+    deterministic routing path is unchanged.
+    """
+    config = settings.message_understanding
+    if not config.enabled:
+        return None
+
+    # Lazy imports keep the default disabled mode free from an OpenAI SDK
+    # import requirement during API startup.
+    from app.integrations.openai.client_factory import OpenAIClientFactory
+    from app.services.answers.message_understanding import (
+        LLMMessageUnderstandingService,
+        MessageUnderstandingConfig,
+    )
+
+    client = OpenAIClientFactory(settings.openai).create_async_client()
+    return LLMMessageUnderstandingService(
+        client,
+        config=MessageUnderstandingConfig(
+            enabled=config.enabled,
+            mode=config.mode,
+            model_name=config.model_name,
+            temperature=config.temperature,
+            max_output_tokens=config.max_output_tokens,
+            min_confidence_to_apply=config.min_confidence_to_apply,
+            request_timeout_seconds=config.request_timeout_seconds,
+        ),
+    )
+
 
 def _get_runtime(request: Request) -> AppRuntime:
     runtime = getattr(request.app.state, "runtime", None)

@@ -30,6 +30,7 @@ from app.config.settings import DatabaseSettings
 from app.db.session import DatabaseSessionManager
 from app.services.answers.answer_orchestrator import (
     IntentClassifierProtocol,
+    MessageUnderstandingProtocol,
     QuestionEmbeddingProtocol,
     QuestionNormalizerProtocol,
 )
@@ -64,6 +65,7 @@ class AppRuntimeConfig:
     intent_classifier: Optional[IntentClassifierProtocol] = None
     question_normalizer: Optional[QuestionNormalizerProtocol] = None
     question_embedding_service: Optional[QuestionEmbeddingProtocol] = None
+    message_understanding_service: Optional[MessageUnderstandingProtocol] = None
 
     service_factory_config: Optional[ServiceFactoryConfig] = None
 
@@ -119,6 +121,7 @@ class AppRuntime:
             else DefaultQuestionNormalizer()
         )
         self._question_embedding_service = config.question_embedding_service
+        self._message_understanding_service = config.message_understanding_service
         self._service_factory_config = config.service_factory_config or ServiceFactoryConfig()
 
     # --------------------------------------------------------
@@ -187,6 +190,7 @@ class AppRuntime:
             intent_classifier=self._intent_classifier,
             question_normalizer=self._question_normalizer,
             question_embedding_service=self._question_embedding_service,
+            message_understanding_service=self._message_understanding_service,
             config=self._service_factory_config,
         )
 

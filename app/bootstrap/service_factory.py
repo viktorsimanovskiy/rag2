@@ -28,6 +28,7 @@ from app.services.answers.answer_orchestrator import (
     AnswerOrchestrator,
     IntentClassifierProtocol,
     MessageGuardProtocol,
+    MessageUnderstandingProtocol,
     QuestionEmbeddingProtocol,
     QuestionNormalizerProtocol,
 )
@@ -109,6 +110,7 @@ class ServiceFactory:
         question_normalizer: QuestionNormalizerProtocol,
         message_guard: Optional[MessageGuardProtocol] = None,
         question_embedding_service: Optional[QuestionEmbeddingProtocol] = None,
+        message_understanding_service: Optional[MessageUnderstandingProtocol] = None,
         config: Optional[ServiceFactoryConfig] = None,
     ) -> None:
         self.db = db
@@ -116,6 +118,7 @@ class ServiceFactory:
         self.question_normalizer = question_normalizer
         self.message_guard = message_guard or RuleBasedMessageGuard()
         self.question_embedding_service = question_embedding_service
+        self.message_understanding_service = message_understanding_service
         self.config = config or ServiceFactoryConfig()
 
         self._feedback_service: Optional[FeedbackService] = None
@@ -209,6 +212,7 @@ class ServiceFactory:
                 question_normalizer=self.question_normalizer,
                 message_guard=self.message_guard,
                 question_embedding_service=self.question_embedding_service,
+                message_understanding_service=self.message_understanding_service,
                 runtime_answer_service=self.get_runtime_answer_service(),
                 sampling_policy=self.get_sampling_policy(),
             )

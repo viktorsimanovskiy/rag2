@@ -51,6 +51,16 @@ from app.services.retrieval.service_discovery import (
 logger = logging.getLogger(__name__)
 
 
+def _to_float(value: Any, *, default: float) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+
 # ============================================================
 # Exceptions
 # ============================================================
@@ -158,6 +168,25 @@ class RuntimeAnswerService:
         service_resolution = await self._resolve_service_context(payload)
         service_resolution_elapsed = perf_counter() - service_resolution_started_at
 
+        # second_step_19_broad_discovery_fallback_for_medium_resolution_v1
+        # If the LLM understanding layer identified a broad entitlement/help
+        # question and the deterministic resolver still cannot choose one
+        # service confidently, do not continue with wide unfiltered retrieval.
+        # Wide retrieval for eligibility questions can pick unrelated identifier
+        # rows and produce a misleading grounded_narrative. In this situation a
+        # cautious service_discovery answer is safer: it lists potentially
+        # relevant measures instead of pretending that one service was resolved.
+        if self._should_fallback_to_service_discovery_after_resolution(
+            payload=payload,
+            service_resolution=service_resolution,
+        ):
+            return await self._build_service_discovery_answer(
+                payload=payload,
+                total_started_at=total_started_at,
+                validation_elapsed=validation_elapsed,
+                terms_elapsed=terms_elapsed,
+            )
+
         retrieval_input_started_at = perf_counter()
         retrieval_input = self._build_retrieval_input(
             payload,
@@ -234,6 +263,169 @@ class RuntimeAnswerService:
             runtime_payload_json=runtime_payload_json,
         )
 
+
+
+    @staticmethod
+    def _should_fallback_to_service_discovery_after_resolution(
+        *,
+        payload: RuntimeAnswerInput,
+        service_resolution: ServiceResolutionResult,
+    ) -> bool:
+        """Return True when broad eligibility should fall back to service discovery.
+
+        This is a post-resolver safety valve for the LLM-assisted route. The LLM
+        may correctly understand a question as broad help/entitlement
+        (needs_service_discovery=true), while the deterministic resolver still
+        returns ambiguous/not_found. In that case continuing with unfiltered
+        retrieval is risky: the generator may combine identifier rows from
+        unrelated services.
+
+        The fallback is intentionally narrow:
+        - only eligibility questions;
+        - ambiguous/not_found service resolution, or resolved with non-high confidence;
+        - only when message_understanding actually marked the question as broad
+          service-discovery;
+        - not when the LLM provided a concrete service_hint.
+        """
+        if payload.intent_type != QuestionIntentEnum.ELIGIBILITY_QUESTION:
+            return False
+
+        status = str(service_resolution.resolution_status or "").strip().lower()
+        if status not in {"ambiguous", "not_found", "resolved"}:
+            return False
+
+        # second_step_19_broad_discovery_fallback_for_medium_resolution_v1
+        # For broad life-situation questions LLM may correctly mark
+        # needs_service_discovery=true. If the resolver returns a non-high
+        # resolved service, treating that single service as the final answer is
+        # still risky: the user did not name a concrete measure, and a medium
+        # match may only be one of several possible measures. In that situation
+        # service_discovery is safer than an overview of one selected service.
+        selected_confidence = ""
+        selected_service = getattr(service_resolution, "selected_service", None)
+        if selected_service is not None:
+            selected_confidence = str(getattr(selected_service, "confidence", "") or "").strip().lower()
+        if status == "resolved" and selected_confidence == "high":
+            return False
+
+        routing_payload = payload.routing_payload_json or {}
+        understanding = routing_payload.get("message_understanding") or {}
+
+        # second_step_20_post_resolver_llm_policy_v1
+        # Cheap deterministic fallback: if the user asks a broad life-situation
+        # help question and the resolver did not return a high-confidence single
+        # service, service_discovery is safer than an overview of one medium
+        # service. This preserves the safety gain from second_step_19 without
+        # calling the LLM before resolver for every broad question in the bank.
+        if self._is_broad_eligibility_help_question(payload):
+            return True
+
+        if not isinstance(understanding, dict):
+            return False
+
+        if not bool(understanding.get("needs_service_discovery")):
+            return False
+
+        confidence = _to_float(understanding.get("confidence"), default=0.0)
+        if confidence < 0.70:
+            return False
+
+        if str(understanding.get("service_hint") or "").strip():
+            return False
+
+        application = routing_payload.get("message_understanding_application") or {}
+        if isinstance(application, dict) and not bool(application.get("resolver_hints_applied")):
+            return False
+
+        return True
+
+    @staticmethod
+    def _is_broad_eligibility_help_question(payload: RuntimeAnswerInput) -> bool:
+        """Cheap broad-help detector for post-resolver safety fallback.
+
+        second_step_20_post_resolver_llm_policy_v1
+
+        This intentionally mirrors the high-level idea of AnswerOrchestrator's
+        broad-help detector, but it is used after service resolution. At this
+        point we already know whether the deterministic resolver produced a
+        high-confidence single service. If it did not, a broad everyday help
+        question should be answered through service_discovery rather than by
+        unfiltered retrieval or a medium-confidence single-service overview.
+        """
+        if payload.intent_type != QuestionIntentEnum.ELIGIBILITY_QUESTION:
+            return False
+
+        text = " ".join(
+            str(value or "")
+            for value in (
+                payload.question_text_normalized,
+                payload.question_text_raw,
+            )
+        ).lower().replace("ё", "е")
+        if not text.strip():
+            return False
+
+        # Explicit application questions normally contain service-specific
+        # terms and should be handled by resolver first. If resolver returns
+        # non-high confidence, they can still be handled by other resolver
+        # diagnostics, but they should not be forced into service_discovery just
+        # because they include "можно ли".
+        explicit_application_markers = (
+            "могу ли подать заявление",
+            "можно ли подать заявление",
+            "могу подать заявление",
+            "подать заявление на",
+            "оформить заявление на",
+        )
+        if any(marker in text for marker in explicit_application_markers):
+            return False
+
+        blocked_markers = (
+            "какие документы",
+            "список документов",
+            "перечень документов",
+            "полный перечень",
+            "срок",
+            "когда",
+            "причин",
+            "основан",
+            "отказ",
+            "обжал",
+        )
+        if any(marker in text for marker in blocked_markers):
+            return False
+
+        broad_markers = (
+            "можно ли получить помощь",
+            "можно ли получить поддержку",
+            "помощь от соцзащит",
+            "нужна помощь",
+            "помогите",
+            "не хватает денег",
+            "денег не хватает",
+            "денег нет",
+            "случилась беда",
+            "трудная ситуация",
+            "сгорел",
+            "нечего есть",
+            "дров",
+            "собрать детей в школу",
+        )
+        if any(marker in text for marker in broad_markers):
+            return True
+
+        routing_payload = payload.routing_payload_json or {}
+        chosen_rules = routing_payload.get("chosen_rules") or []
+        if isinstance(chosen_rules, list) and any(
+            str(rule) in {
+                "service_discovery_crisis_or_material_help",
+                "service_discovery_broad_entitlement",
+            }
+            for rule in chosen_rules
+        ):
+            return len(text.split()) >= 7
+
+        return False
 
     # --------------------------------------------------------
     # Service discovery
@@ -588,7 +780,7 @@ class RuntimeAnswerService:
         if self.service_resolver is None:
             return None
 
-        question_text = payload.question_text_normalized or payload.question_text_raw
+        question_text = self._build_service_resolver_question_text(payload)
         result = await self.service_resolver.resolve(
             ServiceResolverInput(question_text=question_text)
         )
@@ -604,6 +796,26 @@ class RuntimeAnswerService:
         )
 
         return result
+
+    @staticmethod
+    def _build_service_resolver_question_text(payload: RuntimeAnswerInput) -> str:
+        """Build resolver text from the normalized question plus safe hints.
+
+        LLM understanding, when enabled and applied, may add neutral search hints
+        such as service_hint, applicant facts and territory. They are not legal
+        evidence; they only help the deterministic resolver choose a service.
+        """
+        parts: list[str] = [payload.question_text_normalized or payload.question_text_raw]
+
+        for value in (payload.query_constraints_json or {}).get("resolver_query_expansion_terms") or []:
+            text = " ".join(str(value or "").strip().split())
+            if not text:
+                continue
+            if text.lower() in {item.lower() for item in parts}:
+                continue
+            parts.append(text[:160])
+
+        return " ".join(parts).strip()
 
     def _service_resolution_to_json(
         self,
