@@ -29,10 +29,10 @@ import mimetypes
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Protocol
 from uuid import UUID, uuid4
 
-from sqlalchemy import Select, select
+from sqlalchemy import Select, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
@@ -56,6 +56,11 @@ except Exception:  # pragma: no cover
 
 class DocumentNormalizerProtocol:
     async def normalize(self, payload: "NormalizationInput") -> "NormalizationResult":
+        raise NotImplementedError
+
+
+class DocumentPreprocessorProtocol(Protocol):
+    def analyze(self, file_path: str | Path) -> "Any":
         raise NotImplementedError
 
 
@@ -119,6 +124,13 @@ class DocumentIngestionInput:
     parser_version: str = "parser_v1"
     schema_version: str = "schema_v1"
 
+    # DOCX preprocessing is intentionally opt-in.
+    # Supported values:
+    # - off: current behavior;
+    # - report_only: run preprocessor and attach report, but do not change published data;
+    # - trim_for_rag: run preprocessor and publish only prepared RAG content.
+    docx_preprocessing_mode: str = "off"
+
 
 @dataclass(slots=True)
 class DetectedFileInfo:
@@ -178,6 +190,11 @@ class ExtractionResult:
     doc_uid_base: Optional[str]
     revision_date: Optional[datetime]
 
+    document_number: Optional[str] = None
+    document_date: Optional[datetime] = None
+    service_name_full: Optional[str] = None
+    service_name_short: Optional[str] = None
+
     blocks: list[dict[str, Any]] = field(default_factory=list)
     tables: list[dict[str, Any]] = field(default_factory=list)
     table_rows: list[dict[str, Any]] = field(default_factory=list)
@@ -202,9 +219,7 @@ class SemanticEnrichmentResult:
     """
     source_authority: Optional[str]
     document_type: Optional[str]
-    measure_codes: list[str] = field(default_factory=list)
     legal_facts: list[dict[str, Any]] = field(default_factory=list)
-    aliases: list[dict[str, Any]] = field(default_factory=list)
     enrichment_payload_json: dict[str, Any] = field(default_factory=dict)
 
 
@@ -241,6 +256,14 @@ class PublishInput:
     enrichment_result: SemanticEnrichmentResult
     qc_result: QcResult
     input_payload: DocumentIngestionInput
+
+
+@dataclass(slots=True)
+class DocxPreprocessingRun:
+    """Internal result of optional DOCX preprocessing stage."""
+
+    payload_json: dict[str, Any]
+    prepared_text: Optional[str] = None
 
 
 @dataclass(slots=True)
@@ -285,6 +308,7 @@ class DocumentIngestionPipeline:
         enricher: SemanticEnricherProtocol,
         qc: StructuralQcProtocol,
         publisher: DocumentPublisherProtocol,
+        preprocessor: Optional[DocumentPreprocessorProtocol] = None,
     ) -> None:
         self.db = db
         self.normalizer = normalizer
@@ -292,6 +316,7 @@ class DocumentIngestionPipeline:
         self.enricher = enricher
         self.qc = qc
         self.publisher = publisher
+        self.preprocessor = preprocessor
 
     # --------------------------------------------------------
     # Public API
@@ -328,9 +353,12 @@ class DocumentIngestionPipeline:
             payload=payload,
             file_info=file_info,
         )
+        job_id = job.job_id
+        current_stage = "received"
 
         try:
-            await self._mark_job_stage(job, status="running", stage="idempotency_check")
+            current_stage = "idempotency_check"
+            await self._mark_job_stage(job, status="running", stage=current_stage)
 
             duplicate_document = await self._find_duplicate_document(file_info.file_hash)
             if duplicate_document is not None and not payload.force_reingest:
@@ -344,7 +372,7 @@ class DocumentIngestionPipeline:
                     },
                 )
                 return DocumentIngestionResult(
-                    ingestion_job_id=job.job_id,
+                    ingestion_job_id=job_id,
                     document_id=getattr(duplicate_document, "document_id", None),
                     status="skipped_duplicate",
                     file_hash=file_info.file_hash,
@@ -353,7 +381,21 @@ class DocumentIngestionPipeline:
                     payload_json={"reason": "duplicate"},
                 )
 
-            await self._mark_job_stage(job, status="running", stage="normalization")
+            preprocessing_run = await self._run_docx_preprocessing_if_needed(
+                job=job,
+                file_info=file_info,
+                payload=payload,
+            )
+            preprocessing_payload_json = (
+                preprocessing_run.payload_json if preprocessing_run is not None else None
+            )
+
+            current_stage = "normalization"
+            await self._mark_job_stage(job, status="running", stage=current_stage)
+
+            normalization_metadata_json = dict(payload.metadata_json or {})
+            if preprocessing_payload_json is not None:
+                normalization_metadata_json["docx_preprocessing"] = preprocessing_payload_json
 
             normalized_result = await self.normalizer.normalize(
                 NormalizationInput(
@@ -362,14 +404,31 @@ class DocumentIngestionPipeline:
                     extension=file_info.extension,
                     mime_type=file_info.mime_type,
                     source_type=payload.source_type,
-                    metadata_json=payload.metadata_json,
+                    metadata_json=normalization_metadata_json,
                 )
             )
+            if preprocessing_payload_json is not None:
+                normalized_result.parser_payload_json["docx_preprocessing"] = preprocessing_payload_json
 
+            if preprocessing_run is not None and preprocessing_run.prepared_text is not None:
+                normalized_result = NormalizationResult(
+                    normalized_text=preprocessing_run.prepared_text,
+                    normalized_content_hash=self._compute_text_hash(
+                        preprocessing_run.prepared_text
+                    ),
+                    detected_language_code=normalized_result.detected_language_code,
+                    parser_payload_json={
+                        **(normalized_result.parser_payload_json or {}),
+                        "docx_preprocessing": preprocessing_payload_json,
+                        "normalized_text_source": "docx_preprocessor_prepared_text",
+                    },
+                )
+
+            current_stage = "structure_extraction"
             await self._mark_job_stage(
                 job,
                 status="running",
-                stage="structure_extraction",
+                stage=current_stage,
                 payload_json={
                     "content_hash": normalized_result.normalized_content_hash,
                 },
@@ -385,7 +444,8 @@ class DocumentIngestionPipeline:
                 )
             )
 
-            await self._mark_job_stage(job, status="running", stage="semantic_enrichment")
+            current_stage = "semantic_enrichment"
+            await self._mark_job_stage(job, status="running", stage=current_stage)
 
             enrichment_result = await self.enricher.enrich(
                 SemanticEnrichmentInput(
@@ -395,7 +455,8 @@ class DocumentIngestionPipeline:
                 )
             )
 
-            await self._mark_job_stage(job, status="running", stage="quality_control")
+            current_stage = "quality_control"
+            await self._mark_job_stage(job, status="running", stage=current_stage)
 
             qc_result = await self.qc.run_checks(
                 QcInput(
@@ -416,7 +477,7 @@ class DocumentIngestionPipeline:
                     },
                 )
                 return DocumentIngestionResult(
-                    ingestion_job_id=job.job_id,
+                    ingestion_job_id=job_id,
                     document_id=None,
                     status="failed_qc",
                     file_hash=file_info.file_hash,
@@ -428,11 +489,12 @@ class DocumentIngestionPipeline:
                     },
                 )
 
-            await self._mark_job_stage(job, status="running", stage="publish")
+            current_stage = "publish"
+            await self._mark_job_stage(job, status="running", stage=current_stage)
 
             publish_result = await self.publisher.publish(
                 PublishInput(
-                    ingestion_job_id=job.job_id,
+                    ingestion_job_id=job_id,
                     file_info=file_info,
                     normalized_result=normalized_result,
                     extraction_result=extraction_result,
@@ -456,7 +518,7 @@ class DocumentIngestionPipeline:
             logger.info(
                 "Document ingestion completed",
                 extra={
-                    "ingestion_job_id": str(job.job_id),
+                    "ingestion_job_id": str(job_id),
                     "document_id": str(publish_result.document_id),
                     "file_hash": file_info.file_hash,
                     "content_hash": normalized_result.normalized_content_hash,
@@ -464,7 +526,7 @@ class DocumentIngestionPipeline:
             )
 
             return DocumentIngestionResult(
-                ingestion_job_id=job.job_id,
+                ingestion_job_id=job_id,
                 document_id=publish_result.document_id,
                 status="completed",
                 file_hash=file_info.file_hash,
@@ -475,6 +537,12 @@ class DocumentIngestionPipeline:
                     "qc_metrics_json": qc_result.metrics_json,
                     "document_title": extraction_result.document_title,
                     "doc_uid_base": extraction_result.doc_uid_base,
+                    "document_number": extraction_result.document_number,
+                    "document_date": extraction_result.document_date,
+                    "revision_date": extraction_result.revision_date,
+                    "service_name_full": extraction_result.service_name_full,
+                    "service_name_short": extraction_result.service_name_short,
+                    "docx_preprocessing": preprocessing_payload_json,
                 },
             )
 
@@ -482,18 +550,83 @@ class DocumentIngestionPipeline:
             logger.exception(
                 "Document ingestion failed",
                 extra={
-                    "ingestion_job_id": str(job.job_id),
+                    "ingestion_job_id": str(job_id),
                     "file_path": payload.file_path,
                     "original_filename": payload.original_filename,
+                    "stage": current_stage,
                 },
             )
-            await self._mark_job_failed(
-                job=job,
-                stage=getattr(job, "stage", "unknown"),
+            await self.db.rollback()
+            await self._mark_job_failed_by_id(
+                job_id=job_id,
+                stage=current_stage,
                 error_message=str(exc),
                 payload_json={"exception_type": exc.__class__.__name__},
             )
             raise
+
+    async def _run_docx_preprocessing_if_needed(
+        self,
+        *,
+        job: Any,
+        file_info: DetectedFileInfo,
+        payload: DocumentIngestionInput,
+    ) -> Optional[DocxPreprocessingRun]:
+        mode = payload.docx_preprocessing_mode
+        if mode == "off":
+            return None
+
+        if file_info.extension.lower() != "docx":
+            return None
+
+        if mode in {"report_only", "trim_for_rag"} and self.preprocessor is None:
+            raise IngestionDependencyError(
+                f"docx_preprocessing_mode={mode} requires a DOCX preprocessor."
+            )
+
+        assert self.preprocessor is not None
+
+        current_stage = "docx_preprocessing_report"
+        await self._mark_job_stage(job, status="running", stage=current_stage)
+
+        preprocessing_result = self.preprocessor.analyze(file_info.file_path)
+        report = preprocessing_result.report.to_dict()
+        trim_can_be_applied = self._can_apply_docx_trim(report)
+
+        if mode == "trim_for_rag" and not trim_can_be_applied:
+            raise IngestionValidationError(
+                "docx_preprocessing_mode=trim_for_rag cannot be applied safely: "
+                f"{', '.join(report.get('warnings') or ['unknown_reason'])}"
+            )
+
+        report_payload = {
+            "mode": mode,
+            "applied_to_published_content": mode == "trim_for_rag",
+            "trim_safety_passed": trim_can_be_applied,
+            "report": report,
+        }
+
+        await self._mark_job_stage(
+            job,
+            status="running",
+            stage=current_stage,
+            payload_json={"docx_preprocessing": report_payload},
+        )
+
+        return DocxPreprocessingRun(
+            payload_json=report_payload,
+            prepared_text=(
+                preprocessing_result.prepared_text if mode == "trim_for_rag" else None
+            ),
+        )
+
+    def _can_apply_docx_trim(self, report: dict[str, Any]) -> bool:
+        return (
+            bool(report.get("official_start_found"))
+            and bool(report.get("has_exactly_one_each_core_table"))
+            and bool(report.get("trim_after_last_core_table_candidate"))
+            and not bool(report.get("tail_contains_core_table"))
+        )
 
     # --------------------------------------------------------
     # Input / file detection
@@ -508,6 +641,11 @@ class DocumentIngestionPipeline:
 
         if not payload.source_type or not payload.source_type.strip():
             raise IngestionValidationError("source_type must not be empty.")
+
+        if payload.docx_preprocessing_mode not in {"off", "report_only", "trim_for_rag"}:
+            raise IngestionValidationError(
+                "docx_preprocessing_mode must be one of: off, report_only, trim_for_rag."
+            )
 
         file_path = Path(payload.file_path)
         if not file_path.exists():
@@ -546,6 +684,9 @@ class DocumentIngestionPipeline:
                     break
                 hasher.update(chunk)
         return hasher.hexdigest()
+
+    def _compute_text_hash(self, text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     # --------------------------------------------------------
     # Ingestion job lifecycle
@@ -640,6 +781,35 @@ class DocumentIngestionPipeline:
 
         await self.db.commit()
         await self.db.refresh(job)
+
+    async def _mark_job_failed_by_id(
+        self,
+        *,
+        job_id: UUID,
+        stage: str,
+        error_message: str,
+        payload_json: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """
+        Mark an ingestion job as failed without touching a possibly expired ORM object.
+
+        This is important after a nested publish failure/rollback: SQLAlchemy may expire
+        attributes on the original job instance, and reading them can trigger async IO
+        from a non-greenlet context.
+        """
+        stmt = (
+            update(IngestionJob)
+            .where(IngestionJob.job_id == job_id)
+            .values(
+                status="failed",
+                stage=stage,
+                error_message=error_message,
+                finished_at=self._utcnow(),
+                payload_json=payload_json or {},
+            )
+        )
+        await self.db.execute(stmt)
+        await self.db.commit()
 
     # --------------------------------------------------------
     # Idempotency / duplicate checks

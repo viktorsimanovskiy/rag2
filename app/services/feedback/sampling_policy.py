@@ -60,7 +60,6 @@ class SamplingDecisionInput:
     answer_event_id: UUID
     answer_mode: AnswerModeEnum
     intent_type: QuestionIntentEnum
-    measure_code: Optional[str]
     confidence_score: Optional[float]
     request_metadata_json: dict[str, Any] = field(default_factory=dict)
 

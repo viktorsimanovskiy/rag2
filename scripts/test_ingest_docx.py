@@ -17,6 +17,7 @@ from app.services.ingestion.basic_document_semantic_enricher import (
 )
 from app.services.ingestion.docx_structure_extractor import DocxStructureExtractor
 from app.services.ingestion.docx_text_normalizer import DocxTextNormalizer
+from app.services.ingestion.docx_preprocessor import ConsultantPlusDocxPreprocessor
 from app.services.ingestion.document_ingestion_pipeline import (
     DocumentIngestionInput,
     DocumentIngestionPipeline,
@@ -25,7 +26,7 @@ from app.services.ingestion.document_publisher import DocumentPublisher
 from app.services.ingestion.structural_qc_service import StructuralQcService
 
 
-async def run(file_path: str, source_type: str, uploaded_by: str | None) -> int:
+async def run(file_path: str, source_type: str, uploaded_by: str | None, docx_preprocessing_mode: str) -> int:
     settings = load_settings()
 
     manager = DatabaseSessionManager(settings.database)
@@ -41,6 +42,7 @@ async def run(file_path: str, source_type: str, uploaded_by: str | None) -> int:
                 enricher=BasicDocumentSemanticEnricher(),
                 qc=StructuralQcService(),
                 publisher=DocumentPublisher(session),
+                preprocessor=ConsultantPlusDocxPreprocessor(),
             )
 
             result = await pipeline.ingest_document(
@@ -49,6 +51,7 @@ async def run(file_path: str, source_type: str, uploaded_by: str | None) -> int:
                     original_filename=Path(file_path).name,
                     source_type=source_type,
                     uploaded_by=uploaded_by,
+                    docx_preprocessing_mode=docx_preprocessing_mode,
                     metadata_json={
                         "run_mode": "manual_docx_test",
                         "source_format": "docx",
@@ -87,9 +90,22 @@ def main() -> int:
     parser.add_argument("file_path", help="Path to .docx file")
     parser.add_argument("--source-type", default="manual_test")
     parser.add_argument("--uploaded-by", default=None)
+    parser.add_argument(
+        "--docx-preprocessing-mode",
+        choices=["off", "report_only", "trim_for_rag"],
+        default="off",
+        help="DOCX preprocessing mode. report_only attaches a cleaning/trim report without changing published data; trim_for_rag publishes prepared RAG content.",
+    )
     args = parser.parse_args()
 
-    return asyncio.run(run(args.file_path, args.source_type, args.uploaded_by))
+    return asyncio.run(
+        run(
+            args.file_path,
+            args.source_type,
+            args.uploaded_by,
+            args.docx_preprocessing_mode,
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -84,13 +84,11 @@ class EvidenceItemInput:
     """
     Represents one evidence object used to produce an answer.
 
-    Exactly one of:
-    - document_id
-    - block_id
-    - table_id
-    - table_row_id
-    - legal_fact_id
-    must be present.
+    Valid pointer shapes:
+    - document_id only;
+    - exactly one precise pointer: block_id, table_id, table_row_id or legal_fact_id;
+    - document_id plus exactly one precise pointer, when document_id is used as
+      a freshness-check context for the precise evidence object.
     """
     evidence_item_type: EvidenceItemTypeEnum
     role_code: str
@@ -179,7 +177,6 @@ class QualityAggregateResult:
     aggregate_date: date
     channel_code: ChannelTypeEnum
     intent_type: QuestionIntentEnum
-    measure_code: Optional[str]
     total_answers: int
     total_feedback: int
     avg_feedback_score: Optional[float]
@@ -468,7 +465,7 @@ class FeedbackService:
         - delete existing aggregates for this date
         - rebuild from answer_events/question_events/feedback
         - aggregate by:
-            date + channel + intent + measure_code
+            date + channel + intent
 
         Note:
         channel is derived through question -> session -> channel.
@@ -488,13 +485,12 @@ class FeedbackService:
 
         rows = await self._fetch_quality_aggregate_source_rows(day_start, day_end)
 
-        grouped: dict[tuple[ChannelTypeEnum, QuestionIntentEnum, Optional[str]], dict[str, Any]] = {}
+        grouped: dict[tuple[ChannelTypeEnum, QuestionIntentEnum], dict[str, Any]] = {}
 
         for row in rows:
             key = (
                 row["channel_code"],
                 row["intent_type"],
-                row["measure_code"],
             )
             bucket = grouped.setdefault(
                 key,
@@ -524,7 +520,7 @@ class FeedbackService:
 
         results: list[QualityAggregateResult] = []
 
-        for (channel_code, intent_type, measure_code), bucket in grouped.items():
+        for (channel_code, intent_type), bucket in grouped.items():
             avg_feedback_score = (
                 round(sum(bucket["feedback_scores"]) / len(bucket["feedback_scores"]), 4)
                 if bucket["feedback_scores"]
@@ -535,7 +531,6 @@ class FeedbackService:
                 aggregate_date=aggregate_date,
                 channel_code=channel_code,
                 intent_type=intent_type,
-                measure_code=measure_code,
                 total_answers=bucket["total_answers"],
                 total_feedback=bucket["total_feedback"],
                 avg_feedback_score=self._to_decimal_or_none(avg_feedback_score, digits=4),
@@ -550,7 +545,6 @@ class FeedbackService:
                     aggregate_date=aggregate_date,
                     channel_code=channel_code,
                     intent_type=intent_type,
-                    measure_code=measure_code,
                     total_answers=bucket["total_answers"],
                     total_feedback=bucket["total_feedback"],
                     avg_feedback_score=avg_feedback_score,
@@ -601,9 +595,8 @@ class FeedbackService:
             self._validate_evidence_item_input(item, index=idx)
 
     def _validate_evidence_item_input(self, item: EvidenceItemInput, index: int) -> None:
-        pointer_count = sum(
+        precise_pointer_count = sum(
             1 for value in [
-                item.document_id,
                 item.block_id,
                 item.table_id,
                 item.table_row_id,
@@ -611,9 +604,16 @@ class FeedbackService:
             ] if value is not None
         )
 
-        if pointer_count != 1:
+        has_document_pointer = item.document_id is not None
+
+        if precise_pointer_count == 0 and not has_document_pointer:
             raise ValidationError(
-                f"Evidence item at index={index} must contain exactly one pointer id."
+                f"Evidence item at index={index} must contain a pointer id."
+            )
+
+        if precise_pointer_count > 1:
+            raise ValidationError(
+                f"Evidence item at index={index} must contain no more than one precise pointer id."
             )
 
         if not item.role_code or not item.role_code.strip():
@@ -780,7 +780,6 @@ class FeedbackService:
             select(
                 Channel.channel_code.label("channel_code"),
                 QuestionEvent.intent_type.label("intent_type"),
-                QuestionEvent.measure_code.label("measure_code"),
                 AnswerEvent.answer_event_id.label("answer_event_id"),
                 AnswerEvent.answer_mode.label("answer_mode"),
                 AnswerEvent.validation_status.label("validation_status"),
@@ -807,7 +806,6 @@ class FeedbackService:
             flattened.append({
                 "channel_code": row["channel_code"],
                 "intent_type": row["intent_type"],
-                "measure_code": row["measure_code"],
                 "answer_event_id": answer_id,
                 "is_reused": is_reused,
                 "validation_status": row["validation_status"],
@@ -834,7 +832,6 @@ class FeedbackService:
             normalized.append({
                 "channel_code": row["channel_code"],
                 "intent_type": row["intent_type"],
-                "measure_code": row["measure_code"],
                 "feedback_score": row["feedback_score"],
                 "total_answer_increment": total_answer_increment,
                 "reused_increment": reused_increment,

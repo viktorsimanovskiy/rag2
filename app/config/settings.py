@@ -107,6 +107,38 @@ def _get_int_env(
     return value
 
 
+
+
+def _get_float_env(
+    name: str,
+    *,
+    default: float,
+    min_value: float | None = None,
+    max_value: float | None = None,
+) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        value = default
+    else:
+        try:
+            value = float(raw.strip())
+        except Exception as exc:
+            raise InvalidSettingError(
+                f"Environment variable {name} must be a float, got: {raw}"
+            ) from exc
+
+    if min_value is not None and value < min_value:
+        raise InvalidSettingError(
+            f"Environment variable {name} must be >= {min_value}, got: {value}"
+        )
+    if max_value is not None and value > max_value:
+        raise InvalidSettingError(
+            f"Environment variable {name} must be <= {max_value}, got: {value}"
+        )
+
+    return value
+
+
 def _normalize_url(value: str) -> str:
     normalized = value.strip()
     if not normalized:
@@ -148,6 +180,29 @@ class OpenAISettings:
 
 
 @dataclass(slots=True, frozen=True)
+class MessageUnderstandingSettings:
+    enabled: bool
+    mode: str
+    model_name: str
+    temperature: float
+    max_output_tokens: int
+    min_confidence_to_apply: float
+    request_timeout_seconds: int
+
+
+@dataclass(slots=True, frozen=True)
+class LLMAnswerComposerSettings:
+    enabled: bool
+    mode: str
+    model_name: str
+    temperature: float
+    max_output_tokens: int
+    request_timeout_seconds: int
+    max_input_chars: int
+    max_output_chars: int
+
+
+@dataclass(slots=True, frozen=True)
 class TelegramSettings:
     bot_token: str
     enabled: bool
@@ -165,6 +220,8 @@ class AppSettings:
     debug: bool
     database: DatabaseSettings
     openai: OpenAISettings
+    message_understanding: MessageUnderstandingSettings
+    llm_answer_composer: LLMAnswerComposerSettings
     telegram: TelegramSettings
     logging: LoggingSettings
 
@@ -191,6 +248,21 @@ def load_settings() -> AppSettings:
     - APP_OPENAI_MAX_RETRIES
     - APP_OPENAI_ORGANIZATION
     - APP_OPENAI_PROJECT
+    - APP_MESSAGE_UNDERSTANDING_ENABLED
+    - APP_MESSAGE_UNDERSTANDING_MODE
+    - APP_MESSAGE_UNDERSTANDING_MODEL
+    - APP_MESSAGE_UNDERSTANDING_TEMPERATURE
+    - APP_MESSAGE_UNDERSTANDING_MAX_OUTPUT_TOKENS
+    - APP_MESSAGE_UNDERSTANDING_MIN_CONFIDENCE
+    - APP_MESSAGE_UNDERSTANDING_TIMEOUT_SECONDS
+    - APP_LLM_ANSWER_COMPOSER_ENABLED
+    - APP_LLM_ANSWER_COMPOSER_MODE
+    - APP_LLM_ANSWER_COMPOSER_MODEL
+    - APP_LLM_ANSWER_COMPOSER_TEMPERATURE
+    - APP_LLM_ANSWER_COMPOSER_MAX_OUTPUT_TOKENS
+    - APP_LLM_ANSWER_COMPOSER_TIMEOUT_SECONDS
+    - APP_LLM_ANSWER_COMPOSER_MAX_INPUT_CHARS
+    - APP_LLM_ANSWER_COMPOSER_MAX_OUTPUT_CHARS
     - APP_TELEGRAM_ENABLED
     - APP_TELEGRAM_BOT_TOKEN
     - APP_TELEGRAM_POLLING_TIMEOUT_SECONDS
@@ -224,6 +296,84 @@ def load_settings() -> AppSettings:
         project=_get_env("APP_OPENAI_PROJECT", default="") or None,
     )
 
+    message_understanding_mode = _get_env(
+        "APP_MESSAGE_UNDERSTANDING_MODE",
+        default="shadow",
+    ).lower()
+    if message_understanding_mode not in {"shadow", "assist", "enforce"}:
+        raise InvalidSettingError(
+            "APP_MESSAGE_UNDERSTANDING_MODE must be one of: shadow, assist, enforce"
+        )
+
+    message_understanding = MessageUnderstandingSettings(
+        enabled=_get_bool_env("APP_MESSAGE_UNDERSTANDING_ENABLED", default=False),
+        mode=message_understanding_mode,
+        model_name=_get_env("APP_MESSAGE_UNDERSTANDING_MODEL", default="gpt-4.1-mini"),
+        temperature=_get_float_env(
+            "APP_MESSAGE_UNDERSTANDING_TEMPERATURE",
+            default=0.0,
+            min_value=0.0,
+            max_value=2.0,
+        ),
+        max_output_tokens=_get_int_env(
+            "APP_MESSAGE_UNDERSTANDING_MAX_OUTPUT_TOKENS",
+            default=700,
+            min_value=64,
+        ),
+        min_confidence_to_apply=_get_float_env(
+            "APP_MESSAGE_UNDERSTANDING_MIN_CONFIDENCE",
+            default=0.72,
+            min_value=0.0,
+            max_value=1.0,
+        ),
+        request_timeout_seconds=_get_int_env(
+            "APP_MESSAGE_UNDERSTANDING_TIMEOUT_SECONDS",
+            default=20,
+            min_value=1,
+        ),
+    )
+
+    llm_answer_composer_mode = _get_env(
+        "APP_LLM_ANSWER_COMPOSER_MODE",
+        default="shadow",
+    ).lower()
+    if llm_answer_composer_mode not in {"disabled", "shadow", "assist"}:
+        raise InvalidSettingError(
+            "APP_LLM_ANSWER_COMPOSER_MODE must be one of: disabled, shadow, assist"
+        )
+
+    llm_answer_composer = LLMAnswerComposerSettings(
+        enabled=_get_bool_env("APP_LLM_ANSWER_COMPOSER_ENABLED", default=False),
+        mode=llm_answer_composer_mode,
+        model_name=_get_env("APP_LLM_ANSWER_COMPOSER_MODEL", default="gpt-4.1-mini"),
+        temperature=_get_float_env(
+            "APP_LLM_ANSWER_COMPOSER_TEMPERATURE",
+            default=0.0,
+            min_value=0.0,
+            max_value=2.0,
+        ),
+        max_output_tokens=_get_int_env(
+            "APP_LLM_ANSWER_COMPOSER_MAX_OUTPUT_TOKENS",
+            default=1000,
+            min_value=64,
+        ),
+        request_timeout_seconds=_get_int_env(
+            "APP_LLM_ANSWER_COMPOSER_TIMEOUT_SECONDS",
+            default=35,
+            min_value=1,
+        ),
+        max_input_chars=_get_int_env(
+            "APP_LLM_ANSWER_COMPOSER_MAX_INPUT_CHARS",
+            default=12000,
+            min_value=1000,
+        ),
+        max_output_chars=_get_int_env(
+            "APP_LLM_ANSWER_COMPOSER_MAX_OUTPUT_CHARS",
+            default=4500,
+            min_value=500,
+        ),
+    )
+
     telegram_enabled = _get_bool_env("APP_TELEGRAM_ENABLED", default=False)
     telegram_bot_token = _get_env(
         "APP_TELEGRAM_BOT_TOKEN",
@@ -250,6 +400,8 @@ def load_settings() -> AppSettings:
         debug=debug,
         database=database,
         openai=openai,
+        message_understanding=message_understanding,
+        llm_answer_composer=llm_answer_composer,
         telegram=telegram,
         logging=logging_settings,
     )

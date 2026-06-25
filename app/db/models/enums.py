@@ -42,7 +42,6 @@ class QuestionIntentEnum(StrEnum):
     APPEAL_QUESTION = "appeal_question"
     MIXED_QUESTION = "mixed_question"
     AMBIGUOUS_QUESTION = "ambiguous_question"
-    NO_MEASURE_DETECTED = "no_measure_detected"
     OTHER = "other"
 
 

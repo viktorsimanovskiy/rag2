@@ -95,7 +95,6 @@ class ReuseQueryInput:
     question_event_id: UUID
     similarity_threshold: float = 0.90
     max_candidates: int = 20
-    allow_measure_mismatch: bool = False
     allow_subject_category_mismatch: bool = False
 
 
@@ -106,7 +105,6 @@ class QuestionSignature:
     """
     question_event_id: UUID
     intent_type: QuestionIntentEnum
-    measure_code: Optional[str]
     subject_category_code: Optional[str]
     question_text_normalized: Optional[str]
 
@@ -222,7 +220,6 @@ class ReuseGate:
         signature_filtered = self.filter_candidates_by_question_signature(
             current_signature=current_signature,
             candidates=raw_candidates,
-            allow_measure_mismatch=payload.allow_measure_mismatch,
             allow_subject_category_mismatch=payload.allow_subject_category_mismatch,
         )
 
@@ -423,7 +420,6 @@ class ReuseGate:
         *,
         current_signature: QuestionSignature,
         candidates: list[ReuseCandidateMatch],
-        allow_measure_mismatch: bool = False,
         allow_subject_category_mismatch: bool = False,
     ) -> list[ReuseCandidateMatch]:
         """
@@ -431,11 +427,9 @@ class ReuseGate:
 
         Must match:
         - intent_type (always)
-        - measure_code (unless explicitly relaxed)
         - subject_category_code (unless explicitly relaxed)
 
         Conservative rule:
-        if current question has a measure_code, candidate must match it.
         """
         filtered: list[ReuseCandidateMatch] = []
 
@@ -444,10 +438,6 @@ class ReuseGate:
 
             if historical_signature.intent_type != current_signature.intent_type:
                 continue
-
-            if current_signature.measure_code:
-                if not allow_measure_mismatch and historical_signature.measure_code != current_signature.measure_code:
-                    continue
 
             if current_signature.subject_category_code:
                 if (
@@ -606,7 +596,8 @@ class ReuseGate:
         - answer has evidence_hash
         - answer has at least one evidence item
         - evidence items are structurally complete
-        - every evidence item points to exactly one object
+        - every evidence item has either document evidence, one precise evidence pointer,
+          or document evidence plus one precise evidence pointer
         - at least one strong evidence object exists:
           document, block, table, table_row, or legal_fact
 
@@ -631,21 +622,31 @@ class ReuseGate:
         strong_item_count = 0
 
         for item in evidence_items:
-            pointer_count = sum(
+            precise_pointer_count = sum(
                 1 for value in [
-                    item.document_id,
                     item.block_id,
                     item.table_id,
                     item.table_row_id,
                     item.legal_fact_id,
                 ] if value is not None
             )
+            has_document_pointer = item.document_id is not None
 
-            if pointer_count != 1:
+            if precise_pointer_count == 0 and not has_document_pointer:
                 invalid_items.append({
                     "answer_evidence_item_id": str(item.answer_evidence_item_id),
-                    "reason": "invalid_pointer_count",
-                    "pointer_count": pointer_count,
+                    "reason": "missing_pointer",
+                    "precise_pointer_count": precise_pointer_count,
+                    "has_document_pointer": has_document_pointer,
+                })
+                continue
+
+            if precise_pointer_count > 1:
+                invalid_items.append({
+                    "answer_evidence_item_id": str(item.answer_evidence_item_id),
+                    "reason": "too_many_precise_pointers",
+                    "precise_pointer_count": precise_pointer_count,
+                    "has_document_pointer": has_document_pointer,
                 })
                 continue
 
@@ -748,7 +749,6 @@ class ReuseGate:
         return QuestionSignature(
             question_event_id=question_event.question_event_id,
             intent_type=question_event.intent_type,
-            measure_code=question_event.measure_code,
             subject_category_code=question_event.subject_category_code,
             question_text_normalized=self._normalize_text(
                 question_event.question_text_normalized or question_event.question_text_raw
@@ -824,11 +824,6 @@ class ReuseGate:
 
         if current.intent_type == historical.intent_type:
             score += 0.50
-
-        if current.measure_code and historical.measure_code and current.measure_code == historical.measure_code:
-            score += 0.30
-        elif current.measure_code is None and historical.measure_code is None:
-            score += 0.10
 
         if (
             current.subject_category_code
