@@ -27,7 +27,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.services import ServiceRegistry
 
+<<<<<<< HEAD
 RESOLVER_PATCH_VERSION = "second_step_41_preserve_ambiguity_guard_reasons_v1"
+=======
+RESOLVER_PATCH_VERSION = "first_step_fix_13_resolver_cache_and_travel_bugfix"
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
 
 # ServiceFactory is created per API request, therefore instance-level cache in
 # ServiceResolver is not enough for HTTP mode. Keep the immutable resolver index
@@ -172,7 +176,10 @@ class ServiceResolver:
     ) -> ServiceResolutionResult:
         total_started_at = perf_counter()
         normalize_started_at = perf_counter()
+<<<<<<< HEAD
         question_text_raw = _normalize_text_without_runtime_expansion(payload.question_text)
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         question_text = _normalize_text(payload.question_text)
         normalize_elapsed = perf_counter() - normalize_started_at
 
@@ -205,7 +212,10 @@ class ServiceResolver:
             candidate = _score_service(
                 service_doc=service_doc,
                 question_text=question_text,
+<<<<<<< HEAD
                 question_text_raw=question_text_raw,
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
                 question_padded=question_padded,
                 question_tokens=question_tokens,
                 token_document_frequency=token_document_frequency,
@@ -244,7 +254,10 @@ class ServiceResolver:
             candidates=candidates,
             debug_payload_json={
                 "normalized_question": question_text,
+<<<<<<< HEAD
                 "normalized_question_raw": question_text_raw,
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
                 "question_tokens": sorted(question_tokens),
                 "runtime_vocabulary": _runtime_vocabulary_debug(),
                 "active_services_count": len(service_docs),
@@ -352,7 +365,10 @@ def _score_service(
     *,
     service_doc: _ServiceSearchDocument,
     question_text: str,
+<<<<<<< HEAD
     question_text_raw: str,
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
     question_padded: str,
     question_tokens: set[str],
     token_document_frequency: dict[str, int],
@@ -446,7 +462,10 @@ def _score_service(
         score=accumulator.score,
         service_doc=service_doc,
         question_text=question_text,
+<<<<<<< HEAD
         question_text_raw=question_text_raw,
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         question_tokens=question_tokens,
         accumulator=accumulator,
     )
@@ -468,7 +487,11 @@ def _score_service(
         confidence=confidence,
         matched_terms=sorted(accumulator.matched_terms),
         matched_aliases=sorted(accumulator.matched_aliases),
+<<<<<<< HEAD
         match_reasons=_compact_match_reasons_for_candidate(accumulator.match_reasons),
+=======
+        match_reasons=accumulator.match_reasons[:10],
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
     )
 
 
@@ -582,7 +605,10 @@ def _apply_question_context_adjustments(
     score: float,
     service_doc: _ServiceSearchDocument,
     question_text: str,
+<<<<<<< HEAD
     question_text_raw: str,
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
     question_tokens: set[str],
     accumulator: _ScoreAccumulator,
 ) -> float:
@@ -736,6 +762,7 @@ def _apply_question_context_adjustments(
     def service_text_has_any(markers: tuple[str, ...] | set[str]) -> bool:
         return any(marker in service_text for marker in markers)
 
+<<<<<<< HEAD
     question_text_raw_for_context = question_text_raw or question_text
 
     def q_raw_has_any(markers: tuple[str, ...] | set[str]) -> bool:
@@ -744,6 +771,8 @@ def _apply_question_context_adjustments(
     def q_raw_text_has_any(markers: tuple[str, ...] | set[str]) -> bool:
         return any(marker in question_text_raw_for_context for marker in markers)
 
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
     # fix_07: runtime_vocabulary может добавлять полезные общие слова,
     # но слишком широкие расширения не должны делать профильную услугу
     # уверенной, если в вопросе нет её ключевого контекста. Здесь стоят
@@ -991,8 +1020,13 @@ def _apply_question_context_adjustments(
         adjusted *= 0.50
         accumulator.match_reasons.append("понижение: вопрос про ремонт жилья без печного отопления/проводки")
 
+<<<<<<< HEAD
     oncology_question = q_has_any({"онколог", "онкологи", "онкобольн", "диабет"})
     service_has_oncology = s_has_any({"онколог", "онкологи", "онкобольн", "диабет"})
+=======
+    oncology_question = q_has_any({"онколог", "онкобольн", "диабет"})
+    service_has_oncology = s_has_any({"онколог", "онкобольн", "диабет"})
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
     if oncology_question:
         if service_has_oncology:
             adjusted += 40.0
@@ -1372,6 +1406,7 @@ def _apply_question_context_adjustments(
         adjusted = max(adjusted, 74.0)
         accumulator.match_reasons.append("нейтрально: общий вопрос только про ЕДВ")
 
+<<<<<<< HEAD
 
     # second_step_31: дополнительные защитные развилки по массовому прогону
     # second_step_30. Правила не добавляют новые алиасы услуг, а разрывают
@@ -1783,6 +1818,8 @@ def _apply_question_context_adjustments(
             accumulator.match_reasons.append("step38 сильное понижение: вопрос про ЖКУ/коммуналку, не ремонт жилья")
 
 
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
     return max(0.0, adjusted)
 
 
@@ -1835,6 +1872,7 @@ def _choose_resolution_status(
     # сигнале.
     first_specificity = _candidate_specificity_score(first)
     second_specificity = _candidate_specificity_score(second)
+<<<<<<< HEAD
 
     # second_step_40_broad_jku_clarification_v1
     # Широкий вопрос вида "я льготник, компенсация за жильё и коммуналку"
@@ -1846,6 +1884,8 @@ def _choose_resolution_status(
         if len(candidates) >= 2 and second.score >= 40.0:
             return "ambiguous", None
 
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
     strong_exact_signal = _has_strong_exact_resolution_signal(first)
 
     if strong_exact_signal:
@@ -1884,6 +1924,7 @@ def _choose_resolution_status(
     return "resolved", first
 
 
+<<<<<<< HEAD
 def _candidate_has_broad_jku_guard(candidate: ServiceCandidate) -> bool:
     return any(
         "ambiguity_guard: широкий ЖКУ-вопрос без категории/территории" in reason
@@ -1932,6 +1973,9 @@ def _compact_match_reasons_for_candidate(match_reasons: list[str], *, limit: int
 def _has_strong_exact_resolution_signal(candidate: ServiceCandidate) -> bool:
     if _candidate_has_broad_jku_guard(candidate):
         return False
+=======
+def _has_strong_exact_resolution_signal(candidate: ServiceCandidate) -> bool:
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
     if not any("точное совпадение" in reason for reason in candidate.match_reasons):
         return False
 
@@ -2098,6 +2142,7 @@ _GENERIC_TOKENS = {
 _TOKEN_RE = re.compile(r"[а-яa-z0-9]+(?:[.,][0-9]+)?", re.IGNORECASE)
 
 
+<<<<<<< HEAD
 def _normalize_text_without_runtime_expansion(value: str | None) -> str:
     if value is None:
         return ""
@@ -2110,6 +2155,8 @@ def _normalize_text_without_runtime_expansion(value: str | None) -> str:
     return text
 
 
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
 def _normalize_text(value: str | None) -> str:
     if value is None:
         return ""

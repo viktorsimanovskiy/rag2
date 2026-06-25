@@ -191,6 +191,7 @@ class MessageUnderstandingSettings:
 
 
 @dataclass(slots=True, frozen=True)
+<<<<<<< HEAD
 class LLMAnswerComposerSettings:
     enabled: bool
     mode: str
@@ -203,6 +204,8 @@ class LLMAnswerComposerSettings:
 
 
 @dataclass(slots=True, frozen=True)
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
 class TelegramSettings:
     bot_token: str
     enabled: bool
@@ -221,7 +224,10 @@ class AppSettings:
     database: DatabaseSettings
     openai: OpenAISettings
     message_understanding: MessageUnderstandingSettings
+<<<<<<< HEAD
     llm_answer_composer: LLMAnswerComposerSettings
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
     telegram: TelegramSettings
     logging: LoggingSettings
 
@@ -255,6 +261,7 @@ def load_settings() -> AppSettings:
     - APP_MESSAGE_UNDERSTANDING_MAX_OUTPUT_TOKENS
     - APP_MESSAGE_UNDERSTANDING_MIN_CONFIDENCE
     - APP_MESSAGE_UNDERSTANDING_TIMEOUT_SECONDS
+<<<<<<< HEAD
     - APP_LLM_ANSWER_COMPOSER_ENABLED
     - APP_LLM_ANSWER_COMPOSER_MODE
     - APP_LLM_ANSWER_COMPOSER_MODEL
@@ -263,6 +270,8 @@ def load_settings() -> AppSettings:
     - APP_LLM_ANSWER_COMPOSER_TIMEOUT_SECONDS
     - APP_LLM_ANSWER_COMPOSER_MAX_INPUT_CHARS
     - APP_LLM_ANSWER_COMPOSER_MAX_OUTPUT_CHARS
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
     - APP_TELEGRAM_ENABLED
     - APP_TELEGRAM_BOT_TOKEN
     - APP_TELEGRAM_POLLING_TIMEOUT_SECONDS
@@ -333,6 +342,7 @@ def load_settings() -> AppSettings:
         ),
     )
 
+<<<<<<< HEAD
     llm_answer_composer_mode = _get_env(
         "APP_LLM_ANSWER_COMPOSER_MODE",
         default="shadow",
@@ -374,6 +384,8 @@ def load_settings() -> AppSettings:
         ),
     )
 
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
     telegram_enabled = _get_bool_env("APP_TELEGRAM_ENABLED", default=False)
     telegram_bot_token = _get_env(
         "APP_TELEGRAM_BOT_TOKEN",
@@ -401,7 +413,10 @@ def load_settings() -> AppSettings:
         database=database,
         openai=openai,
         message_understanding=message_understanding,
+<<<<<<< HEAD
         llm_answer_composer=llm_answer_composer,
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         telegram=telegram,
         logging=logging_settings,
     )

@@ -46,13 +46,19 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = load_settings()
     message_understanding_service = _build_message_understanding_service(settings)
+<<<<<<< HEAD
     llm_answer_composer_service = _build_llm_answer_composer_service(settings)
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
 
     runtime = AppRuntime(
         AppRuntimeConfig(
             database=settings.database,
             message_understanding_service=message_understanding_service,
+<<<<<<< HEAD
             llm_answer_composer_service=llm_answer_composer_service,
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         )
     )
 
@@ -248,6 +254,7 @@ def _build_message_understanding_service(settings: AppSettings) -> Any | None:
     )
 
 
+<<<<<<< HEAD
 def _build_llm_answer_composer_service(settings: AppSettings) -> Any | None:
     """Build optional LLM answer composer.
 
@@ -281,6 +288,8 @@ def _build_llm_answer_composer_service(settings: AppSettings) -> Any | None:
     )
 
 
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
 def _get_runtime(request: Request) -> AppRuntime:
     runtime = getattr(request.app.state, "runtime", None)
     if not isinstance(runtime, AppRuntime):

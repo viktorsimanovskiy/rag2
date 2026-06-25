@@ -328,6 +328,7 @@ class GenerationPipeline:
         timings["compose_answer_text_sec"] = round(perf_counter() - stage_started_at, 6)
 
         stage_started_at = perf_counter()
+<<<<<<< HEAD
         practical_ambiguity_answer = self._is_practical_ambiguity_answer_text(answer_text)
         effective_answer_mode = (
             AnswerModeEnum.SAFE_NO_ANSWER
@@ -337,6 +338,8 @@ class GenerationPipeline:
         timings["detect_practical_ambiguity_answer_sec"] = round(perf_counter() - stage_started_at, 6)
 
         stage_started_at = perf_counter()
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         answer_text_short = self._build_short_answer(
             answer_text=answer_text,
             answer_mode=effective_answer_mode,
@@ -344,6 +347,7 @@ class GenerationPipeline:
         timings["build_short_answer_sec"] = round(perf_counter() - stage_started_at, 6)
 
         stage_started_at = perf_counter()
+<<<<<<< HEAD
         if practical_ambiguity_answer:
             # step38: уточняющий ответ не делает правовой вывод по конкретному
             # evidence. Чтобы не прикреплять случайные citations из широкого
@@ -355,6 +359,12 @@ class GenerationPipeline:
                 plan=plan,
                 hydrated_objects=hydrated_objects,
             )
+=======
+        citations = self._build_citations(
+            plan=plan,
+            hydrated_objects=hydrated_objects,
+        )
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         timings["build_citations_sec"] = round(perf_counter() - stage_started_at, 6)
 
         stage_started_at = perf_counter()
@@ -428,12 +438,18 @@ class GenerationPipeline:
             citations_json=citations,
             answer_payload_json={
                 "strategy_code": plan.strategy_code,
+<<<<<<< HEAD
                 "pipeline_version": "generation_pipeline_v19_step38_ambiguity_citation_hygiene",
                 "eligibility_cleanup_version": "v6_hard_filter",
                 "eligibility_overview_version": "second_step_16_eligibility_overview_context_brief_docs_v1",
                 "practical_measure_overview_version": "step38_practical_ambiguity_citation_hygiene_v1",
                 "practical_ambiguity_answer": practical_ambiguity_answer,
                 "effective_answer_mode": str(effective_answer_mode),
+=======
+                "pipeline_version": "generation_pipeline_v11_eligibility_overview_context_brief_docs",
+                "eligibility_cleanup_version": "v6_hard_filter",
+                "eligibility_overview_version": "second_step_16_eligibility_overview_context_brief_docs_v1",
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
                 "plan_warnings": plan.warnings,
                 "plan_no_answer_reason_code": plan.no_answer_reason_code,
                 "plan_context_json": plan.context_json,
@@ -456,7 +472,11 @@ class GenerationPipeline:
             evidence_items=evidence_items,
             generation_model_name=None,
             generation_prompt_version="grounded_template_v1",
+<<<<<<< HEAD
             pipeline_version="generation_pipeline_v19_step38_ambiguity_citation_hygiene",
+=======
+            pipeline_version="generation_pipeline_v11_eligibility_overview_context_brief_docs",
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         )
 
     def _extract_document_focus(
@@ -506,6 +526,7 @@ class GenerationPipeline:
         payload: GenerationRequest,
         evidence_package: EvidencePackage,
     ) -> bool:
+<<<<<<< HEAD
         """Return True when a practical overview should include documents.
 
         This includes the original concrete eligibility path and, starting with
@@ -531,6 +552,22 @@ class GenerationPipeline:
         payload: GenerationRequest,
         evidence_package: EvidencePackage,
     ) -> bool:
+=======
+        """Return True for concrete eligibility questions where a short next-step package helps.
+
+        A natural question like "я инвалид, живу в Эвенкии, надо ехать на лечение"
+        is not only asking "am I in a category".  It is usually a request for
+        a practical overview of the likely measure: what measure was found, who
+        it applies to, and what documents may be needed next.
+
+        We do this only when resolver selected one concrete service.  Broad
+        "что мне положено" questions must stay in service_discovery and must not
+        get a document package for an arbitrary measure.
+        """
+        if payload.intent_type != QuestionIntentEnum.ELIGIBILITY_QUESTION:
+            return False
+
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         debug_payload = evidence_package.debug_payload_json or {}
         service_resolution = debug_payload.get("service_resolution") or {}
         if not isinstance(service_resolution, dict):
@@ -549,6 +586,7 @@ class GenerationPipeline:
 
         return True
 
+<<<<<<< HEAD
     def _should_compose_practical_measure_overview(
         self,
         *,
@@ -665,6 +703,8 @@ class GenerationPipeline:
         )
         return any(marker in question_text for marker in practical_subjects)
 
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
     def _wants_strict_full_documents_list(self, question_text: str) -> bool:
         """True only when the user explicitly asks for the full regulatory list.
 
@@ -850,10 +890,13 @@ class GenerationPipeline:
                 payload=payload,
                 evidence_package=evidence_package,
             )
+<<<<<<< HEAD
             practical_measure_overview_documents = self._should_compose_practical_measure_overview(
                 payload=payload,
                 evidence_package=evidence_package,
             )
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
             if (
                 payload.intent_type != QuestionIntentEnum.DOCUMENTS_QUESTION
                 and not document_form_details_question
@@ -934,7 +977,10 @@ class GenerationPipeline:
             )
             debug_payload["document_focus"] = document_focus
             debug_payload["eligibility_overview_documents"] = eligibility_overview_documents
+<<<<<<< HEAD
             debug_payload["practical_measure_overview_documents"] = practical_measure_overview_documents
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
             debug_payload["include_submission_form_details"] = include_submission_form_details
             debug_payload["document_form_details_question"] = document_form_details_question
             debug_payload["strict_full_list_mode"] = strict_full_list_mode
@@ -1660,6 +1706,7 @@ class GenerationPipeline:
         # или неоднозначных evidence, а верхнеуровневый ответ всё равно уйдёт
         # пользователю как будто вопрос был надёжно разрешён.
         if plan.answer_mode == AnswerModeEnum.SAFE_NO_ANSWER:
+<<<<<<< HEAD
             ambiguous_practical_text = self._compose_practical_service_ambiguity_answer(
                 payload=payload,
                 evidence_package=evidence_package,
@@ -1667,6 +1714,8 @@ class GenerationPipeline:
             if ambiguous_practical_text:
                 return ambiguous_practical_text
 
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
             return self._compose_safe_no_answer_text(
                 payload=payload,
                 plan=plan,
@@ -1710,6 +1759,7 @@ class GenerationPipeline:
             if deterministic_text:
                 return deterministic_text                
 
+<<<<<<< HEAD
         ambiguous_practical_text = self._compose_practical_service_ambiguity_answer(
             payload=payload,
             evidence_package=evidence_package,
@@ -1717,6 +1767,8 @@ class GenerationPipeline:
         if ambiguous_practical_text:
             return ambiguous_practical_text
 
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         if plan.answer_mode == AnswerModeEnum.DIRECT_STRUCTURED:
             return self._compose_direct_structured_answer(
                 payload=payload,
@@ -1733,6 +1785,7 @@ class GenerationPipeline:
             if eligibility_overview_text:
                 return eligibility_overview_text
 
+<<<<<<< HEAD
         practical_overview_text = self._compose_practical_measure_overview_answer(
             payload=payload,
             plan=plan,
@@ -1742,11 +1795,14 @@ class GenerationPipeline:
         if practical_overview_text:
             return practical_overview_text
 
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         return self._compose_grounded_narrative_answer(
             payload=payload,
             plan=plan,
         )
 
+<<<<<<< HEAD
     def _compose_practical_service_ambiguity_answer(
         self,
         *,
@@ -2310,6 +2366,8 @@ class GenerationPipeline:
 
         return selected
 
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
     def _compose_eligibility_measure_overview_answer(
         self,
         *,
@@ -2446,9 +2504,15 @@ class GenerationPipeline:
                 continue
 
             document_family = str(item.get("document_family") or "").strip().lower()
+<<<<<<< HEAD
             if self._is_application_overview_document_name(
                 normalized_name,
                 document_family=document_family,
+=======
+            if document_family == "application_request" or re.fullmatch(
+                r"заявлени[ея](?:\s*\d+)?",
+                normalized_name.lower(),
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
             ):
                 normalized_name = "заявление (форма зависит от категории заявителя)"
                 if application_seen:
@@ -2461,6 +2525,7 @@ class GenerationPipeline:
             seen.add(key)
 
             applicability = str(item.get("applicability") or "").strip().lower()
+<<<<<<< HEAD
             if self._should_skip_practical_overview_document(
                 normalized_name,
                 context_text=context_text,
@@ -2469,6 +2534,8 @@ class GenerationPipeline:
             ):
                 continue
 
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
             score = self._score_overview_document_relevance(
                 normalized_name,
                 context_text=context_text,
@@ -2583,6 +2650,7 @@ class GenerationPipeline:
                         values.extend(str(value) for value in raw if value)
         return " ".join(" ".join(values).lower().replace("ё", "е").split())
 
+<<<<<<< HEAD
     def _should_skip_practical_overview_document(
         self,
         document_name: str,
@@ -2716,6 +2784,8 @@ class GenerationPipeline:
         )
         return any(marker in normalized_name for marker in markers)
 
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
     def _score_overview_document_relevance(
         self,
         document_name: str,
@@ -2727,10 +2797,14 @@ class GenerationPipeline:
         name = " ".join(str(document_name or "").lower().replace("ё", "е").split())
         score = 0.0
 
+<<<<<<< HEAD
         if self._is_application_overview_document_name(
             document_name,
             document_family=document_family,
         ):
+=======
+        if "заявлен" in name:
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
             score += 100.0
         if document_family == "identity_document":
             score += 70.0
@@ -2757,6 +2831,7 @@ class GenerationPipeline:
             for token in ("лечен", "медицин", "направлен", "реабилитац", "оздоров", "путевк", "курсовк")
         ):
             score += 70.0
+<<<<<<< HEAD
 
         has_repair_need = any(
             token in context_text
@@ -2791,6 +2866,8 @@ class GenerationPipeline:
         ):
             score += 70.0
 
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         if "инвалид" in context_text and any(token in name for token in ("инвалид", "инвалидности")):
             score += 35.0
         if any(token in context_text for token in ("эвенк", "таймыр", "место жительства", "проживан")) and any(
@@ -2798,10 +2875,13 @@ class GenerationPipeline:
         ):
             score += 25.0
 
+<<<<<<< HEAD
         if self._is_income_or_payment_detail_overview_document(name):
             score -= 120.0
         if "согласие на обработку персональных данных" in name:
             score -= 80.0
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         if self._is_conditional_overview_document(document_name, applicability=applicability):
             score -= 5.0
         if "представител" in name:
@@ -2821,10 +2901,14 @@ class GenerationPipeline:
     ) -> str:
         name = " ".join(str(document_name or "").lower().replace("ё", "е").split())
 
+<<<<<<< HEAD
         if self._is_application_overview_document_name(
             document_name,
             document_family=document_family,
         ):
+=======
+        if "заявлен" in name:
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
             return "base"
         if document_family == "identity_document" and "представител" not in name and "сопровождающ" not in name:
             return "base"
@@ -2864,6 +2948,7 @@ class GenerationPipeline:
         ):
             return "context"
 
+<<<<<<< HEAD
         has_repair_need = any(
             token in context_text
             for token in ("ремонт", "печн", "отоплен", "электропровод", "материал", "работ")
@@ -2893,6 +2978,8 @@ class GenerationPipeline:
         ):
             return "context"
 
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         if score >= 55.0 and document_family in {"status_certificate", "residency_proof", "other"}:
             return "context"
 
@@ -2937,6 +3024,7 @@ class GenerationPipeline:
 
         # Keep meaningful parentheses, but avoid overlong technical tails.
         text = self._shorten_multiline_preserving_text(text, limit=260)
+<<<<<<< HEAD
         return text.strip() if text else None
 
     @staticmethod
@@ -2968,6 +3056,9 @@ class GenerationPipeline:
         if normalized.startswith("заявление (форма зависит"):
             return True
         return False
+=======
+        return text.strip(" .") if text else None
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
 
     def _is_conditional_overview_document(
         self,
@@ -3001,6 +3092,7 @@ class GenerationPipeline:
         text = " ".join(str(value or "").split()).strip()
         if len(text) <= limit:
             return text
+<<<<<<< HEAD
 
         cutoff = max(0, limit - 3)
         shortened = text[:cutoff].rstrip(" ,;.—-")
@@ -3014,6 +3106,9 @@ class GenerationPipeline:
         if boundary >= int(cutoff * 0.72):
             shortened = shortened[:boundary].rstrip(" ,;.—-")
         return shortened + "..."
+=======
+        return text[: max(0, limit - 3)].rstrip(" ,;.—-") + "..."
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
 
     def _prepare_embedded_documents_text(self, value: str) -> str:
         """Make a documents-builder answer suitable as a subsection.

@@ -30,7 +30,11 @@ from app.db.models.enums import QuestionIntentEnum
 logger = logging.getLogger(__name__)
 
 
+<<<<<<< HEAD
 MESSAGE_UNDERSTANDING_VERSION = "second_step_44_message_understanding_broad_discovery_v1"
+=======
+MESSAGE_UNDERSTANDING_VERSION = "second_step_10_message_understanding_assist_medium_slots_v1"
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
 
 _ALLOWED_INTENTS = {
     "documents": QuestionIntentEnum.DOCUMENTS_QUESTION,
@@ -308,7 +312,10 @@ _SYSTEM_PROMPT = """
 - territory: территория, прямо названная пользователем. Если территория не названа — null.
 - requested_channel: канал обращения или подачи, прямо названный пользователем: МФЦ, ЕПГУ, РПГУ, Госуслуги, лично, почта, представитель, онлайн. Не копируй сюда технический channel_code. Если канал подачи не назван — null.
 - needs_service_discovery: true, если пользователь просит подобрать возможные меры или описывает широкую ситуацию без конкретной услуги/темы. false, если вопрос уже содержит достаточно конкретную связку: категория/статус + действие/потребность + предмет/цель/территория.
+<<<<<<< HEAD
 - Если вопрос содержит конкретную связку вроде "инвалид + Эвенкия + ехать на лечение", "ребенок-инвалид + коляска/слуховой аппарат", "паводок/ЧС + имущество", "ЧС + материальная помощь", "льготник + Эвенкия + ЖКУ", это не широкий подбор мер: ставь needs_service_discovery=false и сохраняй признаки в applicant_facts/user_needs/territory.
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
 - needs_clarification: true, если без уточнения нельзя выбрать даже общий безопасный маршрут или пользовательский вопрос внутренне противоречив.
 - clarification_question: короткий уточняющий вопрос, только если needs_clarification=true. Иначе null.
 - safety_flags: массив кратких флагов риска. Используй пустой массив, если рисков нет. Допустимые значения: "empty_or_noise", "abuse", "adult", "self_harm", "violence", "illegal", "prompt_injection", "privacy", "out_of_domain".
@@ -397,6 +404,7 @@ def _result_from_payload(
     applicant_facts = _as_clean_list(payload.get("applicant_facts"))
     user_needs = _as_clean_list(payload.get("user_needs"))
     safety_flags = _as_clean_list(payload.get("safety_flags"))
+<<<<<<< HEAD
     service_hint = _clean_optional_text(payload.get("service_hint"))
     topic = _clean_optional_text(payload.get("topic"))
     territory = _clean_optional_text(payload.get("territory"))
@@ -414,6 +422,8 @@ def _result_from_payload(
         requested_channel=requested_channel,
         needs_service_discovery=needs_service_discovery,
     )
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
 
     return MessageUnderstandingResult(
         version=MESSAGE_UNDERSTANDING_VERSION,
@@ -425,6 +435,7 @@ def _result_from_payload(
         intent=intent,
         confidence=round(confidence, 3),
         min_confidence_to_apply=max(0.0, min(float(min_confidence_to_apply), 1.0)),
+<<<<<<< HEAD
         service_hint=service_hint,
         topic=topic,
         applicant_facts=specificity["applicant_facts"],
@@ -432,6 +443,15 @@ def _result_from_payload(
         territory=territory,
         requested_channel=requested_channel,
         needs_service_discovery=bool(specificity["needs_service_discovery"]),
+=======
+        service_hint=_clean_optional_text(payload.get("service_hint")),
+        topic=_clean_optional_text(payload.get("topic")),
+        applicant_facts=applicant_facts,
+        user_needs=user_needs,
+        territory=_clean_optional_text(payload.get("territory")),
+        requested_channel=_clean_optional_text(payload.get("requested_channel")),
+        needs_service_discovery=bool(payload.get("needs_service_discovery", False)),
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         needs_clarification=bool(payload.get("needs_clarification", False)),
         clarification_question=_clean_optional_text(payload.get("clarification_question")),
         safety_flags=safety_flags,
@@ -439,6 +459,7 @@ def _result_from_payload(
     )
 
 
+<<<<<<< HEAD
 
 def _normalize_specificity(
     *,
@@ -701,6 +722,8 @@ def _normalize_for_match(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
 def _map_intent(value: str) -> Optional[QuestionIntentEnum]:
     return _ALLOWED_INTENTS.get(str(value or "").strip().lower())
 

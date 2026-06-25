@@ -30,7 +30,10 @@ from app.config.settings import DatabaseSettings
 from app.db.session import DatabaseSessionManager
 from app.services.answers.answer_orchestrator import (
     IntentClassifierProtocol,
+<<<<<<< HEAD
     LLMAnswerComposerProtocol,
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
     MessageUnderstandingProtocol,
     QuestionEmbeddingProtocol,
     QuestionNormalizerProtocol,
@@ -67,7 +70,10 @@ class AppRuntimeConfig:
     question_normalizer: Optional[QuestionNormalizerProtocol] = None
     question_embedding_service: Optional[QuestionEmbeddingProtocol] = None
     message_understanding_service: Optional[MessageUnderstandingProtocol] = None
+<<<<<<< HEAD
     llm_answer_composer_service: Optional[LLMAnswerComposerProtocol] = None
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
 
     service_factory_config: Optional[ServiceFactoryConfig] = None
 
@@ -124,7 +130,10 @@ class AppRuntime:
         )
         self._question_embedding_service = config.question_embedding_service
         self._message_understanding_service = config.message_understanding_service
+<<<<<<< HEAD
         self._llm_answer_composer_service = config.llm_answer_composer_service
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         self._service_factory_config = config.service_factory_config or ServiceFactoryConfig()
 
     # --------------------------------------------------------
@@ -194,7 +203,10 @@ class AppRuntime:
             question_normalizer=self._question_normalizer,
             question_embedding_service=self._question_embedding_service,
             message_understanding_service=self._message_understanding_service,
+<<<<<<< HEAD
             llm_answer_composer_service=self._llm_answer_composer_service,
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
             config=self._service_factory_config,
         )
 

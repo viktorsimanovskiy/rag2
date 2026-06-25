@@ -50,11 +50,14 @@ from app.services.feedback.feedback_service import (
     FeedbackService,
 )
 from app.services.generation.generation_pipeline import GenerationResult
+<<<<<<< HEAD
 from app.services.generation.llm_answer_composer import (
     LLMAnswerComposerInput,
     LLMAnswerComposerResult,
     input_from_generation_result,
 )
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
 from app.services.answers.message_guard import MessageGuardResult
 from app.services.answers.message_understanding import MessageUnderstandingResult
 from app.services.reuse.reuse_gate import (
@@ -97,11 +100,14 @@ class MessageUnderstandingProtocol:
         raise NotImplementedError
 
 
+<<<<<<< HEAD
 class LLMAnswerComposerProtocol:
     async def compose(self, payload: LLMAnswerComposerInput) -> LLMAnswerComposerResult:
         raise NotImplementedError
 
 
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
 class QuestionEmbeddingProtocol:
     async def embed(self, text: str) -> list[float]:
         raise NotImplementedError
@@ -241,7 +247,10 @@ class AnswerOrchestrator:
         message_guard: Optional[MessageGuardProtocol],
         question_embedding_service: Optional[QuestionEmbeddingProtocol],
         message_understanding_service: Optional[MessageUnderstandingProtocol],
+<<<<<<< HEAD
         llm_answer_composer_service: Optional[LLMAnswerComposerProtocol],
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         runtime_answer_service: RuntimeAnswerServiceProtocol,
         sampling_policy: SamplingPolicyProtocol,
     ) -> None:
@@ -253,7 +262,10 @@ class AnswerOrchestrator:
         self.message_guard = message_guard
         self.question_embedding_service = question_embedding_service
         self.message_understanding_service = message_understanding_service
+<<<<<<< HEAD
         self.llm_answer_composer_service = llm_answer_composer_service
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         self.runtime_answer_service = runtime_answer_service
         self.sampling_policy = sampling_policy
 
@@ -1495,6 +1507,7 @@ class AnswerOrchestrator:
         answer_payload_json["runtime_answer_service_runtime_payload"] = runtime_payload_json
         generation_result.answer_payload_json = answer_payload_json
 
+<<<<<<< HEAD
         await self._attach_llm_answer_composer_shadow_diagnostics(
             request_payload=payload,
             generation_result=generation_result,
@@ -1679,6 +1692,9 @@ class AnswerOrchestrator:
             return normalized
         return normalized[: limit - 1].rstrip() + "…"
 
+=======
+        return generation_result
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
 
     async def _persist_generated_answer_event(
         self,
@@ -1778,12 +1794,15 @@ class AnswerOrchestrator:
         if "message_understanding_application" in routing_payload_json:
             debug_payload_json["message_understanding_application"] = routing_payload_json.get("message_understanding_application")
 
+<<<<<<< HEAD
         answer_payload_json = dict(answer_event.answer_payload_json or {})
         if "llm_answer_composer_call_policy" in answer_payload_json:
             debug_payload_json["llm_answer_composer_call_policy"] = answer_payload_json.get("llm_answer_composer_call_policy")
         if "llm_answer_composer" in answer_payload_json:
             debug_payload_json["llm_answer_composer"] = answer_payload_json.get("llm_answer_composer")
 
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         return OutgoingAnswerPayload(
             answer_event_id=answer_event.answer_event_id,
             session_id=session.session_id,

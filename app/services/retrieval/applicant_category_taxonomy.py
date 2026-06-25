@@ -326,6 +326,7 @@ def build_applicant_category_groups() -> list[ApplicantCategoryGroupDefinition]:
         ),
         ApplicantCategoryGroupDefinition(
             code="fuel_need",
+<<<<<<< HEAD
             label="нуждаемость в твёрдом топливе, дровах, угле или отоплении",
             question_patterns=(
                 r"\bдров",
@@ -380,6 +381,14 @@ def build_applicant_category_groups() -> list[ApplicantCategoryGroupDefinition]:
             weight=3.9,
         ),
         ApplicantCategoryGroupDefinition(
+=======
+            label="нуждаемость в топливе, дровах, отоплении",
+            question_patterns=(r"\bдров", r"\bугол", r"\bтоплив", r"\bотоплен"),
+            evidence_terms=("дров", "угол", "топлив", "отоплен"),
+            weight=3.4,
+        ),
+        ApplicantCategoryGroupDefinition(
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
             code="school_need",
             label="подготовка детей к школе",
             question_patterns=(r"\bсобрать\s+дет\w*\s+в\s+школ", r"\bдет\w*\s+в\s+школ", r"\bшкольн\w*\s+(?:форм|одежд|принадлежност)"),

@@ -27,8 +27,12 @@ from app.services.retrieval.applicant_category_taxonomy import (
 )
 
 
+<<<<<<< HEAD
 SERVICE_DISCOVERY_VERSION = "service_discovery_v11_practical_need_profiles_noise_cleanup"
 # second_step_30_practical_need_profiles_noise_cleanup_v1
+=======
+SERVICE_DISCOVERY_VERSION = "service_discovery_v7_school_noise_filter"
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
 
 
 # ============================================================
@@ -544,12 +548,17 @@ class ServiceDiscovery:
             if "социальн контракт" in context:
                 return 2.2
 
+<<<<<<< HEAD
         if profile.code in {"fuel_need", "solid_fuel_need"}:
+=======
+        if profile.code == "fuel_need":
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
             if any(term in context for term in ("печн отоплен", "дров", "топлив")):
                 return 4.5
             if "материальн помощ" in context or "трудн жизненн" in context:
                 return 2.4
 
+<<<<<<< HEAD
         if profile.code == "assistive_device_need":
             if any(term in context for term in ("тср", "техническ средств", "средств реабилитац", "кресло каталк", "кресло коляск", "коляск", "слухов аппарат")):
                 return 10.0
@@ -574,6 +583,8 @@ class ServiceDiscovery:
             if "проезд" in context:
                 return 4.0
 
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         if profile.code == "emergency_fire":
             if any(term in context for term in ("утрат имущества", "вред здоров", "чрезвычайн", "чс")):
                 return 3.8
@@ -676,6 +687,7 @@ class ServiceDiscovery:
                 max_rows_per_service=2,
             )
         if "fuel_need" in signal_codes:
+<<<<<<< HEAD
             if _is_solid_fuel_purchase_question(question):
                 return ServiceDiscoveryProfile(
                     code="solid_fuel_need",
@@ -714,6 +726,11 @@ class ServiceDiscovery:
             return ServiceDiscoveryProfile(
                 code="free_travel_need",
                 label="льготный или бесплатный проезд",
+=======
+            return ServiceDiscoveryProfile(
+                code="fuel_need",
+                label="дрова, топливо или отопление",
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
                 max_services=4,
                 max_rows_per_service=1,
             )
@@ -768,16 +785,20 @@ class ServiceDiscovery:
                 "печн отоплен",
                 "электропроводк",
                 "дров",
+<<<<<<< HEAD
                 "уголь",
                 "тверд топлив",
                 "твердое топливо",
                 "твёрдое топливо",
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
                 "топлив",
                 "отоплен",
                 "материальн помощ",
                 "трудн жизненн",
                 "социальн контракт",
             ),
+<<<<<<< HEAD
             "solid_fuel_need": (
                 "дров",
                 "уголь",
@@ -825,6 +846,8 @@ class ServiceDiscovery:
                 "автобус",
                 "проезд",
             ),
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
             "food_need": (
                 "материальн помощ",
                 "трудн жизненн",
@@ -881,6 +904,7 @@ class ServiceDiscovery:
                 "зубопротез",
                 "донор",
             ),
+<<<<<<< HEAD
             "solid_fuel_need": (
                 "соцобслужив",
                 "материнск",
@@ -899,6 +923,8 @@ class ServiceDiscovery:
                 "зубопротез",
                 "донор",
             ),
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
             "food_need": (
                 "санаторн",
                 "лагер",
@@ -922,6 +948,7 @@ class ServiceDiscovery:
                 "погибш",
                 "зубопротез",
             ),
+<<<<<<< HEAD
             "assistive_device_need": (
                 "жилищно коммунальн",
                 "жку",
@@ -982,6 +1009,8 @@ class ServiceDiscovery:
                 "топлив",
                 "дров",
             ),
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
             "emergency_fire": (
                 "политическ репресс",
                 "свидетельств о праве",
@@ -1027,7 +1056,11 @@ class ServiceDiscovery:
 
         # For practical crisis questions it is better to return fewer focused
         # directions than a long list with obviously unrelated benefits.
+<<<<<<< HEAD
         if profile.code in {"fuel_need", "solid_fuel_need", "food_need", "school_need", "emergency_fire", "assistive_device_need", "dental_prosthesis_need", "public_transport_need", "free_travel_need"}:
+=======
+        if profile.code in {"fuel_need", "food_need", "school_need", "emergency_fire"}:
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
             return filtered
 
         # For status questions keep the original list if filtering would hide
@@ -1054,6 +1087,7 @@ class ServiceDiscovery:
         terms_context = normalize_text(" ".join(candidate.matched_terms))
         context = normalize_text(" ".join([service_context, terms_context]))
 
+<<<<<<< HEAD
         if profile.code in {"assistive_device_need", "dental_prosthesis_need", "public_transport_need"}:
             # For practical need profiles, a candidate without the matched
             # practical signal is almost always a tail status/payment service
@@ -1097,6 +1131,11 @@ class ServiceDiscovery:
         if profile.code == "fuel_need":
             if any(term in service_context for term in ("жилищно коммунальн", "жку", "жилье отдельным", "погибш", "зубопротез", "донор")):
                 return not any(term in context for term in ("печн", "отоплен", "дров", "уголь", "тверд", "топлив", "материальн помощ", "трудн жизненн"))
+=======
+        if profile.code == "fuel_need":
+            if any(term in service_context for term in ("жилищно коммунальн", "жку", "жилье отдельным", "погибш", "зубопротез", "донор")):
+                return not any(term in context for term in ("печн", "отоплен", "дров", "топлив", "материальн помощ", "трудн жизненн"))
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
             return False
 
         if profile.code == "food_need":
@@ -1158,6 +1197,7 @@ class ServiceDiscovery:
                 )
             )
 
+<<<<<<< HEAD
         if profile.code == "assistive_device_need":
             if any(
                 term in service_context
@@ -1289,6 +1329,8 @@ class ServiceDiscovery:
                 )
             )
 
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         if profile.code == "emergency_fire":
             return any(
                 term in service_context
@@ -1378,10 +1420,13 @@ class ServiceDiscovery:
             "fuel_need": (
                 "дров",
                 "угол",
+<<<<<<< HEAD
                 "уголь",
                 "тверд топлив",
                 "твердое топливо",
                 "твёрдое топливо",
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
                 "топлив",
                 "печн отоплен",
                 "отоплен",
@@ -1389,6 +1434,7 @@ class ServiceDiscovery:
                 "тжс",
                 "адресн материальн",
             ),
+<<<<<<< HEAD
             "assistive_device_need": (
                 "тср",
                 "техническ средств",
@@ -1423,6 +1469,8 @@ class ServiceDiscovery:
                 "автобус",
                 "проезд",
             ),
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
             "school_need": (
                 "школьн возраст",
                 "ребенк школьн",
@@ -1461,10 +1509,13 @@ class ServiceDiscovery:
             "hardship": 2.9,
             "food_need": 2.7,
             "fuel_need": 3.0,
+<<<<<<< HEAD
             "assistive_device_need": 4.8,
             "dental_prosthesis_need": 4.8,
             "public_transport_need": 5.4,
             "free_travel_need": 4.4,
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
             "school_need": 3.1,
             "low_income": 1.8,
         }
@@ -1619,6 +1670,7 @@ class ServiceDiscovery:
 
     @staticmethod
     def _build_profile_intro(profile: ServiceDiscoveryProfile) -> Optional[str]:
+<<<<<<< HEAD
         if profile.code == "solid_fuel_need":
             return (
                 "По вопросу о дровах, угле или другом твёрдом топливе в первую очередь стоит проверить адресную материальную помощь, "
@@ -1652,6 +1704,14 @@ class ServiceDiscovery:
                 "По вопросу о льготном или бесплатном проезде нужно уточнить льготную категорию и вид проезда. "
                 "Ниже приведены возможные направления для проверки, но право подтверждается условиями конкретной услуги."
             )
+=======
+        if profile.code == "fuel_need":
+            return (
+                "По вопросу о дровах, топливе или отоплении в первую очередь стоит проверить адресную материальную помощь, "
+                "помощь в трудной жизненной ситуации и специальные меры, связанные с печным отоплением. "
+                "Право на выплату нужно подтверждать условиями конкретной услуги и документами."
+            )
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         if profile.code == "food_need":
             return (
                 "По вопросу о еде или предметах первой необходимости в первую очередь стоит проверить адресную материальную помощь, "
@@ -1694,6 +1754,7 @@ class ServiceDiscovery:
                 "После уточнения можно проверять конкретную услугу отдельно."
             )
 
+<<<<<<< HEAD
         if "assistive_device_need" in signal_codes:
             return (
                 "Что нужно уточнить: заявитель взрослый инвалид или ребёнок-инвалид, есть ли ИПРА, какое средство нужно, "
@@ -1713,6 +1774,8 @@ class ServiceDiscovery:
                 "проездное удостоверение или компенсация расходов на конкретную поездку."
             )
 
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         if signal_codes & {"school_need", "family_with_children", "large_family", "single_parent"}:
             return (
                 "Что нужно уточнить для точного ответа: состав семьи, возраст детей, место жительства, доход, "
@@ -1851,6 +1914,7 @@ class ServiceDiscovery:
         )
 
 
+<<<<<<< HEAD
 
 def _is_solid_fuel_purchase_question(normalized_question: str) -> bool:
     """Return True when the user asks about obtaining/buying fuel itself.
@@ -1896,6 +1960,8 @@ def _is_public_transport_question(normalized_question: str) -> bool:
         )
     )
 
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
 # ============================================================
 # Signal definitions
 # ============================================================

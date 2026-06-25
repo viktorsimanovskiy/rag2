@@ -311,18 +311,26 @@ class RuntimeAnswerService:
         routing_payload = payload.routing_payload_json or {}
         understanding = routing_payload.get("message_understanding") or {}
 
+<<<<<<< HEAD
         # second_step_21_runtime_fallback_static_bugfix_v1
+=======
+        # second_step_20_post_resolver_llm_policy_v1
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         # Cheap deterministic fallback: if the user asks a broad life-situation
         # help question and the resolver did not return a high-confidence single
         # service, service_discovery is safer than an overview of one medium
         # service. This preserves the safety gain from second_step_19 without
         # calling the LLM before resolver for every broad question in the bank.
+<<<<<<< HEAD
         #
         # This method is static; call the helper via the class name rather than
         # through self. The previous second_step_20 variant raised
         # NameError("name 'self' is not defined") exactly in broad-help fallback
         # cases.
         if RuntimeAnswerService._is_broad_eligibility_help_question(payload):
+=======
+        if self._is_broad_eligibility_help_question(payload):
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
             return True
 
         if not isinstance(understanding, dict):

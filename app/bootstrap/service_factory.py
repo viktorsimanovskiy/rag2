@@ -27,7 +27,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.services.answers.answer_orchestrator import (
     AnswerOrchestrator,
     IntentClassifierProtocol,
+<<<<<<< HEAD
     LLMAnswerComposerProtocol,
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
     MessageGuardProtocol,
     MessageUnderstandingProtocol,
     QuestionEmbeddingProtocol,
@@ -112,7 +115,10 @@ class ServiceFactory:
         message_guard: Optional[MessageGuardProtocol] = None,
         question_embedding_service: Optional[QuestionEmbeddingProtocol] = None,
         message_understanding_service: Optional[MessageUnderstandingProtocol] = None,
+<<<<<<< HEAD
         llm_answer_composer_service: Optional[LLMAnswerComposerProtocol] = None,
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         config: Optional[ServiceFactoryConfig] = None,
     ) -> None:
         self.db = db
@@ -121,7 +127,10 @@ class ServiceFactory:
         self.message_guard = message_guard or RuleBasedMessageGuard()
         self.question_embedding_service = question_embedding_service
         self.message_understanding_service = message_understanding_service
+<<<<<<< HEAD
         self.llm_answer_composer_service = llm_answer_composer_service
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
         self.config = config or ServiceFactoryConfig()
 
         self._feedback_service: Optional[FeedbackService] = None
@@ -216,7 +225,10 @@ class ServiceFactory:
                 message_guard=self.message_guard,
                 question_embedding_service=self.question_embedding_service,
                 message_understanding_service=self.message_understanding_service,
+<<<<<<< HEAD
                 llm_answer_composer_service=self.llm_answer_composer_service,
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
                 runtime_answer_service=self.get_runtime_answer_service(),
                 sampling_policy=self.get_sampling_policy(),
             )
