@@ -20,6 +20,7 @@ from app.services.ingestion.document_ingestion_pipeline import (
     ExtractionResult,
 )
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -82,8 +83,113 @@ class DocxStructureExtractor:
         "исчерпывающий перечень",
     )
 
+    _STRONG_TITLE_STARTS = (
+        "ИСЧЕРПЫВАЮЩИЙ ПЕРЕЧЕНЬ",
+        "ИДЕНТИФИКАТОРЫ КАТЕГОРИЙ",
+        "ПЕРЕЧЕНЬ НЕОБХОДИМЫХ",
+        "ПЕРЕЧЕНЬ ДОКУМЕНТОВ",
+        "ПЕРЕЧЕНЬ ОСНОВАНИЙ",
+        "ФОРМА",
+        "СОСТАВ ЗАПРОСА",
+        "ЗАЯВЛЕНИЕ",
+        "СОГЛАСИЕ",
+        "РАСПИСКА",
+        "ПЕРЕЧЕНЬ УСЛОВНЫХ ОБОЗНАЧЕНИЙ",
+    )
+
+    _NOISE_TABLE_MARKERS = (
+        "СПИСОК ИЗМЕНЯЮЩИХ ДОКУМЕНТОВ",
+        "КОНСУЛЬТАНТПЛЮС",
+    )
+
+    _OFFICIAL_START_MARKER = "МИНИСТЕРСТВО СОЦИАЛЬНОЙ ПОЛИТИКИ"
+
+    _STRICT_CONSULTANT_NOISE_MARKERS = (
+        "КОНСУЛЬТАНТПЛЮС",
+        "ДОКУМЕНТ ПРЕДОСТАВЛЕН КОНСУЛЬТАНТПЛЮС",
+        "WWW.CONSULTANT.RU",
+        "СПИСОК ИЗМЕНЯЮЩИХ ДОКУМЕНТОВ",
+        "НУМЕРАЦИЯ ПУНКТОВ ДАНА В СООТВЕТСТВИИ",
+    )
+
+    _FORM_TITLE_MARKERS = (
+        "СОСТАВ ЗАПРОСА",
+        "СОГЛАСИЕ НА ОБРАБОТКУ ПЕРСОНАЛЬНЫХ ДАННЫХ",
+        "К ЗАЯВЛЕНИЮ ПРИЛАГАЮ",
+        "ПРИЛАГАЮ СЛЕДУЮЩИЕ ДОКУМЕНТЫ",
+        "ПРИЛАГАЮТСЯ СЛЕДУЮЩИЕ ДОКУМЕНТЫ",
+        "ПЕРЕЧЕНЬ ПРИЛАГАЕМЫХ ДОКУМЕНТОВ",
+        "СВЕДЕНИЯ О ДОКУМЕНТЕ",
+        "СВЕДЕНИЯ О ДОКУМЕНТАХ",
+        "СВЕДЕНИЯ О МЕДИЦИНСКИХ ДОКУМЕНТАХ",
+        "ДОКУМЕНТ, УДОСТОВЕРЯЮЩИЙ ЛИЧНОСТЬ",
+        "ДОКУМЕНТА, УДОСТОВЕРЯЮЩЕГО ЛИЧНОСТЬ",
+        "ПОДТВЕРЖДАЮЩЕГО ПОЛНОМОЧИЯ ПРЕДСТАВИТЕЛЯ",
+        "СВЕДЕНИЯ О ЗАКОННОМ ПРЕДСТАВИТЕЛЕ",
+        "СВЕДЕНИЯ О ПРЕДСТАВИТЕЛЕ",
+        "ЗАЯВЛЕНИЕ",
+        "ФОРМА",
+        "СОГЛАСИЕ",
+        "РАСПИСКА",
+    )
+
+    _FORM_CONTEXT_MARKERS = (
+        "ПОДПИСЬ ЗАЯВИТЕЛЯ",
+        "ФАМИЛИЯ, ИМЯ, ОТЧЕСТВО",
+        "ДАТА ПОДПИСЬ",
+        "ДОСТОВЕРНОСТЬ И ПОЛНОТУ СВЕДЕНИЙ",
+        "ИТОГО ПРИЛОЖЕНИЯ",
+        "ИТОГО: ПРИЛОЖЕНИЯ",
+        "ПРИНЯЛ ДОКУМЕНТЫ",
+        "КОЛИЧЕСТВО (ШТ.)",
+        "КОЛ-ВО (ШТ.)",
+        "КОЛ-ВО (ЛИСТОВ)",
+    )
+
+    _CATEGORY_MARKERS = (
+        "ИДЕНТИФИКАТОРЫ КАТЕГОРИЙ",
+        "КАТЕГОРИЙ (ПРИЗНАКОВ) ЗАЯВИТЕЛЕЙ",
+        "ПРИЗНАКОВ ЗАЯВИТЕЛЕЙ",
+        "НАИМЕНОВАНИЕ ПРИЗНАКА ЗАЯВИТЕЛЯ",
+        "НАИМЕНОВАНИЕ ОТДЕЛЬНЫХ ПРИЗНАКОВ ЗАЯВИТЕЛЕЙ",
+    )
+
+    _DOCUMENTS_MARKERS = (
+        "ИСЧЕРПЫВАЮЩИЙ ПЕРЕЧЕНЬ ДОКУМЕНТОВ",
+        "ПЕРЕЧЕНЬ ДОКУМЕНТОВ",
+        "НАИМЕНОВАНИЕ ДОКУМЕНТА",
+        "ДОКУМЕНТЫ, НЕОБХОДИМЫЕ ДЛЯ ПРЕДОСТАВЛЕНИЯ",
+        "ДОКУМЕНТОВ, НЕОБХОДИМЫХ ДЛЯ ПРЕДОСТАВЛЕНИЯ",
+    )
+
+    _REFUSAL_MARKERS = (
+        "ИСЧЕРПЫВАЮЩИЙ ПЕРЕЧЕНЬ ОСНОВАНИЙ",
+        "ОСНОВАНИЙ ДЛЯ ОТКАЗА",
+        "ОТКАЗА В ПРИЕМЕ",
+        "ОТКАЗ В ПРИЕМЕ",
+        "ПРИОСТАНОВЛЕНИЯ ПРЕДОСТАВЛЕНИЯ",
+        "ОТКАЗА В ПРЕДОСТАВЛЕНИИ",
+        "ПЕРЕЧЕНЬ ОСНОВАНИЙ",
+    )
+
+    _AMOUNT_MARKERS = (
+        "РАЗМЕР",
+        "СУММА",
+        "РУБ",
+        "ВЫПЛАТ",
+    )
+
     _BAD_TITLE_PATTERNS = (
         re.compile(r"^\([^)]{0,200}\)$", flags=re.IGNORECASE),
+        re.compile(r"^\s*\d+\.?\s*$", flags=re.IGNORECASE),
+        re.compile(r"^\s*\d+\.\s*к\s+заявлению\s+прилага", flags=re.IGNORECASE),
+        re.compile(r"к\s+заявлению\s+прилага", flags=re.IGNORECASE),
+        re.compile(r"перечень\s+прилагаемых\s+документов", flags=re.IGNORECASE),
+        re.compile(r"сведения\s+о\s+.*документ", flags=re.IGNORECASE),
+        re.compile(r"подтверждающего\s+полномочия\s+представителя", flags=re.IGNORECASE),
+        re.compile(r"водоснабжение|водоотведение", flags=re.IGNORECASE),
+        re.compile(r"привед[ее]н[аы]?\s+в\s+таблице", flags=re.IGNORECASE),
+        re.compile(r"^\s*приложение\s+N?\s*\d+", flags=re.IGNORECASE),
         re.compile(r"^\s*почтовый адрес", flags=re.IGNORECASE),
         re.compile(r"^\s*телефон", flags=re.IGNORECASE),
         re.compile(r"^\s*адрес электронной почты", flags=re.IGNORECASE),
@@ -92,12 +198,51 @@ class DocxStructureExtractor:
         re.compile(r"^\s*дата выдачи", flags=re.IGNORECASE),
         re.compile(r"^\s*срок действия полномочий", flags=re.IGNORECASE),
     )
+    
+    _TEXTUAL_DATE_RE = re.compile(
+        r"(?P<day>\d{1,2})\s+"
+        r"(?P<month>января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)"
+        r"\s+(?P<year>\d{4})\s*г?\.?",
+        flags=re.IGNORECASE,
+    )
+
+    _RUS_MONTHS = {
+        "января": 1,
+        "февраля": 2,
+        "марта": 3,
+        "апреля": 4,
+        "мая": 5,
+        "июня": 6,
+        "июля": 7,
+        "августа": 8,
+        "сентября": 9,
+        "октября": 10,
+        "ноября": 11,
+        "декабря": 12,
+    }
+
+    _TITLE_STOP_MARKERS = (
+        "в соответствии с",
+        "i. общие положения",
+        "i. предмет",
+        "предмет регулирования",
+        "круг заявителей",
+        "список изменяющих документов",
+    )
+
+    _TITLE_SKIP_EXACT = {
+        "министерство социальной политики",
+        "министерство социальной политики красноярского края",
+        "красноярского края",
+        "приказ",
+        "приложение",
+    }
 
     def __init__(
         self,
         *,
         max_markdown_preview_rows: int = 8,
-        keep_last_paragraph_context: int = 5,
+        keep_last_paragraph_context: int = 14,
     ) -> None:
         self.max_markdown_preview_rows = max_markdown_preview_rows
         self.keep_last_paragraph_context = keep_last_paragraph_context
@@ -115,6 +260,25 @@ class DocxStructureExtractor:
         tables: list[dict[str, Any]] = []
         table_rows: list[dict[str, Any]] = []
 
+        trim_config = self._get_docx_preprocessing_trim_config(
+            payload.parser_payload_json
+        )
+        trim_enabled = trim_config is not None
+        official_start_reached = not trim_enabled
+        trim_boundary_reached = False
+        trim_last_core_table_index = (
+            int(trim_config["last_core_table_index"])
+            if trim_config is not None
+            else None
+        )
+        preprocessing_skip_counts = {
+            "skipped_before_official_start": 0,
+            "skipped_strict_consultant_noise": 0,
+            "skipped_after_last_core_table": 0,
+            "skipped_residual_form_fields_tables": 0,
+            "skipped_residual_abbreviation_tables": 0,
+        }
+
         paragraph_context: deque[dict[str, Any]] = deque(
             maxlen=self.keep_last_paragraph_context
         )
@@ -124,11 +288,34 @@ class DocxStructureExtractor:
         meaningful_paragraph_count = 0
         skipped_blank_tables_count = 0
 
+        current_heading_text: Optional[str] = None
+        heading_path: list[str] = []
+
         for item in self._iter_block_items(doc):
             if isinstance(item, Paragraph):
+                paragraph_text = self._clean_text(item.text)
+
+                if trim_enabled:
+                    if not official_start_reached:
+                        if self._is_official_start_text(paragraph_text):
+                            official_start_reached = True
+                        else:
+                            preprocessing_skip_counts["skipped_before_official_start"] += 1
+                            continue
+
+                    if trim_boundary_reached:
+                        preprocessing_skip_counts["skipped_after_last_core_table"] += 1
+                        continue
+
+                    if self._is_strict_consultant_noise_text(paragraph_text):
+                        preprocessing_skip_counts["skipped_strict_consultant_noise"] += 1
+                        continue
+
                 block = self._build_block_from_paragraph(
                     paragraph=item,
                     block_order=block_order + 1,
+                    current_heading_text=current_heading_text,
+                    heading_path=heading_path,
                 )
                 if block is None:
                     continue
@@ -136,12 +323,44 @@ class DocxStructureExtractor:
                 block_order += 1
                 blocks.append(block)
 
+                if block.get("block_type") == "heading":
+                    heading_text = self._clean_text(block.get("content_clean") or "")
+                    if heading_text:
+                        current_heading_text = heading_text
+                        heading_path = self._update_heading_path(
+                            heading_path=heading_path,
+                            heading_text=heading_text,
+                            section_number=block.get("section_number"),
+                        )
+
                 if self._is_meaningful_text(block.get("content_clean")):
                     meaningful_paragraph_count += 1
                     paragraph_context.append(block)
 
             elif isinstance(item, Table):
                 table_counter += 1
+
+                if trim_enabled:
+                    if not official_start_reached:
+                        preprocessing_skip_counts["skipped_before_official_start"] += 1
+                        continue
+
+                    if (
+                        trim_boundary_reached
+                        or (
+                            trim_last_core_table_index is not None
+                            and table_counter > trim_last_core_table_index
+                        )
+                    ):
+                        preprocessing_skip_counts["skipped_after_last_core_table"] += 1
+                        trim_boundary_reached = True
+                        continue
+
+                    table_text_sample = self._table_text_sample(item)
+                    if self._is_strict_consultant_noise_text(table_text_sample):
+                        preprocessing_skip_counts["skipped_strict_consultant_noise"] += 1
+                        continue
+
                 table_id = f"docx_tbl_{table_counter}_{uuid4().hex[:8]}"
 
                 table_title = self._detect_table_title(
@@ -157,7 +376,6 @@ class DocxStructureExtractor:
                     paragraph_context=list(paragraph_context),
                 )
 
-                # Skip blank/template tables that do not produce any meaningful rows.
                 if not row_payloads:
                     skipped_blank_tables_count += 1
                     logger.info(
@@ -168,6 +386,8 @@ class DocxStructureExtractor:
                             "table_title": table_title,
                         },
                     )
+                    if trim_enabled and table_counter == trim_last_core_table_index:
+                        trim_boundary_reached = True
                     continue
 
                 table_payload = self._build_table_payload(
@@ -178,22 +398,60 @@ class DocxStructureExtractor:
                     paragraph_context=list(paragraph_context),
                     row_payloads=row_payloads,
                 )
+
+                if trim_enabled:
+                    residual_skip_reason = self._detect_preprocessed_residual_table_skip_reason(
+                        table_payload=table_payload,
+                    )
+                    if residual_skip_reason == "form_fields":
+                        preprocessing_skip_counts["skipped_residual_form_fields_tables"] += 1
+                        if table_counter == trim_last_core_table_index:
+                            trim_boundary_reached = True
+                        continue
+                    if residual_skip_reason == "abbreviations":
+                        preprocessing_skip_counts["skipped_residual_abbreviation_tables"] += 1
+                        if table_counter == trim_last_core_table_index:
+                            trim_boundary_reached = True
+                        continue
+
                 tables.append(table_payload)
                 table_rows.extend(row_payloads)
+
+                if trim_enabled and table_counter == trim_last_core_table_index:
+                    trim_boundary_reached = True
 
         document_title = self._detect_document_title(
             original_filename=payload.original_filename,
             blocks=blocks,
         )
+
+        document_number, document_date = self._extract_document_date_and_number(
+            original_filename=payload.original_filename,
+            blocks=blocks,
+        )
+
+        service_name_full = self._detect_service_name_full(
+            blocks=blocks,
+        )
+
+        # Конкретная услуга будет определяться отдельным service_registry.
+        # Старую грубую группировку мер здесь больше не используем.
+        service_name_short = None
+
         revision_date = self._detect_revision_date(
             original_filename=payload.original_filename,
             blocks=blocks,
             normalized_text=payload.normalized_text,
+            document_date=document_date,
         )
+
         doc_uid_base = self._detect_doc_uid_base(
             original_filename=payload.original_filename,
             document_title=document_title,
             normalized_text=payload.normalized_text,
+            service_name_full=service_name_full,
+            document_number=document_number,
+            document_date=document_date,
         )
 
         extraction_payload_json = {
@@ -205,7 +463,25 @@ class DocxStructureExtractor:
             "table_rows_count": len(table_rows),
             "meaningful_paragraph_count": meaningful_paragraph_count,
             "source_format": "docx",
+            "document_number": document_number,
+            "document_date": (
+                document_date.isoformat()
+                if document_date is not None
+                else None
+            ),
+            "revision_date": (
+                revision_date.isoformat()
+                if revision_date is not None
+                else None
+            ),
+            "service_name_full": service_name_full,
+            "service_name_short": service_name_short,
+            "docx_preprocessing_trim_applied": trim_enabled,
+            "docx_preprocessing_skip_counts": preprocessing_skip_counts,
         }
+        docx_preprocessing_payload = (payload.parser_payload_json or {}).get("docx_preprocessing")
+        if docx_preprocessing_payload is not None:
+            extraction_payload_json["docx_preprocessing"] = docx_preprocessing_payload
 
         logger.info(
             "DOCX structure extracted",
@@ -222,11 +498,139 @@ class DocxStructureExtractor:
             document_title=document_title,
             doc_uid_base=doc_uid_base,
             revision_date=revision_date,
+            document_number=document_number,
+            document_date=document_date,
+            service_name_full=service_name_full,
+            service_name_short=service_name_short,
             blocks=blocks,
             tables=tables,
             table_rows=table_rows,
             extraction_payload_json=extraction_payload_json,
         )
+
+    def _get_docx_preprocessing_trim_config(
+        self,
+        parser_payload_json: dict[str, Any] | None,
+    ) -> Optional[dict[str, Any]]:
+        payload = (parser_payload_json or {}).get("docx_preprocessing") or {}
+        if payload.get("mode") != "trim_for_rag":
+            return None
+        if not payload.get("applied_to_published_content"):
+            return None
+
+        report = payload.get("report") or {}
+        if not (
+            report.get("official_start_found")
+            and report.get("has_exactly_one_each_core_table")
+            and report.get("trim_after_last_core_table_candidate")
+            and not report.get("tail_contains_core_table")
+        ):
+            return None
+
+        last_core_table_index = report.get("last_core_table_index")
+        if last_core_table_index is None:
+            return None
+
+        return {"last_core_table_index": int(last_core_table_index)}
+
+    def _is_official_start_text(self, text: str) -> bool:
+        text_n = self._normalize_detection_text(text)
+        return (
+            text_n == self._OFFICIAL_START_MARKER
+            or text_n.startswith(self._OFFICIAL_START_MARKER)
+        )
+
+    def _is_strict_consultant_noise_text(self, text: str) -> bool:
+        text_n = self._normalize_detection_text(text)
+        if not text_n or len(text_n) > 700:
+            return False
+        return any(marker in text_n for marker in self._STRICT_CONSULTANT_NOISE_MARKERS)
+
+    def _detect_preprocessed_residual_table_skip_reason(
+        self,
+        *,
+        table_payload: dict[str, Any],
+    ) -> Optional[str]:
+        """
+        Extra conservative cleanup used only with docx_preprocessing_mode=trim_for_rag.
+
+        Tail trimming removes forms after the last core table. Some ConsultantPlus
+        exports also contain non-normative helper tables before the core tables:
+        mostly abbreviation/definition tables and, rarely, form fragments. They are
+        useful for reading the source manually, but they pollute retrieval.
+
+        We deliberately do not remove arbitrary generic tables here. Only two
+        classes are skipped:
+        - tables already classified as form_fields;
+        - explicit abbreviation / conditional-designation tables.
+        """
+        table_type = str(table_payload.get("table_type") or "")
+        if table_type == "form_fields":
+            return "form_fields"
+
+        if self._is_abbreviation_or_designation_table_payload(table_payload):
+            return "abbreviations"
+
+        return None
+
+    def _is_abbreviation_or_designation_table_payload(
+        self,
+        table_payload: dict[str, Any],
+    ) -> bool:
+        title_n = self._normalize_detection_text(str(table_payload.get("table_title") or ""))
+        summary_n = self._normalize_detection_text(str(table_payload.get("summary") or ""))
+        preview_n = self._normalize_detection_text(str(table_payload.get("markdown_preview") or ""))
+
+        header_schema = table_payload.get("header_schema_json") or {}
+        raw_headers = header_schema.get("raw_headers") or []
+        headers_n = self._normalize_detection_text(" ".join(str(x) for x in raw_headers))
+
+        haystack = " ".join([title_n, summary_n, headers_n, preview_n[:1500]])
+
+        strong_title_markers = (
+            "ПЕРЕЧЕНЬ УСЛОВНЫХ ОБОЗНАЧЕНИЙ",
+            "ПЕРЕЧЕНЬ ОБОЗНАЧЕНИЙ И УСЛОВНЫХ СОКРАЩЕНИЙ",
+            "УСЛОВНЫЕ ОБОЗНАЧЕНИЯ И СОКРАЩЕНИЯ",
+            "ПЕРЕЧЕНЬ УСЛОВНЫХ СОКРАЩЕНИЙ",
+            "УСЛОВНЫЕ СОКРАЩЕНИЯ",
+            "ПЕРЕЧЕНЬ СОКРАЩЕНИЙ",
+            "ПЕРЕЧЕНЬ ТЕРМИНОВ И СОКРАЩЕНИЙ",
+        )
+        if any(marker in title_n for marker in strong_title_markers):
+            return True
+
+        # Some tables have a weak title but their first header is literally
+        # "1. Условные обозначения". Require enough rows to avoid catching
+        # a random one-line explanatory table.
+        rows_count = int(table_payload.get("rows_count") or 0)
+        if rows_count >= 8 and "УСЛОВНЫЕ ОБОЗНАЧЕНИЯ" in headers_n:
+            return True
+
+        abbreviation_like = (
+            "ГОСУДАРСТВЕННАЯ УСЛУГА" in haystack
+            and (
+                "ГМИС" in haystack
+                or "ЕЦЦПСС" in haystack
+                or "ЕПГУ" in haystack
+                or "МФЦ" in haystack
+            )
+        )
+        if rows_count >= 12 and "УСЛОВНЫ" in haystack and abbreviation_like:
+            return True
+
+        return False
+
+    def _table_text_sample(self, table: Table, *, max_rows: int = 16) -> str:
+        row_texts: list[str] = []
+        for row in table.rows[:max_rows]:
+            values = [self._clean_text(cell.text) for cell in row.cells]
+            deduped: list[str] = []
+            for value in values:
+                if value and (not deduped or deduped[-1] != value):
+                    deduped.append(value)
+            if deduped:
+                row_texts.append(" | ".join(deduped))
+        return " || ".join(row_texts)
 
     def _validate_input(self, payload: ExtractionInput) -> None:
         if payload is None:
@@ -264,6 +668,8 @@ class DocxStructureExtractor:
         *,
         paragraph: Paragraph,
         block_order: int,
+        current_heading_text: Optional[str],
+        heading_path: list[str],
     ) -> Optional[dict[str, Any]]:
         raw_text = self._clean_text(paragraph.text)
         if not raw_text:
@@ -306,6 +712,13 @@ class DocxStructureExtractor:
                 "style_name": style_name,
                 "is_heading_style": self._is_heading_style(style_name),
                 "is_list_like": self._looks_like_list_item(raw_text),
+                "current_heading_text": current_heading_text,
+                "heading_path": list(heading_path),
+                "block_semantic_hints": self._infer_block_semantic_hints(
+                    text=raw_text,
+                    current_heading_text=current_heading_text,
+                    heading_path=heading_path,
+                ),
             },
         }
 
@@ -355,20 +768,50 @@ class DocxStructureExtractor:
         row_payloads: list[dict[str, Any]],
     ) -> dict[str, Any]:
         headers, header_keys = self._extract_headers(table)
+        appendix_number = self._detect_appendix_number_from_context(paragraph_context)
+        explicit_normative_table_number = self._detect_normative_table_number_from_context(paragraph_context)
         table_type = self._detect_table_type(
             table_title=table_title,
             headers=headers,
             row_payloads=row_payloads,
+            normative_table_number=explicit_normative_table_number,
         )
+        normative_table_number, normative_table_number_source = self._resolve_normative_table_number(
+            explicit_normative_table_number=explicit_normative_table_number,
+            table_type=table_type,
+        )
+        effective_table_title = self._repair_table_title(
+            table_title=table_title,
+            table_type=table_type,
+            headers=headers,
+            row_payloads=row_payloads,
+            normative_table_number=normative_table_number,
+        )
+
+        metadata_json = {
+            "docx_table_index": int(table_number),
+            "normative_table_number": normative_table_number,
+            "normative_table_number_source": normative_table_number_source,
+            "table_semantic_type": table_type,
+            "preceding_paragraphs": [
+                x.get("content_clean")
+                for x in paragraph_context
+                if self._is_meaningful_text(x.get("content_clean"))
+            ],
+            "header_columns_count": len(headers),
+        }
+        if effective_table_title != table_title:
+            metadata_json["detected_table_title_raw"] = table_title
+            metadata_json["table_title_repaired"] = True
 
         return {
             "table_id": table_id,
             "table_number": table_number,
-            "appendix_number": self._detect_appendix_number_from_context(paragraph_context),
+            "appendix_number": appendix_number,
             "table_type": table_type,
-            "table_title": table_title,
+            "table_title": effective_table_title,
             "summary": self._build_table_summary(
-                table_title=table_title,
+                table_title=effective_table_title,
                 headers=headers,
                 rows_count=len(row_payloads),
                 table_type=table_type,
@@ -394,17 +837,10 @@ class DocxStructureExtractor:
             "citation_json": {
                 "source_type": "docx_table",
                 "table_number": table_number,
-                "table_title": table_title,
+                "normative_table_number": normative_table_number,
+                "table_title": effective_table_title,
             },
-            "metadata_json": {
-                "docx_table_index": int(table_number),
-                "preceding_paragraphs": [
-                    x.get("content_clean")
-                    for x in paragraph_context
-                    if self._is_meaningful_text(x.get("content_clean"))
-                ],
-                "header_columns_count": len(headers),
-            },
+            "metadata_json": metadata_json,
         }
 
     def _build_table_row_payloads(
@@ -420,7 +856,9 @@ class DocxStructureExtractor:
         raw_rows = self._extract_raw_rows(table, header_keys)
         row_payloads: list[dict[str, Any]] = []
 
-        # Pre-build a light preview payload so we can infer semantic table type.
+        current_requirement_group = "unknown"
+        current_requirement_group_label: Optional[str] = None
+
         preview_rows: list[dict[str, Any]] = []
         for idx, row_json in enumerate(raw_rows, start=1):
             normalized_row_json = {
@@ -436,10 +874,25 @@ class DocxStructureExtractor:
             ):
                 continue
 
-            if self._is_service_section_row(
+            table_title_for_section_guard = self._normalize_detection_text(table_title)
+            is_refusal_table_title = (
+                "ОСНОВАН" in table_title_for_section_guard
+                and (
+                    "ОТКАЗ" in table_title_for_section_guard
+                    or "ПРИОСТАНОВ" in table_title_for_section_guard
+                )
+            )
+            if (not is_refusal_table_title) and self._is_service_section_row(
                 row_json=row_json,
                 normalized_row_json=normalized_row_json,
             ):
+                service_section = self._classify_service_section_row(
+                    row_json=row_json,
+                    normalized_row_json=normalized_row_json,
+                )
+                if service_section is not None:
+                    current_requirement_group = service_section["section_kind"]
+                    current_requirement_group_label = service_section["section_label"]
                 continue
 
             row_summary = self._build_row_summary(
@@ -455,23 +908,46 @@ class DocxStructureExtractor:
                     "row_json": row_json,
                     "normalized_row_json": normalized_row_json,
                     "row_summary": row_summary,
+                    "row_context": {
+                        "requirement_group": current_requirement_group,
+                        "requirement_group_label": current_requirement_group_label,
+                    },
                 }
             )
 
         if not preview_rows:
             return []
 
+        appendix_number = self._detect_appendix_number_from_context(paragraph_context)
+        explicit_normative_table_number = self._detect_normative_table_number_from_context(paragraph_context)
         table_type = self._detect_table_type(
             table_title=table_title,
             headers=headers,
             row_payloads=preview_rows,
+            normative_table_number=explicit_normative_table_number,
+        )
+        normative_table_number, normative_table_number_source = self._resolve_normative_table_number(
+            explicit_normative_table_number=explicit_normative_table_number,
+            table_type=table_type,
+        )
+        effective_table_title = self._repair_table_title(
+            table_title=table_title,
+            table_type=table_type,
+            headers=headers,
+            row_payloads=preview_rows,
+            normative_table_number=normative_table_number,
         )
 
-        appendix_number = self._detect_appendix_number_from_context(paragraph_context)
+        current_refusal_scope: Optional[str] = None
 
         for row in preview_rows:
             row_json = row["row_json"]
             normalized_row_json = row["normalized_row_json"]
+            effective_row_summary = self._build_row_summary(
+                table_title=effective_table_title,
+                headers=headers,
+                row_json=row_json,
+            )
 
             cells_by_header = self._build_cells_by_header(
                 headers=headers,
@@ -491,41 +967,330 @@ class DocxStructureExtractor:
                 table_type=table_type,
             )
 
+            section_text = self._build_refusal_section_candidate_text(
+                cells_by_semantic_key=cells_by_semantic_key,
+                cells_by_header=cells_by_header,
+            )
+
+            explicit_section_scope = self._detect_refusal_section_scope(
+                table_type=table_type,
+                section_text=section_text,
+            )
+
+            if table_type == "refusal_reasons" and self._is_refusal_section_heading_row(
+                explicit_section_scope=explicit_section_scope,
+                cells_by_header=cells_by_header,
+            ):
+                current_refusal_scope = explicit_section_scope
+                continue
+
+            explicit_row_scope = self._detect_refusal_row_scope(
+                table_type=table_type,
+                cells_by_semantic_key=cells_by_semantic_key,
+                cells_by_header=cells_by_header,
+                cells_by_header_normalized=cells_by_header_normalized,
+            )
+
+            row_scope_source: Optional[str] = None
+
+            if table_type == "refusal_reasons":
+                if current_refusal_scope is not None:
+                    row_scope = current_refusal_scope
+                    row_scope_source = "section_context"
+                elif explicit_row_scope in {"renewal_refusal", "suspension", "intake_refusal", "service_refusal"}:
+                    row_scope = explicit_row_scope
+                    row_scope_source = "row_text"
+                elif explicit_row_scope is not None:
+                    row_scope = explicit_row_scope
+                    row_scope_source = "row_text_fallback"
+                else:
+                    row_scope = "service_refusal"
+                    row_scope_source = "default_service_fallback"
+            else:
+                row_scope = None
+                row_scope_source = None
+
+            requirement_group = row.get("row_context", {}).get("requirement_group", "unknown")
+            requirement_group_label = row.get("row_context", {}).get("requirement_group_label")
+            requirement_group_source = "section_context" if requirement_group in {"required", "optional"} else None
+            if table_type == "documents" and requirement_group not in {"required", "optional"}:
+                inferred_group = self._infer_document_requirement_group_from_row_number_prefix(
+                    row_json=row_json,
+                    normalized_row_json=normalized_row_json,
+                )
+                if inferred_group is not None:
+                    requirement_group = inferred_group
+                    requirement_group_source = "row_number_prefix"
+                else:
+                    inferred_group = self._infer_document_requirement_group_from_row(
+                        row_json=row_json,
+                        normalized_row_json=normalized_row_json,
+                    )
+                    if inferred_group is not None:
+                        requirement_group = inferred_group
+                        requirement_group_source = "row_text"
+                    else:
+                        requirement_group = "required"
+                        requirement_group_source = "default_required_for_documents"
+
+            metadata_json = {
+                "docx_table_index": int(table_number),
+                "normative_table_number": normative_table_number,
+                "normative_table_number_source": normative_table_number_source,
+                "table_number": table_number,
+                "table_title": effective_table_title,
+                "appendix_number": appendix_number,
+                "table_semantic_type": table_type,
+                "row_kind": "data_row",
+                "row_scope": row_scope,
+                "row_scope_source": row_scope_source,
+                "requirement_group": requirement_group,
+                "requirement_group_label": requirement_group_label,
+                "requirement_group_source": requirement_group_source,
+                "table_section_context": {
+                    "requirement_group": requirement_group,
+                    "requirement_group_label": requirement_group_label,
+                    "requirement_group_source": requirement_group_source,
+                },
+                "column_headers": headers,
+                "header_keys": header_keys,
+                "cells_text": [v for v in row_json.values() if self._clean_text(v)],
+                "cells_by_header": cells_by_header,
+                "cells_by_header_key": {
+                    key: self._clean_text(str(row_json.get(key, "")))
+                    for key in header_keys
+                    if self._clean_text(str(row_json.get(key, "")))
+                },
+                "cells_by_header_normalized": cells_by_header_normalized,
+                "cells_by_semantic_key": cells_by_semantic_key,
+            }
+            if effective_table_title != table_title:
+                metadata_json["detected_table_title_raw"] = table_title
+                metadata_json["table_title_repaired"] = True
+
             row_payloads.append(
                 {
                     "table_id": table_id,
                     "row_order": row["row_order"],
                     "row_json": row_json,
                     "normalized_row_json": normalized_row_json,
-                    "row_summary": row["row_summary"],
+                    "row_summary": effective_row_summary,
                     "citation_json": {
                         "source_type": "docx_table_row",
                         "table_number": table_number,
-                        "table_title": table_title,
+                        "normative_table_number": normative_table_number,
+                        "table_title": effective_table_title,
                         "row_order": row["row_order"],
                     },
-                    "metadata_json": {
-                        "docx_table_index": int(table_number),
-                        "table_number": table_number,
-                        "table_title": table_title,
-                        "appendix_number": appendix_number,
-                        "table_semantic_type": table_type,
-                        "column_headers": headers,
-                        "header_keys": header_keys,
-                        "cells_text": [v for v in row_json.values() if self._clean_text(v)],
-                        "cells_by_header": cells_by_header,
-                        "cells_by_header_key": {
-                            key: self._clean_text(str(row_json.get(key, "")))
-                            for key in header_keys
-                            if self._clean_text(str(row_json.get(key, "")))
-                        },
-                        "cells_by_header_normalized": cells_by_header_normalized,
-                        "cells_by_semantic_key": cells_by_semantic_key,
-                    },
+                    "metadata_json": metadata_json,
                 }
             )
 
         return row_payloads
+        
+    def _detect_refusal_row_scope(
+        self,
+        *,
+        table_type: str,
+        cells_by_semantic_key: dict[str, str] | None,
+        cells_by_header: dict[str, str] | None,
+        cells_by_header_normalized: dict[str, str] | None,
+    ) -> Optional[str]:
+        if table_type != "refusal_reasons":
+            return None
+
+        cells_by_semantic_key = cells_by_semantic_key or {}
+        cells_by_header = cells_by_header or {}
+        cells_by_header_normalized = cells_by_header_normalized or {}
+
+        # Важно: не используем table_title и row_summary для row-level scope.
+        # В объединённых таблицах отказов общий заголовок содержит сразу
+        # "отказ в приёме / приостановление / отказ в предоставлении".
+        # Если учитывать его в каждой строке, все строки ошибочно становятся intake_refusal.
+        local_parts = [
+            cells_by_semantic_key.get("refusal_reason", ""),
+            *cells_by_header.values(),
+            *cells_by_header_normalized.values(),
+        ]
+        haystack = self._normalize_search_text(" ".join(x for x in local_parts if x))
+
+        if not haystack:
+            return None
+
+        intake_markers = (
+            "отказ в приеме запроса",
+            "отказа в приеме запроса",
+            "отказ в приеме заявления",
+            "отказа в приеме заявления",
+            "отказ в приеме документов",
+            "отказа в приеме документов",
+            "отказ в приеме к рассмотрению",
+            "отказа в приеме к рассмотрению",
+            "отказ в принятии документов",
+            "отказа в принятии документов",
+        )
+        if any(marker in haystack for marker in intake_markers):
+            return "intake_refusal"
+
+        if "приостанов" in haystack:
+            return "suspension"
+
+        renewal_markers = (
+            "отказ в возобновлении",
+            "отказа в возобновлении",
+            "об отказе в возобновлении",
+            "возобновлении едв",
+            "возобновлении выплаты",
+        )
+        if any(marker in haystack for marker in renewal_markers):
+            return "renewal_refusal"
+
+        service_markers = (
+            "отказ в предоставлении",
+            "отказа в предоставлении",
+            "об отказе в предоставлении",
+            "отказ в назначении",
+            "отказа в назначении",
+            "об отказе в назначении",
+            "отказ в предоставлении государственной услуги",
+            "отказа в предоставлении государственной услуги",
+        )
+        if any(marker in haystack for marker in service_markers):
+            return "service_refusal"
+
+        return None
+        
+    def _detect_refusal_section_scope(
+        self,
+        *,
+        table_type: str,
+        section_text: str,
+    ) -> Optional[str]:
+        if table_type != "refusal_reasons":
+            return None
+
+        haystack = self._normalize_search_text(section_text)
+        if not haystack:
+            return None
+
+        intake_markers = (
+            "исчерпывающий перечень оснований для отказа в приеме",
+            "перечень оснований для отказа в приеме",
+            "оснований для отказа в приеме запроса",
+            "оснований для отказа в приеме заявления",
+            "оснований для отказа в приеме документов",
+            "отказа в приеме заявления и документов",
+            "отказ в приеме заявления и документов",
+            "отказа в приеме к рассмотрению",
+            "отказ в приеме к рассмотрению",
+        )
+        if any(marker in haystack for marker in intake_markers):
+            return "intake_refusal"
+
+        suspension_markers = (
+            "исчерпывающий перечень оснований для приостановления",
+            "перечень оснований для приостановления",
+            "оснований для приостановления предоставления",
+            "приостановления предоставления государственной услуги",
+        )
+        if any(marker in haystack for marker in suspension_markers):
+            return "suspension"
+
+        renewal_markers = (
+            "исчерпывающий перечень оснований для отказа в возобновлении",
+            "перечень оснований для отказа в возобновлении",
+            "оснований для отказа в возобновлении",
+            "отказ в возобновлении",
+            "отказа в возобновлении",
+            "об отказе в возобновлении",
+        )
+        if any(marker in haystack for marker in renewal_markers):
+            return "renewal_refusal"
+
+        service_markers = (
+            "исчерпывающий перечень оснований для отказа в предоставлении",
+            "перечень оснований для отказа в предоставлении",
+            "оснований для отказа в предоставлении государственной услуги",
+            "отказ в предоставлении",
+            "отказа в предоставлении",
+            "об отказе в предоставлении",
+            "отказ в назначении",
+            "отказа в назначении",
+            "оснований для отказа в назначении",
+        )
+        if any(marker in haystack for marker in service_markers):
+            return "service_refusal"
+
+        return None
+        
+    def _build_refusal_section_candidate_text(
+        self,
+        *,
+        cells_by_semantic_key: dict[str, str] | None,
+        cells_by_header: dict[str, str] | None,
+    ) -> str:
+        cells_by_semantic_key = cells_by_semantic_key or {}
+        cells_by_header = cells_by_header or {}
+
+        # Для section-scope берём только содержимое текущей строки.
+        # Общий table_title намеренно исключён: он часто перечисляет все виды отказов
+        # и ломает классификацию каждой отдельной строки.
+        parts = [
+            cells_by_semantic_key.get("refusal_reason", ""),
+            *cells_by_header.values(),
+        ]
+        return self._normalize_search_text(" ".join(x for x in parts if x))
+
+    def _is_refusal_section_heading_row(
+        self,
+        *,
+        explicit_section_scope: Optional[str],
+        cells_by_header: dict[str, str] | None,
+    ) -> bool:
+        if explicit_section_scope not in {
+            "renewal_refusal",
+            "suspension",
+            "intake_refusal",
+            "service_refusal",
+        }:
+            return False
+
+        cells_by_header = cells_by_header or {}
+        values = [self._clean_text(str(value)) for value in cells_by_header.values()]
+        values = [value for value in values if value]
+        if not values:
+            return False
+
+        combined = self._normalize_search_text(" ".join(values))
+        if "перечень оснований" not in combined and "оснований для" not in combined:
+            return False
+
+        # В DOCX merged cells часто приходят как несколько одинаковых значений.
+        # Секционный заголовок обычно занимает всю строку, а не является причиной отказа.
+        unique_values = {self._normalize_search_text(value) for value in values if value}
+        has_row_number = any(re.fullmatch(r"\d+(?:\.\d+)?", value.strip()) for value in values)
+        if len(unique_values) <= 2 and not has_row_number:
+            return True
+
+        first_value = self._normalize_search_text(values[0])
+        if not re.fullmatch(r"\d+(?:\.\d+)?", values[0].strip()):
+            normalized_first = re.sub(r"^\s*\d+(?:\.\d+)*[\.)]?\s+", "", first_value)
+            if normalized_first.startswith("исчерпывающий перечень оснований"):
+                return True
+            if normalized_first.startswith("перечень оснований"):
+                return True
+
+        return False
+
+
+    def _normalize_search_text(
+        self,
+        value: Any,
+    ) -> str:
+        text = self._clean_text(value)
+        if not text:
+            return ""
+        return text.lower().replace("ё", "е")
 
     def _extract_headers(
         self,
@@ -548,7 +1313,7 @@ class DocxStructureExtractor:
             [self._normalize_column_key(x) for x in headers]
         )
         return (headers, header_keys)
-
+        
     def _extract_raw_rows(
         self,
         table: Table,
@@ -642,21 +1407,64 @@ class DocxStructureExtractor:
         if not values:
             return False
 
-        joined = " ".join(values).lower()
+        joined = " ".join(values).lower().replace("ё", "е")
+        joined = " ".join(joined.split())
+
+        # Строки таблицы оснований отказа не должны отбрасываться как
+        # service-section строки таблицы документов только из-за фразы
+        # "документы, необходимые для предоставления...".
+        if (
+            "перечень оснований" in joined
+            or "оснований для отказа" in joined
+            or "отказа в приеме" in joined
+            or "отказ в приеме" in joined
+            or "приостановления предоставления" in joined
+            or "отказа в предоставлении" in joined
+            or "отказ в предоставлении" in joined
+        ):
+            return False
+
+        # Повторные многострочные заголовки внутри таблицы документов не являются
+        # строками документов. Они часто идут второй строкой после верхнего header.
+        if (
+            "наименование документа" in joined
+            and ("идентификаторы категорий" in joined or "n п/п" in joined or "№ п/п" in joined)
+            and ("способ подачи" in joined or "способы подачи" in joined or "с использованием" in joined)
+        ):
+            return True
+
+        # Строки-результаты/разделители вроде "Предоставление (отказ в предоставлении)..."
+        # тоже не являются документами.
+        unique_values = {" ".join(v.lower().replace("ё", "е").split()) for v in values if v}
+        if len(unique_values) == 1:
+            only_value = next(iter(unique_values))
+            if "предоставление (отказ в предоставлении" in only_value:
+                return True
+            if "отказ в предоставлении" in only_value and len(only_value) < 220:
+                return True
 
         service_markers = [
             "документы (информация), необходимые",
             "документы информация необходимые",
             "способы подачи запроса",
             "документы, необходимые для предоставления",
+            "документов, необходимых для предоставления",
+            "сведения, необходимые для предоставления государственной услуги",
             "исчерпывающий перечень документов",
+            "обязательных для предоставления заявителем",
+            "обязательные для предоставления заявителем",
+            "представляемые заявителем самостоятельно",
+            "представляемые заявителем или представителем самостоятельно",
+            "представляемые заявителем (представителем) самостоятельно",
+            "представляемые по собственной инициативе",
+            "по собственной инициативе",
+            "подлежат представлению в рамках межведомственного",
         ]
 
         # Strong marker-based exclusion
         if any(marker in joined for marker in service_markers):
-            # But avoid excluding real row if it also clearly contains an actual document entry
-            if "наименование документа" in joined:
-                return False
+            # But avoid excluding real row if it also clearly contains an actual document entry.
+            # Секции часто содержат слово "заявитель", но не конкретный документ.
             if "паспорт" in joined or "заявление" in joined or "документ, подтверждающий" in joined:
                 return False
             return True
@@ -674,7 +1482,220 @@ class DocxStructureExtractor:
                 return True
 
         return False
+
+    def _classify_service_section_row(
+        self,
+        *,
+        row_json: dict[str, Any],
+        normalized_row_json: dict[str, Any],
+    ) -> Optional[dict[str, str]]:
+        """
+        Пытается определить, какую именно смысловую группу открывает
+        service-строка внутри таблицы.
+
+        На текущем этапе нам нужны две основные группы:
+        - required: документы / сведения, которые заявитель или представитель
+          должен представить самостоятельно;
+        - optional: документы / сведения, которые заявитель или представитель
+          вправе представить по собственной инициативе.
+
+        Важно:
+        - сама service-строка не становится retrievable row;
+        - но её смысл должен быть перенесён в metadata следующих обычных строк.
+        """
+        raw_values = [
+            self._clean_text(str(v))
+            for v in row_json.values()
+            if self._clean_text(str(v))
+        ]
+        if not raw_values:
+            return None
+
+        # Убираем дубли одинаковых фрагментов, которые часто появляются
+        # из-за merged cells / повторяющихся ячеек таблицы.
+        unique_values: list[str] = []
+        seen: set[str] = set()
+        for value in raw_values:
+            normalized_value = " ".join(value.lower().split())
+            if normalized_value in seen:
+                continue
+            seen.add(normalized_value)
+            unique_values.append(value)
+
+        if not unique_values:
+            return None
+
+        section_label = self._clean_text(" ".join(unique_values))
+
+        compact = section_label.lower()
+        compact = compact.replace("ё", "е")
+        compact = compact.replace("(", " ").replace(")", " ")
+        compact = compact.replace(":", " ").replace(";", " ")
+        compact = " ".join(compact.split())
+
+        # Сначала ловим optional, потому что это самый явный маркер
+        # и он не должен случайно пересечься с "самостоятельно".
+        optional_markers = (
+            "по собственной инициативе",
+            "вправе представить",
+            "вправе предоставить",
+            "вправе представить по собственной инициативе",
+            "вправе представить самостоятельно по собственной инициативе",
+            "документы, представляемые по собственной инициативе",
+            "документы и информация, которые заявитель вправе представить по собственной инициативе",
+            "документы и информация, которые заявитель или представитель вправе представить по собственной инициативе",
+            "подлежат представлению в рамках межведомственного информационного взаимодействия",
+            "представляются в рамках межведомственного информационного взаимодействия",
+            "могут быть получены в порядке межведомственного информационного взаимодействия",
+            "находящиеся в распоряжении органов",
+        )
+        if any(marker in compact for marker in optional_markers):
+            return {
+                "section_kind": "optional",
+                "section_label": section_label,
+            }
+
+        # Для required делаем более широкое распознавание.
+        required_markers = (
+            "должен представить самостоятельно",
+            "должны представить самостоятельно",
+            "заявитель должен представить самостоятельно",
+            "заявитель или представитель должен представить самостоятельно",
+            "заявителем самостоятельно",
+            "заявителем представителем самостоятельно",
+            "заявителем или представителем самостоятельно",
+            "представляемые заявителем самостоятельно",
+            "представляемые заявителем представителем самостоятельно",
+            "представляемые заявителем или представителем самостоятельно",
+            "представляемые заявителем (представителем) самостоятельно",
+            "документы, представляемые заявителем самостоятельно",
+            "документы, представляемые заявителем или представителем самостоятельно",
+            "сведения, необходимые для предоставления государственной услуги и представляемые заявителем самостоятельно",
+            "сведения, необходимые для предоставления государственной услуги и представляемые заявителем представителем самостоятельно",
+            "документы и информация, которые заявитель должен представить самостоятельно",
+            "документы и информация, которые заявитель или представитель должен представить самостоятельно",
+            "обязательных для предоставления заявителем",
+            "обязательные для предоставления заявителем",
+            "обязательны для предоставления заявителем",
+            "обязательных для представления заявителем",
+            "обязательные для представления заявителем",
+            "обязательны для представления заявителем",
+            "обязательных для представления",
+            "обязательные для представления",
+            "обязательны для представления",
+        )
+        if any(marker in compact for marker in required_markers):
+            return {
+                "section_kind": "required",
+                "section_label": section_label,
+            }
+
+        # Дополнительный fallback:
+        # если это service-строка про "самостоятельно" и при этом в ней нет
+        # маркеров "по собственной инициативе", то почти наверняка это required.
+        if "самостоятельно" in compact and "по собственной инициативе" not in compact:
+            return {
+                "section_kind": "required",
+                "section_label": section_label,
+            }
+
+        return None
         
+    def _infer_document_requirement_group_from_row_number_prefix(
+        self,
+        *,
+        row_json: dict[str, Any],
+        normalized_row_json: dict[str, Any],
+    ) -> Optional[str]:
+        """
+        Старые и нестандартные таблицы документов часто нумеруют строки так:
+        - 1.1, 1.2, 1.x — документы/сведения, которые заявитель представляет сам;
+        - 2.1, 2.2, 2.x — документы/сведения, которые заявитель вправе представить
+          по собственной инициативе или которые запрашиваются межведомственно.
+
+        Это не пользовательская категория, а служебный способ восстановить одну
+        из двух целевых групп: required / optional.
+        """
+        values = [
+            self._clean_text(str(v))
+            for v in row_json.values()
+            if self._clean_text(str(v))
+        ]
+        if not values:
+            return None
+
+        # Берём первый осмысленный токен. Обычно это колонка "N п/п".
+        first_value = values[0].strip()
+        if re.fullmatch(r"1(?:\.\d+)+", first_value):
+            return "required"
+        if re.fullmatch(r"2(?:\.\d+)+", first_value):
+            return "optional"
+
+        # Иногда номер слипается с названием документа в первой ячейке.
+        combined = self._normalize_search_text(" ".join(values))
+        match = re.match(r"^\s*([12](?:\.\d+)+)[\.)]?\s+", combined)
+        if not match:
+            return None
+
+        prefix = match.group(1)
+        if prefix.startswith("1."):
+            return "required"
+        if prefix.startswith("2."):
+            return "optional"
+        return None
+
+    def _infer_document_requirement_group_from_row(
+        self,
+        *,
+        row_json: dict[str, Any],
+        normalized_row_json: dict[str, Any],
+    ) -> Optional[str]:
+        """Пытается определить required/optional по тексту самой строки документа."""
+        values = [
+            self._clean_text(str(v))
+            for v in row_json.values()
+            if self._clean_text(str(v))
+        ]
+        if not values:
+            return None
+
+        compact = self._normalize_search_text(" ".join(values))
+        compact = compact.replace("(", " ").replace(")", " ")
+        compact = " ".join(compact.split())
+
+        optional_markers = (
+            "по собственной инициативе",
+            "вправе представить",
+            "вправе предоставить",
+            "подлежат представлению в рамках межведомственного",
+            "представляются в рамках межведомственного",
+            "могут быть получены в порядке межведомственного",
+            "находящиеся в распоряжении органов",
+        )
+        if any(marker in compact for marker in optional_markers):
+            return "optional"
+
+        required_markers = (
+            "представляемые заявителем самостоятельно",
+            "представляемые заявителем представителем самостоятельно",
+            "представляемые заявителем или представителем самостоятельно",
+            "заявитель должен представить",
+            "заявитель или представитель должен представить",
+            "обязательных для предоставления заявителем",
+            "обязательные для предоставления заявителем",
+            "обязательны для предоставления заявителем",
+            "обязательных для представления заявителем",
+            "обязательные для представления заявителем",
+            "обязательны для представления заявителем",
+            "обязательных для представления",
+            "обязательные для представления",
+            "обязательны для представления",
+        )
+        if any(marker in compact for marker in required_markers):
+            return "required"
+
+        return None
+
     def _build_cells_by_header(
         self,
         *,
@@ -734,7 +1755,11 @@ class DocxStructureExtractor:
         result: dict[str, str] = {}
 
         for idx, header in enumerate(headers):
-            header_key = header_keys[idx] if idx < len(header_keys) else self._normalize_column_key(header)
+            header_key = (
+                header_keys[idx]
+                if idx < len(header_keys)
+                else self._normalize_column_key(header)
+            )
             value = self._clean_text(str(row_json.get(header_key, "")))
             if not value:
                 continue
@@ -745,6 +1770,35 @@ class DocxStructureExtractor:
                 table_type=table_type,
             )
             result[semantic_key] = value
+
+        if table_type == "deadlines":
+            if "deadline_value" not in result:
+                for raw_value in row_json.values():
+                    clean_value = self._clean_text(str(raw_value))
+                    if not clean_value:
+                        continue
+                    if self._looks_like_deadline_value(clean_value):
+                        result["deadline_value"] = clean_value
+                        break
+
+            if "deadline_scope" not in result:
+                scope_candidates: list[str] = []
+                deadline_value = result.get("deadline_value")
+
+                for raw_value in row_json.values():
+                    clean_value = self._clean_text(str(raw_value))
+                    if not clean_value:
+                        continue
+                    if deadline_value and clean_value == deadline_value:
+                        continue
+                    if self._looks_like_deadline_value(clean_value):
+                        continue
+                    if len(clean_value) < 3:
+                        continue
+                    scope_candidates.append(clean_value)
+
+                if scope_candidates:
+                    result["deadline_scope"] = max(scope_candidates, key=len)
 
         return result
 
@@ -783,7 +1837,6 @@ class DocxStructureExtractor:
             if header_text in {"n п/п", "№ п/п", "n", "№"}:
                 return "row_number"
 
-            # Fallback for repeated generic channel headers after unique key generation.
             if normalized_key.endswith("_2"):
                 return "epgu_submission"
             if normalized_key.endswith("_3"):
@@ -806,10 +1859,125 @@ class DocxStructureExtractor:
                 return "applicant_category_id"
 
         if table_type == "deadlines":
-            if "срок" in header_text or "рабочих дней" in header_text:
+            if (
+                "срок" in header_text
+                or "рабочих дней" in header_text
+                or "календарных дней" in header_text
+                or "не позднее" in header_text
+            ):
                 return "deadline_value"
 
+            if any(
+                marker in header_text
+                for marker in (
+                    "административная процедура",
+                    "процедура",
+                    "действие",
+                    "этап",
+                    "операция",
+                    "наименование",
+                    "результат",
+                    "основание",
+                    "событие",
+                )
+            ):
+                return "deadline_scope"
+
         return norm or normalized_key or "column"
+
+    def _normalize_detection_text(self, value: Any) -> str:
+        text = self._clean_text(value)
+        if not text:
+            return ""
+        text = text.replace("\n", " ").replace("Ё", "Е")
+        text = re.sub(r"\s+", " ", text)
+        return text.strip().upper()
+
+    def _contains_detection_marker(self, text: str, marker: str) -> bool:
+        if not text or not marker:
+            return False
+
+        marker = marker.upper().replace("Ё", "Е")
+        # Короткие слова нельзя искать простым substring-поиском:
+        # иначе "ФОРМА" срабатывает внутри "ИНФОРМАЦИИ".
+        if marker in {"ФОРМА", "СОГЛАСИЕ", "РАСПИСКА", "ЗАЯВЛЕНИЕ"}:
+            pattern = rf"(^|[^0-9A-ZА-Я]){re.escape(marker)}([^0-9A-ZА-Я]|$)"
+            return bool(re.search(pattern, text))
+
+        return marker in text
+
+    def _split_title_from_semantic_start(
+        self,
+        paragraphs: list[str],
+    ) -> tuple[list[str], Optional[str]]:
+        """
+        Return paragraph tail starting from the last strong semantic title start.
+
+        This avoids titles like:
+        "... свои права и исполнять свои обязанности ИСЧЕРПЫВАЮЩИЙ ПЕРЕЧЕНЬ ..."
+        """
+        last_idx: Optional[int] = None
+        last_marker: Optional[str] = None
+
+        for idx, paragraph in enumerate(paragraphs):
+            norm = self._normalize_detection_text(paragraph)
+            for marker in self._STRONG_TITLE_STARTS:
+                if norm.startswith(marker):
+                    last_idx = idx
+                    last_marker = marker
+                    break
+
+        if last_idx is not None:
+            return paragraphs[last_idx:], last_marker
+
+        return paragraphs, None
+
+    def _detect_normative_table_number_from_context(
+        self,
+        paragraph_context: list[dict[str, Any]],
+    ) -> Optional[int]:
+        """
+        Detect the normative table number from nearby text: "Таблица 1/2/3".
+
+        This is intentionally separate from docx_table_index/table_number:
+        - docx_table_index is the physical Word table order;
+        - normative_table_number is the number printed in the regulation.
+        """
+        for item in reversed(paragraph_context):
+            text = self._clean_text(str(item.get("content_clean") or ""))
+            match = re.match(r"^\s*Таблица\s+(\d+)\b", text, flags=re.IGNORECASE)
+            if match:
+                try:
+                    return int(match.group(1))
+                except ValueError:
+                    return None
+        return None
+
+    def _resolve_normative_table_number(
+        self,
+        *,
+        explicit_normative_table_number: Optional[int],
+        table_type: str,
+    ) -> tuple[Optional[int], Optional[str]]:
+        """
+        Возвращает номер нормативной таблицы и источник его определения.
+
+        Если в регламенте нет явного абзаца "Таблица 1/2/3",
+        номер безопасно восстанавливается по уверенно определённому типу
+        ключевой таблицы и помечается как inferred_by_table_type.
+        """
+        if explicit_normative_table_number is not None:
+            return explicit_normative_table_number, "explicit_context"
+
+        inferred_by_type = {
+            "identifiers": 1,
+            "documents": 2,
+            "refusal_reasons": 3,
+        }.get(table_type)
+        if inferred_by_type is not None:
+            return inferred_by_type, "inferred_by_table_type"
+
+        return None, None
 
     def _detect_table_title(
         self,
@@ -817,24 +1985,62 @@ class DocxStructureExtractor:
         paragraph_context: list[dict[str, Any]],
         fallback_number: int,
     ) -> str:
-        candidates = [
-            (item.get("content_clean") or "").strip()
-            for item in reversed(paragraph_context)
+        nearby = [
+            self._clean_text(item.get("content_clean") or "")
+            for item in paragraph_context
+            if self._clean_text(item.get("content_clean") or "")
         ]
+        nearby = nearby[-14:]
+
+        if not nearby:
+            return f"Таблица {fallback_number}"
+
+        marker_idx: Optional[int] = None
+        for idx in range(len(nearby) - 1, -1, -1):
+            if re.match(r"^\s*Таблица\s+\d+\b", nearby[idx], flags=re.IGNORECASE):
+                marker_idx = idx
+                break
+
+        if marker_idx is not None:
+            candidate_parts = nearby[marker_idx + 1 :] or [nearby[marker_idx]]
+            source = "explicit_table_marker"
+        else:
+            candidate_parts = nearby[:]
+            source = "fallback_preceding_context"
+
+        candidate_parts, semantic_marker = self._split_title_from_semantic_start(candidate_parts)
+        if semantic_marker:
+            source = "semantic_heading_start"
+
+        title = self._normalize_title(" ".join(candidate_parts))
+        title_norm = self._normalize_detection_text(title)
+
+        # If a semantic heading appears inside a long fallback fragment, cut everything before it.
+        if source == "fallback_preceding_context":
+            for marker in self._STRONG_TITLE_STARTS:
+                pos = title_norm.find(marker)
+                if pos > 0:
+                    title = self._normalize_title(title[pos:])
+                    title_norm = self._normalize_detection_text(title)
+                    break
+
+        # Avoid dragging a whole service-name tail into table title.
+        if source.startswith("fallback") and len(title) > 260:
+            title = self._normalize_title(" ".join(candidate_parts[-2:]))
+
+        if title and not self._is_bad_title_candidate(title):
+            return title
 
         best_keyword_candidate: Optional[str] = None
         best_plain_candidate: Optional[str] = None
 
-        for candidate in candidates:
-            if not candidate:
-                continue
-            if len(candidate) > 300:
+        for candidate in reversed(nearby):
+            if not candidate or len(candidate) > 300:
                 continue
             if self._is_bad_title_candidate(candidate):
                 continue
 
             normalized = candidate.lower()
-
             if any(keyword in normalized for keyword in self._GOOD_TITLE_KEYWORDS):
                 best_keyword_candidate = candidate
                 break
@@ -851,40 +2057,108 @@ class DocxStructureExtractor:
         return f"Таблица {fallback_number}"
 
     def _looks_like_caption_or_heading(self, text: str) -> bool:
-        lowered = text.lower()
+        cleaned = self._clean_text(text)
+        lowered = cleaned.lower()
+
+        if not cleaned or self._is_bad_title_candidate(cleaned):
+            return False
 
         if any(keyword in lowered for keyword in self._GOOD_TITLE_KEYWORDS):
             return True
 
-        # Short, clean sentence may act as fallback caption only if it is not field-like.
-        return len(text) <= 120 and not self._is_bad_title_candidate(text)
+        if cleaned[:1].islower():
+            return False
+
+        return len(cleaned) <= 120
 
     def _is_bad_title_candidate(self, text: str) -> bool:
-        lowered = text.lower().strip()
+        cleaned = self._clean_text(text)
+        lowered = cleaned.lower().strip()
 
         if len(lowered) < 5:
             return True
 
+        if cleaned[:1].islower():
+            return True
+
         for pattern in self._BAD_TITLE_PATTERNS:
-            if pattern.search(lowered):
+            if pattern.search(cleaned):
                 return True
 
-        # Truncated tails / weak fragments
-        weak_starts = (
+        weak_exact = {
             "государственной услуги",
             "услуг и или",
             "или отказа",
             "предоставлении государственной услуги",
-        )
-        if lowered in weak_starts:
+            "формате)",
+        }
+        if lowered in weak_exact:
             return True
 
         return False
 
     def _normalize_title(self, text: str) -> str:
-        title = self._clean_text(text)
+        title = self._clean_text(text).replace("\n", " ")
+        title = re.sub(r"\s+", " ", title)
         title = re.sub(r"^[\-\–\—\:\;\,]+", "", title).strip()
         return title or "Таблица"
+
+    def _repair_table_title(
+        self,
+        *,
+        table_title: str,
+        table_type: str,
+        headers: list[str],
+        row_payloads: list[dict[str, Any]],
+        normative_table_number: Optional[int],
+    ) -> str:
+        title_n = self._normalize_detection_text(table_title)
+        header_n = self._normalize_detection_text(" ".join(headers))
+        row_n = self._normalize_detection_text(
+            " ".join((row.get("row_summary") or "") for row in row_payloads[:6])
+        )
+        table_n = " ".join([title_n, header_n, row_n])
+
+        title_is_weak = (
+            not table_title
+            or table_title.startswith("Таблица ")
+            or self._is_bad_title_candidate(table_title)
+        )
+
+        if table_type == "identifiers" and (
+            title_is_weak
+            or not any(marker in title_n for marker in ("ИДЕНТИФИКАТОРЫ КАТЕГОРИЙ", "ПРИЗНАКОВ ЗАЯВИТЕЛЕЙ"))
+        ):
+            return "ИДЕНТИФИКАТОРЫ КАТЕГОРИЙ (ПРИЗНАКОВ) ЗАЯВИТЕЛЕЙ"
+
+        if table_type == "documents" and (
+            title_is_weak
+            or not any(marker in title_n for marker in ("ИСЧЕРПЫВАЮЩИЙ ПЕРЕЧЕНЬ", "ПЕРЕЧЕНЬ НЕОБХОДИМЫХ", "ПЕРЕЧЕНЬ ДОКУМЕНТОВ"))
+        ):
+            if "ПЕРЕЧЕНЬ НЕОБХОДИМЫХ" in table_n:
+                return (
+                    "ПЕРЕЧЕНЬ НЕОБХОДИМЫХ ДЛЯ ПРЕДОСТАВЛЕНИЯ ГОСУДАРСТВЕННОЙ "
+                    "УСЛУГИ ДОКУМЕНТОВ И (ИЛИ) ИНФОРМАЦИИ"
+                )
+            return (
+                "ИСЧЕРПЫВАЮЩИЙ ПЕРЕЧЕНЬ ДОКУМЕНТОВ, НЕОБХОДИМЫХ ДЛЯ "
+                "ПРЕДОСТАВЛЕНИЯ ГОСУДАРСТВЕННОЙ УСЛУГИ"
+            )
+
+        if table_type == "refusal_reasons" and (
+            title_is_weak
+            or ("ПРИВЕД" in title_n and "ТАБЛИЦ" in title_n)
+            or not any(marker in title_n for marker in ("ИСЧЕРПЫВАЮЩИЙ ПЕРЕЧЕНЬ ОСНОВАНИЙ", "ПЕРЕЧЕНЬ ОСНОВАНИЙ"))
+        ):
+            return (
+                "ИСЧЕРПЫВАЮЩИЙ ПЕРЕЧЕНЬ ОСНОВАНИЙ ДЛЯ ОТКАЗА В ПРИЕМЕ ЗАПРОСА "
+                "И ДОКУМЕНТОВ, НЕОБХОДИМЫХ ДЛЯ ПРЕДОСТАВЛЕНИЯ ГОСУДАРСТВЕННОЙ "
+                "УСЛУГИ, ОСНОВАНИЙ ДЛЯ ПРИОСТАНОВЛЕНИЯ ПРЕДОСТАВЛЕНИЯ "
+                "ГОСУДАРСТВЕННОЙ УСЛУГИ ИЛИ ОТКАЗА В ПРЕДОСТАВЛЕНИИ "
+                "ГОСУДАРСТВЕННОЙ УСЛУГИ"
+            )
+
+        return table_title
 
     def _detect_table_type(
         self,
@@ -892,71 +2166,286 @@ class DocxStructureExtractor:
         table_title: str,
         headers: list[str],
         row_payloads: list[dict[str, Any]],
+        normative_table_number: Optional[int] = None,
     ) -> str:
-        haystack = f"{table_title} {' '.join(headers)}".lower()
-        row_text = " ".join(
-            (row.get("row_summary") or "").lower()
-            for row in row_payloads[:8]
+        title_n = self._normalize_detection_text(table_title)
+        header_n = self._normalize_detection_text(" ".join(headers))
+        row_summaries = " ".join(
+            (row.get("row_summary") or "")
+            for row in row_payloads[:12]
+        )
+        row_values = " ".join(
+            " ".join(
+                self._clean_text(str(value))
+                for value in (row.get("row_json") or {}).values()
+                if self._clean_text(str(value))
+            )
+            for row in row_payloads[:12]
+        )
+        text_n = self._normalize_detection_text(f"{row_summaries} {row_values}")
+        table_only_n = " ".join([title_n, header_n, text_n])
+
+        rows_count = len(row_payloads)
+        cols_count = max((len((row.get("row_json") or {})) for row in row_payloads), default=len(headers))
+        total_cells = 0
+        empty_cells = 0
+        for row in row_payloads[:20]:
+            row_json = row.get("row_json") or {}
+            for value in row_json.values():
+                total_cells += 1
+                if not self._clean_text(str(value)):
+                    empty_cells += 1
+
+        scores: dict[str, float] = {
+            "consultant_noise": 0.0,
+            "form_fields": 0.0,
+            "identifiers": 0.0,
+            "documents": 0.0,
+            "refusal_reasons": 0.0,
+            "deadlines": 0.0,
+            "amounts": 0.0,
+            "generic": 0.1,
+        }
+
+        # Служебный шум. Смотрим только саму таблицу и её заголовок, не весь соседний контекст.
+        for marker in self._NOISE_TABLE_MARKERS:
+            if marker in table_only_n:
+                scores["consultant_noise"] += 2.5
+        if rows_count <= 2 and "СПИСОК ИЗМЕНЯЮЩИХ ДОКУМЕНТОВ" in table_only_n:
+            scores["consultant_noise"] += 2.5
+
+        # Формы / шаблоны заявлений.
+        for marker in self._FORM_TITLE_MARKERS:
+            if self._contains_detection_marker(title_n, marker):
+                scores["form_fields"] += 2.0
+            elif self._contains_detection_marker(header_n, marker):
+                scores["form_fields"] += 1.2
+            elif self._contains_detection_marker(text_n, marker):
+                scores["form_fields"] += 0.8
+
+        for marker in self._FORM_CONTEXT_MARKERS:
+            if self._contains_detection_marker(table_only_n, marker):
+                scores["form_fields"] += 0.5
+
+        if total_cells >= 12 and empty_cells / max(total_cells, 1) > 0.35:
+            scores["form_fields"] += 0.6
+        if "ПОДПИСЬ" in table_only_n and "ДАТА" in table_only_n and "ФАМИЛ" in table_only_n:
+            scores["form_fields"] += 1.2
+        if (
+            "НАИМЕНОВАНИЕ ДОКУМЕНТА" in header_n
+            and ("КОЛ-ВО" in header_n or "КОЛИЧЕСТВО" in header_n or "КОЛ-ВО" in text_n or "КОЛИЧЕСТВО" in text_n)
+            and not any(marker in header_n for marker in ("СПОСОБ ПОДАЧИ", "СПОСОБЫ ПОДАЧИ", "ЕДИНЫЙ ПОРТАЛ", "ЕПГУ", "МФЦ"))
+        ):
+            scores["form_fields"] += 2.2
+        if (
+            normative_table_number is None
+            and "НАИМЕНОВАНИЕ ДОКУМЕНТА" in header_n
+            and not any(marker in header_n for marker in ("СПОСОБ ПОДАЧИ", "СПОСОБЫ ПОДАЧИ", "ЕДИНЫЙ ПОРТАЛ", "ЕПГУ", "МФЦ"))
+            and (rows_count <= 6 or cols_count <= 4)
+        ):
+            scores["form_fields"] += 1.8
+        if re.match(r"^\d+\.", title_n) and ("СВЕДЕНИЯ" in title_n or "НАИМЕНОВАНИЕ ДОКУМЕНТА" in header_n):
+            scores["form_fields"] += 1.2
+
+        # Категории заявителей.
+        for marker in self._CATEGORY_MARKERS:
+            if marker in title_n:
+                scores["identifiers"] += 2.0
+            elif marker in header_n:
+                scores["identifiers"] += 1.2
+            elif marker in text_n:
+                scores["identifiers"] += 0.6
+        if "ПЕРЕЧЕНЬ РЕЗУЛЬТАТОВ" in header_n and ("А1" in text_n or "Б1" in text_n):
+            scores["identifiers"] += 0.8
+        if normative_table_number == 1 and ("ПРИЗНАК" in header_n or "ЗАЯВИТЕЛ" in header_n):
+            scores["identifiers"] += 1.2
+
+        # Таблица документов.
+        strong_documents_title = any(
+            marker in title_n
+            for marker in (
+                "ИСЧЕРПЫВАЮЩИЙ ПЕРЕЧЕНЬ ДОКУМЕНТОВ",
+                "ПЕРЕЧЕНЬ НЕОБХОДИМЫХ ДЛЯ ПРЕДОСТАВЛЕНИЯ",
+                "ПЕРЕЧЕНЬ ДОКУМЕНТОВ",
+                "ДОКУМЕНТОВ, НЕОБХОДИМЫХ ДЛЯ ПРЕДОСТАВЛЕНИЯ",
+            )
+        )
+        header_or_text_n = f"{header_n} {text_n}"
+        documents_header = (
+            "НАИМЕНОВАНИЕ ДОКУМЕНТА" in header_or_text_n
+            or "ПЕРЕЧЕНЬ НЕОБХОДИМЫХ" in header_or_text_n
+            or "ДОКУМЕНТОВ И (ИЛИ) ИНФОРМАЦИИ" in header_or_text_n
+        )
+        submission_header = any(
+            marker in header_or_text_n
+            for marker in (
+                "СПОСОБ ПОДАЧИ",
+                "СПОСОБЫ ПОДАЧИ",
+                "ЕДИНЫЙ ПОРТАЛ",
+                "ЕПГУ",
+                "РПГУ",
+                "МФЦ",
+                "ПОЧТОВЫМ ОТПРАВЛЕНИЕМ",
+                "ЛИЧНО",
+            )
+        )
+        category_columns = "ИДЕНТИФИКАТОРЫ КАТЕГОРИЙ" in header_or_text_n or "ПРИЗНАКОВ ЗАЯВИТЕЛЕЙ" in header_or_text_n
+        if (
+            not documents_header
+            and strong_documents_title
+            and cols_count >= 5
+            and rows_count >= 3
+            and (submission_header or "ЛИЧНО" in header_or_text_n or "ПС" in header_or_text_n or "ЭД" in header_or_text_n)
+        ):
+            # Some appendix tables have merged header rows, so _extract_headers() falls back
+            # to generic columns. The normative title + wide table + submission markers are
+            # still a strong documents-table signal.
+            documents_header = True
+
+        for marker in self._DOCUMENTS_MARKERS:
+            if marker in title_n:
+                scores["documents"] += 2.0
+            elif marker in header_n:
+                scores["documents"] += 1.0
+        if submission_header:
+            scores["documents"] += 1.1
+        if category_columns and documents_header:
+            scores["documents"] += 1.0
+        if normative_table_number == 2 and (strong_documents_title or documents_header):
+            scores["documents"] += 1.5
+        if strong_documents_title and documents_header and (submission_header or category_columns):
+            scores["documents"] += 2.0
+
+        # Основания отказа / приостановления.
+        strong_refusal_title = (
+            "ИСЧЕРПЫВАЮЩИЙ ПЕРЕЧЕНЬ ОСНОВАНИЙ" in title_n
+            or "ПЕРЕЧЕНЬ ОСНОВАНИЙ" in title_n
+        )
+        weak_refusal_reference = "ПРИВЕД" in title_n and "ТАБЛИЦ" in title_n
+        for marker in self._REFUSAL_MARKERS:
+            if marker in title_n:
+                scores["refusal_reasons"] += 2.0 if strong_refusal_title and not weak_refusal_reference else 0.25
+            elif marker in header_n:
+                scores["refusal_reasons"] += 1.1
+            elif marker in text_n:
+                scores["refusal_reasons"] += 0.6
+        if "ПЕРЕЧЕНЬ ОСНОВАНИЙ" in header_n:
+            scores["refusal_reasons"] += 1.1
+        if normative_table_number == 3 and (
+            "ОТКАЗ" in table_only_n or "ПРИОСТАНОВ" in table_only_n or "ОСНОВАН" in table_only_n
+        ):
+            scores["refusal_reasons"] += 1.4
+
+        # Сроки.
+        deadline_title_markers = [
+            "срок предоставления",
+            "максимальный срок",
+            "срок регистрации",
+            "срок исправления",
+            "срок ожидания",
+            "срок принятия решения",
+            "срок направления",
+            "срок выполнения",
+        ]
+        haystack_lower = f"{table_title} {' '.join(headers)}".lower()
+        deadline_title_score = sum(
+            1 for marker in deadline_title_markers if marker in haystack_lower
+        )
+        deadline_row_like_count = sum(
+            1
+            for row in row_payloads[:12]
+            if self._row_looks_like_deadline_payload(row)
+        )
+        if deadline_title_score >= 1 and deadline_row_like_count >= 1:
+            scores["deadlines"] += 1.5
+        if deadline_title_score >= 2:
+            scores["deadlines"] += 1.0
+        if deadline_row_like_count >= 2:
+            scores["deadlines"] += 1.0
+
+        # Размеры.
+        if any(marker in title_n for marker in self._AMOUNT_MARKERS) and ("РУБ" in table_only_n or "РАЗМЕР" in table_only_n):
+            scores["amounts"] += 1.2
+
+        strong_real_documents_table = (
+            scores["documents"] >= 3.0
+            and documents_header
+            and (strong_documents_title or normative_table_number == 2)
+            and (submission_header or category_columns or cols_count >= 6)
+            and scores["consultant_noise"] < 2.0
+        )
+        form_over_documents = (
+            scores["form_fields"] >= 2.0
+            and not strong_real_documents_table
+            and scores["form_fields"] >= scores["documents"] - 0.2
+        )
+        has_refusal_structure = (
+            normative_table_number == 3
+            or "ПЕРЕЧЕНЬ ОСНОВАНИЙ" in header_n
+            or "ПЕРЕЧЕНЬ ОСНОВАНИЙ" in text_n
+            or "ОСНОВАНИЙ ДЛЯ ОТКАЗА" in header_n
+            or "ОСНОВАНИЙ ДЛЯ ОТКАЗА" in text_n
+        )
+        strong_form_like = (
+            scores["form_fields"] >= 2.0
+            and not strong_real_documents_table
+            and not has_refusal_structure
+        )
+        weak_link_to_another_table = (
+            "ПРИВЕД" in title_n
+            and "ТАБЛИЦ" in title_n
+            and normative_table_number is None
+            and rows_count <= 2
         )
 
-        combined = f"{haystack} {row_text}"
-
-        # 1. Documents tables must have top priority.
-        document_markers = [
-            "документов, необходимых",
-            "документы, необходимые",
-            "исчерпывающий перечень документов",
-            "наименование документа",
-            "способ подачи",
-            "электронной подаче",
-            "лично",
-            "почтовым отправлением",
-            "мфц",
-            "иные требования",
-        ]
-        if sum(1 for marker in document_markers if marker in combined) >= 2:
-            return "documents"
-
-        # 2. Refusal / suspension reasons
-        refusal_markers = [
-            "основания для отказа",
-            "отказа в приеме",
-            "приостановления",
-            "отказа в предоставлении",
-            "основания отказа",
-        ]
-        if any(marker in combined for marker in refusal_markers):
-            return "refusal_reasons"
-
-        # 3. Deadlines
-        deadline_markers = [
-            "срок",
-            "рабочих дней",
-            "календарных дней",
-            "срок предоставления",
-        ]
-        if any(marker in combined for marker in deadline_markers):
-            return "deadlines"
-
-        # 4. Applicant categories / identifiers
-        identifier_markers = [
-            "идентификатор категорий",
-            "идентификаторы категорий",
-            "категории (признаков) заявителей",
-            "категории заявителей",
-        ]
-        if any(marker in combined for marker in identifier_markers):
-            return "identifiers"
-
-        # 5. Forms / field-like tables
-        if self._looks_like_form_table(
-            table_title=table_title,
-            headers=headers,
-            row_payloads=row_payloads,
-        ):
+        if scores["consultant_noise"] >= 2.0:
+            return "consultant_noise"
+        if weak_link_to_another_table:
+            return "generic"
+        if strong_form_like:
             return "form_fields"
+        if scores["refusal_reasons"] >= max(scores["documents"], scores["identifiers"], 1.5):
+            return "refusal_reasons"
+        if strong_real_documents_table or scores["documents"] >= max(scores["identifiers"], scores["form_fields"] + 0.5, 1.5):
+            return "documents"
+        if form_over_documents:
+            return "form_fields"
+        if scores["identifiers"] >= 1.5:
+            return "identifiers"
+        if scores["deadlines"] >= 1.5:
+            return "deadlines"
+        if scores["amounts"] >= 1.2:
+            return "amounts"
 
         return "generic"
+        
+    def _looks_like_form_headers(
+        self,
+        headers: list[str],
+    ) -> bool:
+        norm_headers = [self._normalize_search_text(h) for h in headers if h]
+        if not norm_headers:
+            return False
+
+        form_markers = (
+            "фамилия",
+            "имя",
+            "отчество",
+            "дата рождения",
+            "адрес",
+            "виды дохода",
+            "документ",
+            "подпись",
+            "дата",
+            "номер",
+        )
+
+        hits = 0
+        for header in norm_headers:
+            if any(marker in header for marker in form_markers):
+                hits += 1
+
+        return hits >= 2
 
     def _looks_like_form_table(
         self,
@@ -965,38 +2454,80 @@ class DocxStructureExtractor:
         headers: list[str],
         row_payloads: list[dict[str, Any]],
     ) -> bool:
-        combined = f"{table_title} {' '.join(headers)}".lower()
+        table_type = self._detect_table_type(
+            table_title=table_title,
+            headers=headers,
+            row_payloads=row_payloads,
+            normative_table_number=None,
+        )
+        return table_type == "form_fields"
+        
+    def _row_looks_like_deadline_payload(
+        self,
+        row: dict[str, Any],
+    ) -> bool:
+        row_json = row.get("row_json") or {}
+        values = [
+            self._clean_text(str(v))
+            for v in row_json.values()
+            if self._clean_text(str(v))
+        ]
+        if not values:
+            return False
 
-        form_markers = (
-            "почтовый адрес",
-            "телефон",
-            "подтверждающего полномочия представителя",
-            "серия, номер",
-            "дата выдачи",
-            "кем выдан",
-            "срок действия полномочий",
+        deadline_values = [v for v in values if self._looks_like_deadline_value(v)]
+        if not deadline_values:
+            return False
+
+        non_deadline_values = [
+            v.lower()
+            for v in values
+            if v not in deadline_values
+        ]
+
+        scope_markers = (
+            "решени",
+            "предоставлен",
+            "уведом",
+            "выплат",
+            "регистрац",
+            "рассмотрен",
+            "исправлен",
+            "ожидани",
+            "приостанов",
+            "направлен",
+            "подписани",
         )
 
-        if any(marker in combined for marker in form_markers):
+        if any(
+            any(marker in value for marker in scope_markers)
+            for value in non_deadline_values
+        ):
             return True
 
-        # If most rows are short field labels rather than normative content, treat as form table.
-        short_value_rows = 0
-        total_rows = 0
+        return len(values) <= 3
 
-        for row in row_payloads[:10]:
-            total_rows += 1
-            values = [
-                self._clean_text(str(v))
-                for v in (row.get("row_json") or {}).values()
-                if self._clean_text(str(v))
-            ]
-            if not values:
-                continue
-            if len(values) <= 2 and all(len(v) <= 40 for v in values):
-                short_value_rows += 1
+    def _looks_like_deadline_value(
+        self,
+        text: str,
+    ) -> bool:
+        normalized = self._clean_text(text).lower().replace("ё", "е")
+        if not normalized:
+            return False
 
-        return total_rows > 0 and short_value_rows >= max(2, total_rows // 2)
+        patterns = (
+            r"\b\d+\s+(?:рабоч(?:их|его)?|календарн(?:ых|ого)?)\s+дн",
+            r"\b\d+\s+дн",
+            r"в течение\s+\d+\s+(?:рабоч(?:их|его)?|календарн(?:ых|ого)?)\s+дн",
+            r"не более\s+\d+\s+(?:рабоч(?:их|его)?|календарн(?:ых|ого)?)\s+дн",
+            r"не позднее\s+\d{1,2}(?:-го)?\s+числа",
+            r"в день регистрации",
+            r"в день поступления",
+            r"в день принятия решения",
+            r"ежемесячно",
+        )
+
+        return any(re.search(pattern, normalized) for pattern in patterns)
 
     def _build_table_summary(
         self,
@@ -1082,24 +2613,289 @@ class DocxStructureExtractor:
         original_filename: str,
         blocks: list[dict[str, Any]],
     ) -> str:
-        for block in blocks[:20]:
-            text = self._clean_text(str(block.get("content_clean") or ""))
-            if not text:
-                continue
-            if len(text) < 4:
-                continue
+        texts = [
+            self._clean_text(str(block.get("content_clean") or ""))
+            for block in blocks[:80]
+            if self._is_meaningful_text(block.get("content_clean"))
+        ]
 
+        if not texts:
+            return Path(original_filename).stem
+
+        # 1. Самый надёжный случай:
+        # если в приложении явно найден заголовок самого административного регламента,
+        # берём именно его, а не wrapper-title приказа.
+        appendix_regulation_title = self._extract_regulation_title_from_appendix(texts)
+        if appendix_regulation_title:
+            return appendix_regulation_title
+
+        # 2. Иначе пробуем собрать title из верхней части приказа,
+        # но уже без шума, даты, подписи и служебных строк.
+        start_idx = 0
+        for idx, text in enumerate(texts[:15]):
+            if text.lower() == "приказ":
+                start_idx = idx + 1
+                break
+
+        title_lines: list[str] = []
+
+        for text in texts[start_idx : start_idx + 18]:
             lowered = text.lower()
-            # Skip authority cap headers if the next meaningful title is likely better.
-            if lowered in {
-                "министерство социальной политики",
-                "министерство социальной политики красноярского края",
-            }:
+
+            if self._looks_like_signature_line(text):
+                if title_lines:
+                    break
                 continue
 
+            if any(marker in lowered for marker in self._TITLE_STOP_MARKERS):
+                if title_lines:
+                    break
+                continue
+
+            if self._is_noise_document_title_line(text):
+                if title_lines:
+                    break
+                continue
+
+            if not title_lines:
+                if self._looks_like_document_title_line(text):
+                    title_lines.append(text)
+                continue
+
+            if self._looks_like_document_title_line(text):
+                title_lines.append(text)
+                continue
+
+            break
+
+        if title_lines:
+            return self._normalize_title(" ".join(title_lines))
+
+        # 3. Осторожный fallback: первый содержательный block,
+        # который не шум, не дата, не подпись.
+        for text in texts[:30]:
+            if self._is_noise_document_title_line(text):
+                continue
+            if self._looks_like_signature_line(text):
+                continue
+            if len(text) < 5:
+                continue
             return text
 
         return Path(original_filename).stem
+        
+    def _extract_regulation_title_from_appendix(
+        self,
+        texts: list[str],
+    ) -> Optional[str]:
+        appendix_seen = False
+        collecting = False
+        collected: list[str] = []
+
+        for text in texts[:80]:
+            lowered = text.lower()
+
+            if lowered == "приложение" or lowered.startswith("приложение"):
+                appendix_seen = True
+                if collected:
+                    break
+                continue
+
+            if not appendix_seen:
+                continue
+
+            if self._looks_like_signature_line(text):
+                if collected:
+                    break
+                continue
+
+            if self._is_noise_document_title_line(text):
+                if collected:
+                    continue
+                continue
+
+            if "административный регламент" in lowered:
+                collecting = True
+                collected.append(text)
+                continue
+
+            if not collecting:
+                continue
+
+            if any(marker in lowered for marker in self._TITLE_STOP_MARKERS):
+                break
+
+            if self._looks_like_document_title_line(text):
+                collected.append(text)
+                continue
+
+            break
+
+        if not collected:
+            return None
+
+        return self._normalize_title(" ".join(collected))
+        
+    def _looks_like_signature_line(
+        self,
+        text: str,
+    ) -> bool:
+        clean_text = self._clean_text(text)
+        lowered = clean_text.lower()
+
+        if lowered in {
+            "министр",
+            "первый заместитель министра",
+            "заместитель министра",
+        }:
+            return True
+
+        # И.Л.ПАСТУХОВА / О.Н.ЧЕРНЫШЕВА / Д.В. БОГДАНОВ и т.п.
+        if re.fullmatch(r"[А-ЯЁ]\.[А-ЯЁ]\.[А-ЯЁ\-]+", clean_text):
+            return True
+
+        # Иногда после OCR/нормализации бывают пробелы: И. Л. ПАСТУХОВА
+        if re.fullmatch(r"[А-ЯЁ]\.\s*[А-ЯЁ]\.\s*[А-ЯЁ\-]+", clean_text):
+            return True
+
+        return False
+
+    def _collect_leading_texts(
+        self,
+        blocks: list[dict[str, Any]],
+        *,
+        limit: int = 120,
+    ) -> list[str]:
+        return [
+            self._clean_text(str(block.get("content_clean") or ""))
+            for block in blocks[:limit]
+            if self._is_meaningful_text(block.get("content_clean"))
+        ]
+
+    def _extract_document_number(
+        self,
+        text: str,
+    ) -> Optional[str]:
+        clean_text = self._clean_text(text)
+        if not clean_text:
+            return None
+
+        match = self._NUMBER_RE.search(clean_text)
+        if match is None:
+            return None
+
+        number = self._clean_text(match.group("number"))
+        number = number.replace(" ", "")
+        return number or None
+
+    def _extract_document_date_and_number(
+        self,
+        *,
+        original_filename: str,
+        blocks: list[dict[str, Any]],
+    ) -> tuple[Optional[str], Optional[datetime]]:
+        texts = [original_filename, *self._collect_leading_texts(blocks, limit=80)]
+
+        for text in texts[:25]:
+            clean_text = self._clean_text(text)
+            if not clean_text:
+                continue
+
+            dates = self._extract_candidate_dates(clean_text)
+            number = self._extract_document_number(clean_text)
+
+            lowered = clean_text.lower()
+            looks_like_header = (
+                ("приказ" in lowered)
+                or lowered.startswith("от ")
+                or ("№" in clean_text)
+                or (" N " in clean_text)
+                or (" N" in clean_text)
+            )
+
+            if looks_like_header and dates and number:
+                return number, dates[0]
+
+        for text in texts[:25]:
+            clean_text = self._clean_text(text)
+            if not clean_text:
+                continue
+
+            number = self._extract_document_number(clean_text)
+            if number:
+                dates = self._extract_candidate_dates(clean_text)
+                return number, (dates[0] if dates else None)
+
+        return None, None
+
+    def _strip_clause_prefix(
+        self,
+        text: str,
+    ) -> str:
+        clean_text = self._clean_text(text)
+        match = self._CLAUSE_RE.match(clean_text)
+        if match:
+            return self._clean_text(match.group("text"))
+        return clean_text
+
+    def _looks_like_service_name_candidate(
+        self,
+        text: str,
+    ) -> bool:
+        clean_text = self._clean_text(text)
+        lowered = clean_text.lower()
+
+        if len(clean_text) < 15 or len(clean_text) > 500:
+            return False
+
+        strong_markers = (
+            "предоставление",
+            "назначение",
+            "ежемесячной денежной выплаты",
+            "субсид",
+            "социального контракта",
+            "адресной материальной помощи",
+            "санаторно-курорт",
+            "бесплатных путевок",
+            "государственной социальной помощи",
+        )
+        return any(marker in lowered for marker in strong_markers)
+
+    def _detect_service_name_full(
+        self,
+        *,
+        blocks: list[dict[str, Any]],
+    ) -> Optional[str]:
+        anchor_seen = False
+
+        for block in blocks[:260]:
+            text = self._clean_text(str(block.get("content_clean") or ""))
+            if not text:
+                continue
+
+            lowered = text.lower()
+            block_type = self._clean_text(block.get("block_type") or "").lower()
+
+            if "наименование государственной услуги" in lowered:
+                anchor_seen = True
+                continue
+
+            if not anchor_seen:
+                continue
+
+            if block_type == "heading":
+                break
+
+            candidate = self._strip_clause_prefix(text).rstrip(" .;:")
+
+            if block.get("clause_number"):
+                if self._looks_like_service_name_candidate(candidate):
+                    return candidate
+
+            if self._looks_like_service_name_candidate(candidate):
+                return candidate
+
+        return None
 
     def _detect_revision_date(
         self,
@@ -1107,23 +2903,176 @@ class DocxStructureExtractor:
         original_filename: str,
         blocks: list[dict[str, Any]],
         normalized_text: str,
+        document_date: Optional[datetime] = None,
     ) -> Optional[datetime]:
-        candidates: list[str] = [original_filename, normalized_text]
-        candidates.extend(
-            str(block.get("content_clean") or "") for block in blocks[:20]
-        )
+        texts = self._collect_leading_texts(blocks, limit=120)
 
-        for candidate in candidates:
-            match = self._REVISION_DATE_RE.search(candidate)
-            if not match:
+        for text in texts[:30]:
+            lowered = text.lower()
+            if "в ред." in lowered or "в ред " in lowered:
+                text_dates = self._extract_candidate_dates(text)
+                if text_dates:
+                    return text_dates[0]
+
+        for idx, text in enumerate(texts[:40]):
+            lowered = text.lower()
+            if "список изменяющих документов" not in lowered:
+                continue
+
+            for nearby in texts[idx + 1 : idx + 5]:
+                nearby_lowered = nearby.lower()
+                if "в ред." in nearby_lowered or "в ред " in nearby_lowered:
+                    nearby_dates = self._extract_candidate_dates(nearby)
+                    if nearby_dates:
+                        return nearby_dates[0]
+
+        if document_date is not None:
+            return document_date
+
+        for text in texts[:12]:
+            if self._looks_like_order_date_line(text):
+                text_dates = self._extract_candidate_dates(text)
+                if text_dates:
+                    return text_dates[0]
+
+        filename_dates = self._extract_candidate_dates(original_filename)
+        if filename_dates:
+            return filename_dates[0]
+
+        prefix_dates = self._extract_candidate_dates(
+            self._clean_text(normalized_text[:1200])
+        )
+        if prefix_dates:
+            return prefix_dates[0]
+
+        return None
+        
+    def _extract_candidate_dates(
+        self,
+        text: str,
+    ) -> list[datetime]:
+        clean_text = self._clean_text(text)
+        if not clean_text:
+            return []
+
+        matches: list[tuple[int, datetime]] = []
+
+        for match in self._TEXTUAL_DATE_RE.finditer(clean_text):
+            day = int(match.group("day"))
+            month_name = match.group("month").lower()
+            year = int(match.group("year"))
+            month = self._RUS_MONTHS.get(month_name)
+            if month is None:
                 continue
             try:
-                parsed = datetime.strptime(match.group("date"), "%d.%m.%Y")
-                return parsed.replace(tzinfo=timezone.utc)
+                parsed = datetime(year, month, day, tzinfo=timezone.utc)
+                matches.append((match.start(), parsed))
             except ValueError:
                 continue
 
-        return None
+        for match in self._REVISION_DATE_RE.finditer(clean_text):
+            try:
+                parsed = datetime.strptime(match.group("date"), "%d.%m.%Y")
+                matches.append((match.start(), parsed.replace(tzinfo=timezone.utc)))
+            except ValueError:
+                continue
+
+        matches.sort(key=lambda item: item[0])
+
+        result: list[datetime] = []
+        seen: set[str] = set()
+
+        for _, parsed in matches:
+            key = parsed.strftime("%Y-%m-%d")
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(parsed)
+
+        return result
+
+    def _looks_like_order_date_line(
+        self,
+        text: str,
+    ) -> bool:
+        clean_text = self._clean_text(text)
+        lowered = clean_text.lower()
+
+        if not self._extract_candidate_dates(clean_text):
+            return False
+
+        if lowered.startswith("от ") and ("№" in clean_text or re.search(r"\bN\b", clean_text)):
+            return True
+
+        if "приказ" in lowered and self._extract_candidate_dates(clean_text):
+            return True
+
+        return False
+
+    def _looks_like_document_title_line(
+        self,
+        text: str,
+    ) -> bool:
+        clean_text = self._clean_text(text)
+        if len(clean_text) < 5 or len(clean_text) > 250:
+            return False
+
+        lowered = clean_text.lower()
+
+        strong_markers = (
+            "об утверждении",
+            "о внесении изменения",
+            "о внесении изменений",
+            "административного регламента предоставления",
+            "государственной услуги",
+            "предоставлению",
+            "назначению",
+        )
+        if any(marker in lowered for marker in strong_markers):
+            return True
+
+        letters = [ch for ch in clean_text if ch.isalpha()]
+        if not letters:
+            return False
+
+        upper_ratio = sum(1 for ch in letters if ch == ch.upper()) / len(letters)
+        return upper_ratio >= 0.75 and len(clean_text) >= 12
+
+    def _is_noise_document_title_line(
+        self,
+        text: str,
+    ) -> bool:
+        clean_text = self._clean_text(text)
+        lowered = clean_text.lower()
+
+        if lowered in self._TITLE_SKIP_EXACT:
+            return True
+
+        if self._looks_like_signature_line(clean_text):
+            return True
+
+        if lowered.startswith("документ предоставлен"):
+            return True
+        if lowered.startswith("дата сохранения"):
+            return True
+        if lowered.startswith("www."):
+            return True
+        if lowered.startswith("к приказу"):
+            return True
+        if lowered.startswith("министерство социальной политики"):
+            return True
+        if lowered == "красноярского края":
+            return True
+
+        if lowered.startswith("от ") and self._extract_candidate_dates(clean_text):
+            return True
+
+        if self._extract_candidate_dates(clean_text) and (
+            "№" in clean_text or re.search(r"\bN\b", clean_text)
+        ):
+            return True
+
+        return False
 
     def _detect_doc_uid_base(
         self,
@@ -1131,23 +3080,34 @@ class DocxStructureExtractor:
         original_filename: str,
         document_title: str,
         normalized_text: str,
+        service_name_full: Optional[str] = None,
+        document_number: Optional[str] = None,
+        document_date: Optional[datetime] = None,
     ) -> Optional[str]:
-        number_match = self._NUMBER_RE.search(original_filename)
-        if number_match is None:
-            number_match = self._NUMBER_RE.search(document_title)
-        if number_match is None:
-            number_match = self._NUMBER_RE.search(normalized_text[:3000])
-
-        if number_match is None:
+        identity_basis = (
+            service_name_full
+            or document_title
+            or Path(original_filename).stem
+            or ""
+        )
+        identity_token = self._normalize_token(identity_basis)[:160]
+        if not identity_token:
             return None
 
-        raw_number = self._normalize_token(number_match.group("number"))
-        title_basis = self._normalize_token(document_title)[:80] if document_title else "document"
+        suffix_parts: list[str] = []
 
-        if not raw_number:
-            return None
+        if document_number:
+            normalized_number = self._normalize_token(document_number)
+            if normalized_number:
+                suffix_parts.append(normalized_number)
 
-        return f"{title_basis}__{raw_number}"
+        if not suffix_parts and document_date is not None:
+            suffix_parts.append(document_date.strftime("%Y_%m_%d"))
+
+        if not suffix_parts:
+            return identity_token
+
+        return f"{identity_token}__{'__'.join(suffix_parts)}"
 
     def _detect_appendix_number_from_context(
         self,
@@ -1243,3 +3203,68 @@ class DocxStructureExtractor:
         if normalized in {"column", "column_1", "column_2", "column_3", "column_4", "column_5"}:
             return True
         return False
+        
+    def _update_heading_path(
+        self,
+        *,
+        heading_path: list[str],
+        heading_text: str,
+        section_number: Optional[str],
+    ) -> list[str]:
+        clean_heading = self._clean_text(heading_text)
+        if not clean_heading:
+            return list(heading_path)
+
+        if section_number and re.fullmatch(r"[IVXLCM]+\.?", section_number, flags=re.IGNORECASE):
+            return [clean_heading]
+
+        new_path = list(heading_path)
+        if not new_path or new_path[-1] != clean_heading:
+            new_path.append(clean_heading)
+        return new_path[-4:]
+
+    def _infer_block_semantic_hints(
+        self,
+        *,
+        text: str,
+        current_heading_text: Optional[str],
+        heading_path: list[str],
+    ) -> dict[str, Any]:
+        haystack_parts = [self._clean_text(text)]
+        if current_heading_text:
+            haystack_parts.append(self._clean_text(current_heading_text))
+        haystack_parts.extend(self._clean_text(x) for x in heading_path if self._clean_text(x))
+
+        haystack = " ".join(haystack_parts).lower()
+
+        hints = {
+            "is_deadline_related": False,
+            "deadline_kind_hint": None,
+        }
+
+        if any(
+            marker in haystack
+            for marker in (
+                "срок предоставления государственной услуги",
+                "срок предоставления",
+                "срок регистрации",
+                "срок исправления",
+                "в течение 2 рабочих дней",
+                "не позднее 26-го числа",
+                "не позднее 26 числа",
+                "уведомляется",
+                "направляется заявителю",
+                "выплачивается",
+                "решение принимается",
+            )
+        ):
+            hints["is_deadline_related"] = True
+
+        if any(marker in haystack for marker in ("решение принимается", "принятия решения", "срок предоставления")):
+            hints["deadline_kind_hint"] = "decision"
+        elif any(marker in haystack for marker in ("уведомляется", "уведомление", "направляется заявителю")):
+            hints["deadline_kind_hint"] = "notification"
+        elif any(marker in haystack for marker in ("выплачивается", "выплата", "не позднее 26-го числа", "не позднее 26 числа")):
+            hints["deadline_kind_hint"] = "payment"
+
+        return hints

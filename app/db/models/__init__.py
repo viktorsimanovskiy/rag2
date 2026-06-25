@@ -11,8 +11,9 @@ from app.db.models.documents import (
     DocumentTable,
     DocumentTableRow,
     LegalFact,
-    MeasureAlias,
 )
+
+from app.db.models.services import ServiceRegistry
 
 from app.db.models.feedback import (
     Channel,
@@ -32,7 +33,7 @@ __all__ = [
     "DocumentTable",
     "DocumentTableRow",
     "LegalFact",
-    "MeasureAlias",
+    "ServiceRegistry",
     "Channel",
     "ConversationSession",
     "QuestionEvent",

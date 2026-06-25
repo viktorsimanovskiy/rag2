@@ -30,9 +30,19 @@ from app.config.settings import DatabaseSettings
 from app.db.session import DatabaseSessionManager
 from app.services.answers.answer_orchestrator import (
     IntentClassifierProtocol,
+<<<<<<< HEAD
+    LLMAnswerComposerProtocol,
+=======
+<<<<<<< HEAD
+    LLMAnswerComposerProtocol,
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
+>>>>>>> 4c04853102b91a0c6e1fdd3692b3fb98688e2646
+    MessageUnderstandingProtocol,
     QuestionEmbeddingProtocol,
     QuestionNormalizerProtocol,
 )
+from app.services.answers.intent_classifier import RuleBasedIntentClassifier
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +73,15 @@ class AppRuntimeConfig:
     intent_classifier: Optional[IntentClassifierProtocol] = None
     question_normalizer: Optional[QuestionNormalizerProtocol] = None
     question_embedding_service: Optional[QuestionEmbeddingProtocol] = None
+    message_understanding_service: Optional[MessageUnderstandingProtocol] = None
+<<<<<<< HEAD
+    llm_answer_composer_service: Optional[LLMAnswerComposerProtocol] = None
+=======
+<<<<<<< HEAD
+    llm_answer_composer_service: Optional[LLMAnswerComposerProtocol] = None
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
+>>>>>>> 4c04853102b91a0c6e1fdd3692b3fb98688e2646
 
     service_factory_config: Optional[ServiceFactoryConfig] = None
 
@@ -76,21 +95,10 @@ class DefaultQuestionNormalizer(QuestionNormalizerProtocol):
         return " ".join(question_text.strip().split())
 
 
-class DefaultIntentClassifier(IntentClassifierProtocol):
-    async def classify(self, question_text: str) -> dict:
-        from app.db.models.enums import QuestionIntentEnum
-
-        return {
-            "intent_type": QuestionIntentEnum.OTHER,
-            "measure_code": None,
-            "subject_category_code": None,
-            "classifier_version": "default_intent_classifier_v1",
-            "routing_payload_json": {
-                "source": "default_classifier",
-                "note": "fallback bootstrap classifier",
-            },
-            "query_constraints_json": {},
-        }
+class DefaultIntentClassifier(RuleBasedIntentClassifier):
+    """
+    Default live classifier used by AppRuntime when no custom classifier is supplied.
+    """
 
 
 # ============================================================
@@ -129,6 +137,15 @@ class AppRuntime:
             else DefaultQuestionNormalizer()
         )
         self._question_embedding_service = config.question_embedding_service
+        self._message_understanding_service = config.message_understanding_service
+<<<<<<< HEAD
+        self._llm_answer_composer_service = config.llm_answer_composer_service
+=======
+<<<<<<< HEAD
+        self._llm_answer_composer_service = config.llm_answer_composer_service
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
+>>>>>>> 4c04853102b91a0c6e1fdd3692b3fb98688e2646
         self._service_factory_config = config.service_factory_config or ServiceFactoryConfig()
 
     # --------------------------------------------------------
@@ -197,6 +214,15 @@ class AppRuntime:
             intent_classifier=self._intent_classifier,
             question_normalizer=self._question_normalizer,
             question_embedding_service=self._question_embedding_service,
+            message_understanding_service=self._message_understanding_service,
+<<<<<<< HEAD
+            llm_answer_composer_service=self._llm_answer_composer_service,
+=======
+<<<<<<< HEAD
+            llm_answer_composer_service=self._llm_answer_composer_service,
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
+>>>>>>> 4c04853102b91a0c6e1fdd3692b3fb98688e2646
             config=self._service_factory_config,
         )
 

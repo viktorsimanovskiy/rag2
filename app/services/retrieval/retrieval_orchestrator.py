@@ -94,7 +94,6 @@ class RetrievalInput:
     question_text_normalized: str
 
     intent_type: QuestionIntentEnum
-    measure_code: Optional[str] = None
     subject_category_code: Optional[str] = None
 
     query_terms: list[str] = field(default_factory=list)
@@ -123,7 +122,6 @@ class RetrievedCandidate:
     doc_uid_base: Optional[str] = None
     revision_date: Optional[str] = None
 
-    measure_code: Optional[str] = None
     subject_category: Optional[str] = None
 
     title: Optional[str] = None
@@ -321,6 +319,7 @@ class RetrievalOrchestrator:
         selected_candidates = self._select_final_candidates(
             payload=payload,
             strategy=strategy,
+            query_bundle=query_bundle,
             candidates=reranked_candidates,
             document_stats=document_stats,
             priority_document_ids=priority_document_ids,
@@ -401,14 +400,17 @@ class RetrievalOrchestrator:
         if intent == QuestionIntentEnum.REJECTION_QUESTION:
             return RetrievalStrategy(
                 strategy_code="rejection_priority",
-                use_facts=True,
+                # Для отказного пути источник истины — строки таблицы 3.
+                # legal_fact и обычные block-и здесь дают шум: например, сроки выплат
+                # могут выигрывать у строки отказа только из-за слова "принятия".
+                use_facts=False,
                 use_tables=True,
                 use_rows=True,
-                use_blocks=True,
-                facts_weight=1.25,
+                use_blocks=False,
+                facts_weight=0.00,
                 tables_weight=1.00,
-                rows_weight=1.00,
-                blocks_weight=1.10,
+                rows_weight=1.25,
+                blocks_weight=0.00,
             )
 
         if intent == QuestionIntentEnum.FORM_QUESTION:
@@ -427,14 +429,17 @@ class RetrievalOrchestrator:
         if intent == QuestionIntentEnum.ELIGIBILITY_QUESTION:
             return RetrievalStrategy(
                 strategy_code="eligibility_priority",
-                use_facts=True,
-                use_tables=True,
+                # Для вопросов о праве/категории заявителя источник ответа —
+                # строки identifiers. Факты, целые таблицы и блоки часто
+                # добавляют технические шапки или общие процедурные абзацы.
+                use_facts=False,
+                use_tables=False,
                 use_rows=True,
-                use_blocks=True,
-                facts_weight=1.30,
-                tables_weight=0.95,
-                rows_weight=1.00,
-                blocks_weight=1.10,
+                use_blocks=False,
+                facts_weight=0.00,
+                tables_weight=0.00,
+                rows_weight=1.45,
+                blocks_weight=0.00,
             )
 
         if intent == QuestionIntentEnum.PROCEDURE_QUESTION:
@@ -481,9 +486,24 @@ class RetrievalOrchestrator:
             intent_type=payload.intent_type,
         )
         submission_channel = self._detect_submission_channel(normalized_text)
+        wants_full_documents_list = self._wants_full_documents_list(
+            question_text=normalized_text,
+            intent_type=payload.intent_type,
+        )
+
+        question_deadline_kind = None
+        if payload.intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
+            question_deadline_kind = self._detect_deadline_question_kind(normalized_text)
+
+        question_rejection_scope = None
+        if payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION:
+            question_rejection_scope = self._detect_rejection_question_scope(normalized_text)
+
         requested_column_hints = self._build_requested_column_hints(
             table_question_profile=table_question_profile,
             submission_channel=submission_channel,
+            question_deadline_kind=question_deadline_kind,
+            wants_full_documents_list=wants_full_documents_list,
         )
         table_scope_hints = self._infer_table_scope_hints(
             intent_type=payload.intent_type,
@@ -493,9 +513,10 @@ class RetrievalOrchestrator:
         expanded_terms = self._expand_query_terms(
             question_text=normalized_text,
             intent_type=payload.intent_type,
-            measure_code=payload.measure_code,
             submission_channel=submission_channel,
             requested_column_hints=requested_column_hints,
+            question_deadline_kind=question_deadline_kind,
+            question_rejection_scope=question_rejection_scope,
         )
 
         query_terms = self._deduplicate_preserve_order(
@@ -510,189 +531,201 @@ class RetrievalOrchestrator:
         return {
             "normalized_text": normalized_text,
             "query_terms": query_terms,
-            "measure_code": payload.measure_code,
             "subject_category_code": payload.subject_category_code,
             "table_question_profile": table_question_profile,
             "submission_channel": submission_channel,
             "requested_column_hints": requested_column_hints,
             "table_scope_hints": table_scope_hints,
+            "question_deadline_kind": question_deadline_kind,
+            "question_rejection_scope": question_rejection_scope,
+            "wants_full_documents_list": wants_full_documents_list,
         }
-
-
+        
     def _expand_query_terms(
         self,
         *,
         question_text: str,
         intent_type: QuestionIntentEnum,
-        measure_code: Optional[str],
         submission_channel: Optional[str] = None,
         requested_column_hints: Optional[list[str]] = None,
+        question_deadline_kind: Optional[str] = None,
+        question_rejection_scope: Optional[str] = None,
     ) -> list[str]:
         terms: list[str] = []
 
         base_tokens = self._extract_meaningful_terms(question_text)
         terms.extend(base_tokens)
 
-        if measure_code:
-            terms.append(self._normalize_text(measure_code))
-
-        if "едв" in question_text:
-            terms.extend(
-                [
-                    "едв",
-                    "ежемесячной денежной выплаты",
-                    "ежемесячная денежная выплата",
-                    "денежной выплаты",
-                ]
-            )
-
         if intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
             terms.extend(
                 [
                     "срок",
-                    "срок принятия решения",
-                    "срок рассмотрения",
-                    "рассмотрения заявления",
-                    "принятия решения",
+                    "сроки",
                     "рабочих дней",
                     "календарных дней",
+                    "в течение",
+                    "не позднее",
                     "дней",
                 ]
             )
 
-        elif intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION:
+            if question_deadline_kind == "decision":
+                terms.extend(
+                    [
+                        "срок принятия решения",
+                        "срок рассмотрения",
+                        "рассмотрения заявления",
+                        "принятия решения",
+                        "решение о предоставлении",
+                        "решение принимается",
+                    ]
+                )
+            elif question_deadline_kind == "decision_payment":
+                terms.extend(
+                    [
+                        "срок принятия решения",
+                        "срок рассмотрения",
+                        "рассмотрения заявления",
+                        "принятия решения",
+                        "решение о предоставлении",
+                        "решение принимается",
+                        "максимальный срок предоставления",
+                        "срок предоставления государственной услуги",
+                        "срок выплаты",
+                        "выплата",
+                        "выплачивает",
+                        "выплатят",
+                        "получу выплату",
+                        "получу деньги",
+                        "поступят деньги",
+                        "перечисление",
+                        "перечисляет",
+                    ]
+                )
+            elif question_deadline_kind == "notification":
+                terms.extend(
+                    [
+                        "срок уведомления",
+                        "уведомление",
+                        "уведомления о решении",
+                        "направляет уведомление",
+                        "направления уведомления",
+                        "уведомляет",
+                        "сообщение о решении",
+                        "направляется заявителю",
+                        "в течение 2 рабочих дней со дня принятия решения",
+                    ]
+                )
+            elif question_deadline_kind == "payment":
+                terms.extend(
+                    [
+                        "срок выплаты",
+                        "выплата",
+                        "выплачивает",
+                        "выплатят",
+                        "получу выплату",
+                        "получу деньги",
+                        "поступят деньги",
+                        "ежемесячно",
+                        "не позднее 26-го числа",
+                    ]
+                )
+            elif question_deadline_kind == "registration":
+                terms.extend(
+                    [
+                        "срок регистрации",
+                        "регистрация заявления",
+                        "регистрация запроса",
+                        "не позднее одного рабочего дня",
+                    ]
+                )
+            elif question_deadline_kind == "correction":
+                terms.extend(
+                    [
+                        "срок исправления ошибок",
+                        "срок исправления опечаток",
+                        "опечаток и ошибок",
+                    ]
+                )
+            else:
+                terms.extend(
+                    [
+                        "срок предоставления",
+                        "максимальный срок предоставления",
+                    ]
+                )
+
+        if intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION:
             terms.extend(
                 [
                     "документы",
                     "перечень документов",
                     "необходимые документы",
-                    "документов необходимых",
-                    "представляемые документы",
-                    "документы представляемые заявителем",
-                    "к заявлению",
-                    "заявление",
-                    "заявителем",
-                    "прилагаемые документы",
-                    "предоставления государственной услуги",
                     "наименование документа",
-                    "документы необходимые для предоставления государственной услуги",
+                    "таблица 2",
+                    "приложение 2",
                 ]
             )
 
-            if submission_channel == "epgu":
-                terms.extend(
-                    [
-                        "епгу",
-                        "госуслуги",
-                        "единый портал",
-                        "посредством епгу",
-                        "электронной подаче",
-                        "в электронной форме",
-                        "электронный образ документа",
-                        "сведения о документе",
-                        "единого портала",
-                    ]
-                )
-
-            elif submission_channel == "regional_portal":
-                terms.extend(
-                    [
-                        "рпгу",
-                        "краевой портал",
-                        "региональный портал",
-                        "посредством краевого портала",
-                        "электронной подаче",
-                        "при электронной подаче посредством рпгу",
-                        "электронный образ документа",
-                        "сведения о документе",
-                    ]
-                )
-
-            elif submission_channel == "in_person":
-                terms.extend(
-                    [
-                        "лично",
-                        "личной подаче",
-                        "личном обращении",
-                        "при личной подаче",
-                        "через представителя",
-                        "по доверенности",
-                        "через социального работника",
-                    ]
-                )
-
-            elif submission_channel == "post":
-                terms.extend(
-                    [
-                        "почтой",
-                        "почтовым отправлением",
-                        "по почте",
-                    ]
-                )
-
-            elif submission_channel == "mfc":
-                terms.extend(
-                    [
-                        "мфц",
-                        "через мфц",
-                    ]
-                )
-
-        elif intent_type == QuestionIntentEnum.REJECTION_QUESTION:
+        if intent_type == QuestionIntentEnum.REJECTION_QUESTION:
             terms.extend(
                 [
-                    "отказ",
                     "основания отказа",
+                    "перечень оснований",
                     "причины отказа",
-                    "решение об отказе",
-                    "может быть отказано",
-                    "отказывается в предоставлении",
-                    "отказывается в назначении",
-                    "принимается решение об отказе",
-                    "непредставление документов",
-                    "недостоверные сведения",
-                    "отсутствие права",
+                    "таблица 3",
+                    "приложение 2",
                 ]
             )
 
-        elif intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION:
-            terms.extend(
-                [
-                    "имеет право",
-                    "право на едв",
-                    "право на получение",
-                    "категории граждан",
-                    "категории заявителей",
-                    "заявитель",
-                    "получатели",
-                    "предоставляется",
-                    "предоставляется заявителям",
-                    "условия предоставления",
-                    "при наличии права",
-                ]
-            )
+            if question_rejection_scope == "service_refusal":
+                terms.extend(
+                    [
+                        "отказ в предоставлении",
+                        "отказ в назначении",
+                        "отказа в предоставлении государственной услуги",
+                    ]
+                )
+            elif question_rejection_scope == "intake_refusal":
+                terms.extend(
+                    [
+                        "отказ в приеме",
+                        "отказ в приеме документов",
+                        "отказ в приеме заявления",
+                    ]
+                )
+            elif question_rejection_scope == "suspension":
+                terms.extend(
+                    [
+                        "приостановление",
+                        "основания для приостановления",
+                    ]
+                )
+            elif question_rejection_scope == "renewal_refusal":
+                terms.extend(
+                    [
+                        "отказ в возобновлении",
+                        "отказа в возобновлении",
+                        "возобновлении едв",
+                        "возобновлении выплаты",
+                    ]
+                )
 
-        elif intent_type == QuestionIntentEnum.PROCEDURE_QUESTION:
-            terms.extend(
-                [
-                    "порядок",
-                    "порядок предоставления",
-                    "процедура",
-                    "последовательность",
-                    "предоставление услуги",
-                    "назначение",
-                    "назначается",
-                    "рассмотрение заявления",
-                    "принятие решения",
-                ]
-            )
+        if submission_channel == "epgu":
+            terms.extend(["епгу", "единый портал", "госуслуги"])
+        elif submission_channel == "regional_portal":
+            terms.extend(["рпгу", "краевой портал", "региональный портал"])
+        elif submission_channel == "mfc":
+            terms.extend(["мфц"])
+        elif submission_channel == "post":
+            terms.extend(["почтой", "почтовым отправлением"])
+        elif submission_channel == "in_person":
+            terms.extend(["лично", "личный прием"])
 
         if requested_column_hints:
             terms.extend(requested_column_hints)
 
-        return self._deduplicate_preserve_order(
-            [self._normalize_text(x) for x in terms if self._normalize_text(x)]
-        )[:24]
+        return self._deduplicate_preserve_order(terms)
 
 
     def _extract_meaningful_terms(self, text: str) -> list[str]:
@@ -733,6 +766,91 @@ class RetrievalOrchestrator:
             result.append(item)
 
         return result
+        
+    def _prioritize_deadline_query_terms(
+        self,
+        *,
+        terms: list[str],
+        question_deadline_kind: Optional[str],
+    ) -> list[str]:
+        if not terms:
+            return terms
+
+        common_priority = [
+            "едв",
+            "срок",
+            "в течение",
+            "не позднее",
+            "рабочих дней",
+            "календарных дней",
+        ]
+
+        kind_priority_map = {
+            "decision": [
+                "срок принятия решения",
+                "решение о предоставлении",
+                "решение о назначении",
+                "принятия решения",
+                "рассмотрения заявления",
+            ],
+            "notification": [
+                "срок уведомления",
+                "уведомление",
+                "уведомления о решении",
+                "направляет уведомление",
+                "уведомляет",
+                "сообщение о решении",
+                "направляется заявителю",
+            ],
+            "payment": [
+                "срок выплаты",
+                "выплата",
+                "выплачивает",
+                "выплатят",
+                "получу выплату",
+                "получу деньги",
+                "поступят деньги",
+                "ежемесячно",
+                "не позднее 26-го числа",
+                "26-го числа",
+                "26 числа",
+                "перечисление",
+                "зачисление",
+            ],
+            "registration": [
+                "срок регистрации заявления",
+                "срок регистрации запроса",
+                "регистрация заявления",
+                "регистрация запроса",
+                "регистрируется",
+                "первый рабочий день",
+            ],
+            "correction": [
+                "срок исправления ошибок",
+                "срок исправления опечаток",
+                "исправление ошибок",
+                "исправление опечаток",
+                "опечаток и ошибок",
+            ],
+        }
+
+        priority = kind_priority_map.get(question_deadline_kind or "other", []) + common_priority
+
+        front: list[str] = []
+        tail: list[str] = []
+        seen: set[str] = set()
+
+        for term in priority:
+            if term in terms and term not in seen:
+                front.append(term)
+                seen.add(term)
+
+        for term in terms:
+            if term not in seen:
+                tail.append(term)
+                seen.add(term)
+
+        return front + tail
 
     def _candidate_text_blob(self, candidate: RetrievedCandidate) -> str:
         """
@@ -747,7 +865,6 @@ class RetrievalOrchestrator:
             candidate.title or "",
             candidate.snippet or "",
             candidate.document_name or "",
-            candidate.measure_code or "",
             candidate.subject_category or "",
         ]
 
@@ -797,6 +914,107 @@ class RetrievalOrchestrator:
 
         return self._normalize_text(" ".join(parts))
 
+    def _detect_deadline_question_kind(
+        self,
+        text: str,
+    ) -> str:
+        text_norm = self._normalize_text(text)
+        if not text_norm:
+            return "other"
+
+        payment_markers = (
+            "выплат",
+            "перечисл",
+            "зачисл",
+            "деньги",
+            "26-го числа",
+            "26 числа",
+        )
+        notification_markers = (
+            "уведом",
+            "сообщ",
+            "извест",
+            "о решении",
+            "о принятом решении",
+        )
+        registration_markers = (
+            "регистрац",
+            "зарегистр",
+            "регистрир",
+        )
+        correction_markers = (
+            "опечат",
+            "ошиб",
+            "исправлен",
+        )
+        decision_markers = (
+            "примут решение",
+            "принятия решения",
+            "принятие решения",
+            "рассмотрения заявления",
+            "рассмотрение заявления",
+            "срок предоставления",
+        )
+
+        has_payment_marker = any(marker in text_norm for marker in payment_markers)
+        has_decision_marker = any(marker in text_norm for marker in decision_markers)
+
+        if has_payment_marker and has_decision_marker:
+            return "decision_payment"
+
+        if has_payment_marker:
+            return "payment"
+
+        if any(marker in text_norm for marker in notification_markers):
+            return "notification"
+
+        if any(marker in text_norm for marker in registration_markers):
+            return "registration"
+
+        if any(marker in text_norm for marker in correction_markers):
+            return "correction"
+
+        if any(marker in text_norm for marker in decision_markers):
+            return "decision"
+
+        return "other"
+
+    def _detect_rejection_question_scope(
+        self,
+        text: str,
+    ) -> str:
+        text_norm = self._normalize_text(text)
+        if not text_norm:
+            return "service_refusal"
+
+        if "приостанов" in text_norm:
+            return "suspension"
+
+        if "отказ" in text_norm and "возобнов" in text_norm:
+            return "renewal_refusal"
+
+        if (
+            "отказа в приеме" in text_norm
+            or "отказ в приеме" in text_norm
+            or "приеме документов" in text_norm
+            or "приеме заявления" in text_norm
+            or "не принять документы" in text_norm
+            or "не примут документы" in text_norm
+            or "не принимают документы" in text_norm
+            or "не приняли документы" in text_norm
+            or "откажут принять документы" in text_norm
+            or "отказали принять документы" in text_norm
+            or "вернут документы" in text_norm
+            or "заявление не примут" in text_norm
+            or "заявление не приняли" in text_norm
+        ):
+            return "intake_refusal"
+
+        if "отказ" in text_norm or "почему могут отказать" in text_norm:
+            return "service_refusal"
+
+        return "other"
+
     def _detect_submission_channel(self, text: str) -> Optional[str]:
         """
         Detect submission channel from user question.
@@ -833,11 +1051,13 @@ class RetrievalOrchestrator:
         - documents_base
         - documents_by_submission_channel
         """
+        if intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
+            return "deadline"
+
         if intent_type != QuestionIntentEnum.DOCUMENTS_QUESTION:
             return None
 
         text = self._normalize_text(question_text)
-
         documents_markers = [
             "какие документы",
             "какие нужны документы",
@@ -859,24 +1079,149 @@ class RetrievalOrchestrator:
             return "documents_by_submission_channel"
 
         return "documents_base"
+        
+    def _wants_full_documents_list(
+        self,
+        *,
+        question_text: str,
+        intent_type: QuestionIntentEnum,
+    ) -> bool:
+        """
+        Определяет, просит ли пользователь полный / исчерпывающий /
+        построчный перечень документов, а не обычный summary.
+        """
+        if intent_type != QuestionIntentEnum.DOCUMENTS_QUESTION:
+            return False
+
+        text = self._normalize_text(question_text)
+        markers = (
+            "полный перечень",
+            "исчерпывающий перечень",
+            "весь перечень",
+            "все документы",
+            "полный список",
+            "список документов",
+            "перечень документов",
+            "комплект документов",
+            "пакет документов",
+            "весь комплект",
+            "полный комплект",
+            "все что нужно",
+            "все, что нужно",
+            "что надо принести",
+            "что нужно принести",
+            "по строкам таблицы",
+            "в полном объеме",
+        )
+        return any(marker in text for marker in markers)
 
     def _build_requested_column_hints(
         self,
         *,
         table_question_profile: Optional[str],
         submission_channel: Optional[str],
+        question_deadline_kind: Optional[str] = None,
+        wants_full_documents_list: bool = False,
     ) -> list[str]:
         """
         Hints for downstream retrieval / ranking / debug.
-
         This does not assume exact DB schema for columns.
         These are normalized semantic hints.
         """
         if table_question_profile == "documents_base":
-            return [
+            hints = [
                 "document_name",
                 "наименование документа",
             ]
+
+            if wants_full_documents_list:
+                hints.extend(
+                    [
+                        "представляемые заявителем самостоятельно",
+                        "по собственной инициативе",
+                        "документы и информация",
+                        "required",
+                        "optional",
+                    ]
+                )
+
+            return hints
+
+        if table_question_profile == "deadline":
+            hints = [
+                "deadline_value",
+                "срок",
+                "сроки",
+                "рабочих дней",
+                "календарных дней",
+            ]
+            if question_deadline_kind == "decision":
+                hints.extend(
+                    [
+                        "срок принятия решения",
+                        "срок рассмотрения",
+                        "решение о предоставлении",
+                    ]
+                )
+            elif question_deadline_kind == "decision_payment":
+                hints.extend(
+                    [
+                        "срок принятия решения",
+                        "срок рассмотрения",
+                        "решение о предоставлении",
+                        "срок предоставления государственной услуги",
+                        "максимальный срок предоставления",
+                        "срок выплаты",
+                        "выплата",
+                        "выплатят",
+                        "получу выплату",
+                    ]
+                )
+            elif question_deadline_kind == "notification":
+                hints.extend(
+                    [
+                        "срок уведомления",
+                        "уведомление",
+                        "направления уведомления",
+                        "направляется заявителю",
+                    ]
+                )
+            elif question_deadline_kind == "payment":
+                hints.extend(
+                    [
+                        "срок выплаты",
+                        "выплата",
+                        "выплатят",
+                        "получу выплату",
+                        "не позднее 26-го числа",
+                    ]
+                )
+            elif question_deadline_kind == "registration":
+                hints.extend(
+                    [
+                        "срок регистрации заявления",
+                        "срок регистрации запроса",
+                        "регистрация заявления",
+                        "регистрация запроса",
+                    ]
+                )
+            elif question_deadline_kind == "correction":
+                hints.extend(
+                    [
+                        "срок исправления ошибок",
+                        "срок исправления опечаток",
+                        "опечаток и ошибок",
+                    ]
+                )
+            else:
+                hints.extend(
+                    [
+                        "срок предоставления",
+                        "срок предоставления государственной услуги",
+                        "максимальный срок",
+                    ]
+                )
+            return hints
 
         if table_question_profile == "documents_by_submission_channel":
             mapping = {
@@ -887,7 +1232,6 @@ class RetrievalOrchestrator:
                     "при электронной подаче посредством епгу",
                     "электронной подаче",
                     "единого портала",
-                    
                 ],
                 "regional_portal": [
                     "document_name",
@@ -924,6 +1268,21 @@ class RetrievalOrchestrator:
                 ],
             }
             return mapping.get(submission_channel or "", ["document_name", "наименование документа"])
+            
+            hints = mapping.get(submission_channel or "", ["document_name", "наименование документа"])
+
+            if wants_full_documents_list:
+                hints.extend(
+                    [
+                        "представляемые заявителем самостоятельно",
+                        "по собственной инициативе",
+                        "документы и информация",
+                        "required",
+                        "optional",
+                    ]
+                )
+
+            return hints
 
         return []
 
@@ -969,7 +1328,246 @@ class RetrievalOrchestrator:
         metadata = candidate.metadata_json or {}
         actual = str(metadata.get("table_semantic_type") or "").strip().lower()
         return actual == expected_type.strip().lower()
-        
+
+    def _is_meaningful_identifier_row(self, candidate: RetrievedCandidate) -> bool:
+        """Return True only for real applicant-category rows.
+
+        Header rows inside identifiers tables often contain words like
+        "заявителей" in the column names, while result columns contain phrases
+        like "принятие решения о предоставлении".  Those values are not
+        applicant categories and must not be selected for eligibility answers.
+        """
+        if candidate.source_type != "table_row":
+            return False
+        if not self._has_table_semantic_type(candidate, "identifiers"):
+            return False
+
+        metadata = candidate.metadata_json or {}
+        category_values = self._identifier_category_values_from_metadata(metadata)
+
+        if not category_values and candidate.snippet:
+            # Last-resort fallback only for rows that explicitly look like a
+            # category row, not for full technical table dumps.
+            snippet = self._normalize_text(str(candidate.snippet).replace("_", " "))
+            if (
+                "колонки таблицы" not in snippet
+                and "идентификаторы категорий" not in snippet
+                and "наименование" not in snippet
+            ):
+                category_values.append(snippet)
+
+        for value in category_values:
+            text = " ".join(str(value).replace("_", " ").split()).strip(" .;:-")
+            if not text:
+                continue
+            normalized = self._normalize_text(text)
+            if not normalized:
+                continue
+            if self._is_identifier_header_value(normalized):
+                continue
+            if len(normalized) <= 3 and normalized.replace(".", "").isalnum():
+                continue
+            if self._looks_like_applicant_category_text(normalized):
+                return True
+
+        return False
+
+    def _identifier_category_values_from_metadata(self, metadata: dict[str, Any]) -> list[str]:
+        values: list[str] = []
+
+        def add_value(value: Any) -> None:
+            if value is None:
+                return
+            text = str(value).strip()
+            if text:
+                values.append(text)
+
+        semantic_keys = (
+            "applicant_category_name",
+            "applicant_category",
+            "category_name",
+            "наименование_значение_признаков_заявителей",
+            "наименование_отдельных_признаков_заявителей",
+            "наименование_признака_заявителя",
+            "наименование_признаков_заявителей",
+        )
+
+        for map_key in (
+            "cells_by_semantic_key",
+            "cells_by_header_normalized",
+            "cells_by_header_key",
+        ):
+            cell_map = metadata.get(map_key)
+            if not isinstance(cell_map, dict):
+                continue
+            for key in semantic_keys:
+                if key in cell_map:
+                    add_value(cell_map.get(key))
+
+        cell_map = metadata.get("cells_by_header")
+        if isinstance(cell_map, dict):
+            for key, value in cell_map.items():
+                key_norm = self._normalize_text(str(key).replace("_", " "))
+                if (
+                    "наименование" in key_norm
+                    and "признак" in key_norm
+                    and "заявител" in key_norm
+                ) or "категор" in key_norm:
+                    add_value(value)
+
+        if values:
+            return values
+
+        cells_text = metadata.get("cells_text")
+        if isinstance(cells_text, list) and len(cells_text) >= 2:
+            # Most identifiers tables have: N п/п | applicant category | result.
+            add_value(cells_text[1])
+
+        return values
+
+    def _is_identifier_header_value(self, normalized_text: str) -> bool:
+        text = " ".join(
+            str(normalized_text or "")
+            .replace("ё", "е")
+            .replace("_", " ")
+            .split()
+        ).strip()
+        if not text:
+            return True
+
+        exact_headers = {
+            "n",
+            "n п п",
+            "номер",
+            "колонка 1",
+            "колонка 2",
+            "колонка 3",
+            "идентификаторы категорий",
+            "идентификаторы категорий признаков заявителей",
+            "наименование признака заявителя",
+            "наименование значение признаков заявителей",
+            "наименование отдельных признаков заявителей",
+            "наименование признаков заявителей",
+            "категория заявителей",
+            "категории заявителей",
+            "перечень результатов предоставления государственной услуги",
+            "результат предоставления государственной услуги",
+            "принятие решения о предоставлении отказе в предоставлении мер социальной поддержки",
+            "принятие решения о предоставлении мер социальной поддержки в упреждающем проактивном порядке",
+        }
+        if text in exact_headers:
+            return True
+        if (
+            "идентификаторы категорий" in text
+            or ("наименование" in text and "признак" in text and "заявител" in text)
+        ):
+            return True
+        if "перечень результатов предоставления" in text:
+            return True
+        if "результат предоставления государственной услуги" in text:
+            return True
+        if text.startswith("принятие решения о предоставлении"):
+            return True
+        if text.startswith("принятие решения об отказе"):
+            return True
+        return False
+
+    def _looks_like_applicant_category_text(self, normalized_text: str) -> bool:
+        text = " ".join(
+            str(normalized_text or "")
+            .replace("ё", "е")
+            .replace("_", " ")
+            .split()
+        ).strip()
+        if not text:
+            return False
+        if self._is_identifier_header_value(text):
+            return False
+        if "принятие решения" in text and "предоставлен" in text:
+            return False
+
+        markers = (
+            "заявител",
+            "граждан",
+            "лиц",
+            "лицо",
+            "инвалид",
+            "ветеран",
+            "участник",
+            "труженик",
+            "пенсионер",
+            "сем",
+            "родител",
+            "ребенок",
+            "ребен",
+            "дет",
+            "женщин",
+            "мужчин",
+            "вдов",
+            "реабилит",
+            "награжден",
+            "пострадав",
+            "подвергш",
+            "проживающ",
+            "нуждающ",
+            "одинок",
+            "отсутствие",
+            "умерш",
+            "погибш",
+            "удостоенн",
+            "имеющ",
+            "получател",
+            "служб",
+            "узник",
+            "концлагер",
+            "выпускник",
+            "специалист",
+            "почетн",
+            "жител",
+            "сирот",
+            "учащ",
+            "студент",
+            "безработн",
+            "неработающ",
+            "молод",
+            "матер",
+            "мать",
+        )
+        if any(marker in text for marker in markers):
+            return True
+
+        # fix_08: в части регламентов таблица identifiers содержит
+        # категории без привычных слов «гражданин/заявитель/инвалид»,
+        # например «бывшие несовершеннолетние узники...» или
+        # «выпускники вузов...». Если значение взято именно из колонки
+        # категории заявителя, не является шапкой и не похоже на
+        # процедурный результат, принимаем его как осмысленную строку.
+        hard_noise_markers = (
+            "документ",
+            "заявлен",
+            "срок",
+            "уведом",
+            "жалоб",
+            "административн",
+            "приложен",
+            "регламент",
+            "работник",
+            "уполномоченн",
+            "межведомствен",
+            "приняти",
+            "решен",
+            "предоставлен",
+            "отказ",
+        )
+        if (
+            2 <= len(text.split()) <= 80
+            and not any(marker in text for marker in hard_noise_markers)
+            and any(ch.isalpha() for ch in text)
+        ):
+            return True
+
+        return False
+
     def _looks_like_service_documents_row(self, candidate: RetrievedCandidate) -> bool:
         text = self._candidate_text_blob(candidate)
 
@@ -991,6 +1589,33 @@ class RetrievalOrchestrator:
             ]
             if any(marker in text for marker in real_doc_markers):
                 return False
+            return True
+
+        return False
+        
+    def _looks_like_service_deadline_row(self, candidate: RetrievedCandidate) -> bool:
+        metadata = candidate.metadata_json or {}
+        cells = metadata.get("cells_by_semantic_key") or metadata.get("cells_by_header_key") or {}
+        if not isinstance(cells, dict):
+            return False
+
+        service_values = {
+            "срок",
+            "сроки",
+            "срок предоставления",
+            "срок предоставления государственной услуги",
+            "максимальный срок",
+            "рабочих дней",
+            "календарных дней",
+        }
+
+        for value in cells.values():
+            normalized = self._normalize_text(value)
+            if normalized in service_values:
+                return True
+
+        text_blob = self._normalize_text(self._candidate_text_blob(candidate))
+        if text_blob.startswith("срок ") and len(text_blob.split()) <= 4:
             return True
 
         return False
@@ -1062,7 +1687,55 @@ class RetrievalOrchestrator:
                 "required_documents",
                 "documents_for_service",
             ]
+
+        if intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION:
+            return [
+                "identifiers",
+                "applicant_categories",
+                "категории заявителей",
+                "признаки заявителей",
+                "имеет право",
+                "заявители",
+            ]
+
         return []
+
+    # --------------------------------------------------------
+    # Service-aware retrieval helpers
+    # --------------------------------------------------------
+
+    def _get_resolved_service_key(
+        self,
+        payload: RetrievalInput,
+    ) -> Optional[str]:
+        """
+        Return service_key only when service resolver made a confident choice.
+
+        Ambiguous / not_found resolutions must not hard-filter retrieval,
+        otherwise the system may silently answer from the wrong service.
+        """
+        service_resolution = (payload.constraints_json or {}).get("service_resolution")
+        if not isinstance(service_resolution, dict):
+            return None
+
+        if service_resolution.get("resolution_status") != "resolved":
+            return None
+
+        service_key = service_resolution.get("service_key")
+        if not isinstance(service_key, str) or not service_key.strip():
+            return None
+
+        return service_key.strip()
+
+    def _apply_service_key_filter(
+        self,
+        stmt: Any,
+        payload: RetrievalInput,
+    ) -> Any:
+        service_key = self._get_resolved_service_key(payload)
+        if not service_key:
+            return stmt
+        return stmt.where(DocumentRegistry.service_key == service_key)
 
     # --------------------------------------------------------
     # Branch retrieval
@@ -1075,17 +1748,7 @@ class RetrievalOrchestrator:
         strategy: RetrievalStrategy,
         query_bundle: dict[str, Any],
     ) -> list[RetrievedCandidate]:
-        """
-        Retrieve from normalized legal facts.
-
-        Priority:
-        - active documents only
-        - measure_code exact match if present
-        - subject_category exact match if present
-        - fact_type boosts depending on intent
-        """
         text_terms = query_bundle["query_terms"]
-        measure_code = query_bundle["measure_code"]
         subject_category = query_bundle["subject_category_code"]
 
         stmt = (
@@ -1095,7 +1758,6 @@ class RetrievalOrchestrator:
                 DocumentRegistry.document_name.label("document_name"),
                 DocumentRegistry.doc_uid_base.label("doc_uid_base"),
                 DocumentRegistry.revision_date.label("revision_date"),
-                LegalFact.measure_code.label("measure_code"),
                 LegalFact.subject_category.label("subject_category"),
                 LegalFact.fact_type.label("title"),
                 LegalFact.validity_note.label("snippet"),
@@ -1104,7 +1766,6 @@ class RetrievalOrchestrator:
                 (
                     self._fact_match_score_expr(
                         text_terms=text_terms,
-                        measure_code=measure_code,
                         subject_category=subject_category,
                         intent_type=payload.intent_type,
                     ) * strategy.facts_weight
@@ -1113,14 +1774,7 @@ class RetrievalOrchestrator:
             .join(DocumentRegistry, DocumentRegistry.document_id == LegalFact.document_id)
             .where(DocumentRegistry.status == "active")
         )
-
-        if measure_code:
-            stmt = stmt.where(
-                or_(
-                    LegalFact.measure_code == measure_code,
-                    LegalFact.measure_code.is_(None),
-                )
-            )
+        stmt = self._apply_service_key_filter(stmt, payload)
 
         if subject_category:
             stmt = stmt.where(
@@ -1150,7 +1804,6 @@ class RetrievalOrchestrator:
                     document_name=row["document_name"],
                     doc_uid_base=row["doc_uid_base"],
                     revision_date=self._datetime_to_iso(row["revision_date"]),
-                    measure_code=row["measure_code"],
                     subject_category=row["subject_category"],
                     title=row["title"],
                     snippet=row["snippet"],
@@ -1167,9 +1820,6 @@ class RetrievalOrchestrator:
         strategy: RetrievalStrategy,
         query_bundle: dict[str, Any],
     ) -> list[RetrievedCandidate]:
-        """
-        Retrieve tables by title/summary/preview plus document filters.
-        """
         text_terms = query_bundle["query_terms"]
 
         stmt = (
@@ -1179,7 +1829,6 @@ class RetrievalOrchestrator:
                 DocumentRegistry.document_name.label("document_name"),
                 DocumentRegistry.doc_uid_base.label("doc_uid_base"),
                 DocumentRegistry.revision_date.label("revision_date"),
-                literal(None).label("measure_code"),
                 literal(None).label("subject_category"),
                 DocumentTable.table_title.label("title"),
                 DocumentTable.summary.label("snippet"),
@@ -1192,12 +1841,37 @@ class RetrievalOrchestrator:
             .join(DocumentRegistry, DocumentRegistry.document_id == DocumentTable.document_id)
             .where(DocumentRegistry.status == "active")
         )
+        stmt = self._apply_service_key_filter(stmt, payload)
 
-        if payload.measure_code:
+        if payload.intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION:
+            # Для вопросов о документах источник истины — таблица перечня документов.
+            # Без этого в evidence попадают таблицы категорий заявителей только потому,
+            # что в них встречаются слова из вопроса: «ветеран», «край», «труд».
             stmt = stmt.where(
                 or_(
-                    DocumentTable.metadata_json["measure_code"].astext == payload.measure_code,
-                    DocumentTable.metadata_json["measure_code"].astext.is_(None),
+                    DocumentTable.metadata_json["table_semantic_type"].astext == "documents",
+                    DocumentTable.table_type == "documents_table",
+                )
+            )
+
+        if payload.intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION:
+            # Для вопросов о праве на меру главный структурный источник —
+            # таблица идентификаторов категорий заявителей. Документные таблицы
+            # здесь дают шум: вместо ответа о праве пользователь получает
+            # фрагменты перечня документов.
+            stmt = stmt.where(
+                or_(
+                    DocumentTable.metadata_json["table_semantic_type"].astext.in_(
+                        ["identifiers", "applicant_categories", "categories"]
+                    ),
+                    DocumentTable.table_type == "identifiers",
+                )
+            )
+
+        if payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION:
+            stmt = stmt.where(
+                DocumentTable.metadata_json["table_semantic_type"].astext.in_(
+                    ["refusal_reasons", "rejection_reasons"]
                 )
             )
 
@@ -1236,16 +1910,53 @@ class RetrievalOrchestrator:
         strategy: RetrievalStrategy,
         query_bundle: dict[str, Any],
     ) -> list[RetrievedCandidate]:
-        """
-        Retrieve row-level evidence.
-
-        Important for:
-        - documents_question
-        - form_question
-        - deadline_question
-        where exact row selection often matters.
-        """
         text_terms = query_bundle["query_terms"]
+
+        wants_full_documents_list = bool(query_bundle.get("wants_full_documents_list"))
+        is_documents_question = payload.intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION
+        question_rejection_scope = query_bundle.get("question_rejection_scope")
+
+        row_score_expr = self._row_match_score_expr(text_terms=text_terms) * strategy.rows_weight
+
+        if is_documents_question:
+            # Для service-aware documents-path важно не потерять базовые строки таблицы 2,
+            # даже если в них нет слов из вопроса («ветеран труда края», «ЕДВ»).
+            # Лексика пользователя помогает ранжировать, но принадлежность строке
+            # перечня документов должна давать ненулевой базовый вес.
+            row_score_expr = row_score_expr + case(
+                (
+                    DocumentTableRow.metadata_json["table_semantic_type"].astext == "documents",
+                    0.75,
+                ),
+                else_=0.0,
+            )
+
+        if payload.intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION:
+            # Даже если в конкретной строке таблицы 1 нет всех слов вопроса,
+            # принадлежность к identifiers уже является сильным сигналом: это
+            # регламентная таблица категорий заявителей.
+            row_score_expr = row_score_expr + case(
+                (
+                    DocumentTableRow.metadata_json["table_semantic_type"].astext.in_(
+                        ["identifiers", "applicant_categories", "categories"]
+                    ),
+                    0.75,
+                ),
+                else_=0.0,
+            )
+
+        if (
+            payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION
+            and question_rejection_scope
+            and question_rejection_scope != "other"
+        ):
+            row_score_expr = row_score_expr + case(
+                (
+                    DocumentTableRow.metadata_json["row_scope"].astext == question_rejection_scope,
+                    0.55,
+                ),
+                else_=0.0,
+            )
 
         stmt = (
             select(
@@ -1254,29 +1965,51 @@ class RetrievalOrchestrator:
                 DocumentRegistry.document_name.label("document_name"),
                 DocumentRegistry.doc_uid_base.label("doc_uid_base"),
                 DocumentRegistry.revision_date.label("revision_date"),
-                literal(None).label("measure_code"),
                 literal(None).label("subject_category"),
                 literal("table_row").label("title"),
                 DocumentTableRow.row_summary.label("snippet"),
                 DocumentTableRow.citation_json.label("citation_json"),
                 DocumentTableRow.metadata_json.label("metadata_json"),
-                (
-                    self._row_match_score_expr(text_terms=text_terms) * strategy.rows_weight
-                ).label("score"),
+                row_score_expr.label("score"),
             )
             .join(DocumentRegistry, DocumentRegistry.document_id == DocumentTableRow.document_id)
             .where(DocumentRegistry.status == "active")
         )
+        stmt = self._apply_service_key_filter(stmt, payload)
 
-        if payload.measure_code:
+        if is_documents_question:
             stmt = stmt.where(
-                or_(
-                    DocumentTableRow.metadata_json["measure_code"].astext == payload.measure_code,
-                    DocumentTableRow.metadata_json["measure_code"].astext.is_(None),
+                DocumentTableRow.metadata_json["table_semantic_type"].astext == "documents"
+            )
+
+        if payload.intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION:
+            # В текущем корпусе для ответа о праве на конкретную услугу
+            # используем строки таблицы identifiers. Это предотвращает уход
+            # в документы/формы и даёт пользователю категории заявителей.
+            stmt = stmt.where(
+                DocumentTableRow.metadata_json["table_semantic_type"].astext.in_(
+                    ["identifiers", "applicant_categories", "categories"]
                 )
             )
 
-        stmt = stmt.order_by(desc("score")).limit(payload.top_k_rows)
+        if payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION:
+            stmt = stmt.where(
+                DocumentTableRow.metadata_json["table_semantic_type"].astext.in_(
+                    ["refusal_reasons", "rejection_reasons"]
+                )
+            )
+
+            if question_rejection_scope and question_rejection_scope != "other":
+                stmt = stmt.where(
+                    DocumentTableRow.metadata_json["row_scope"].astext == question_rejection_scope
+                )
+
+        rows_limit = payload.top_k_rows
+
+        if is_documents_question and (wants_full_documents_list or self._get_resolved_service_key(payload)):
+            rows_limit = max(payload.top_k_rows, 48)
+
+        stmt = stmt.order_by(desc("score")).limit(rows_limit)
 
         result = await self.db.execute(stmt)
         rows = result.mappings().all()
@@ -1311,15 +2044,6 @@ class RetrievalOrchestrator:
         strategy: RetrievalStrategy,
         query_bundle: dict[str, Any],
     ) -> list[RetrievedCandidate]:
-        """
-        Retrieve paragraph/list/heading level blocks.
-
-        Blocks remain useful for:
-        - explanatory norms
-        - procedure descriptions
-        - appeal rules
-        - narrative fallback when no exact structured object exists
-        """
         text_terms = query_bundle["query_terms"]
 
         stmt = (
@@ -1329,7 +2053,6 @@ class RetrievalOrchestrator:
                 DocumentRegistry.document_name.label("document_name"),
                 DocumentRegistry.doc_uid_base.label("doc_uid_base"),
                 DocumentRegistry.revision_date.label("revision_date"),
-                literal(None).label("measure_code"),
                 literal(None).label("subject_category"),
                 DocumentBlock.block_type.label("title"),
                 DocumentBlock.content_clean.label("snippet"),
@@ -1345,6 +2068,7 @@ class RetrievalOrchestrator:
             .join(DocumentRegistry, DocumentRegistry.document_id == DocumentBlock.document_id)
             .where(DocumentRegistry.status == "active")
         )
+        stmt = self._apply_service_key_filter(stmt, payload)
 
         stmt = stmt.order_by(desc("score")).limit(payload.top_k_blocks)
 
@@ -1384,7 +2108,6 @@ class RetrievalOrchestrator:
         self,
         *,
         text_terms: list[str],
-        measure_code: Optional[str],
         subject_category: Optional[str],
         intent_type: QuestionIntentEnum,
     ):
@@ -1399,12 +2122,6 @@ class RetrievalOrchestrator:
         """
         score = literal(0.0)
 
-        if measure_code:
-            score = score + case(
-                (LegalFact.measure_code == measure_code, 1.0),
-                else_=0.0,
-            )
-
         if subject_category:
             score = score + case(
                 (LegalFact.subject_category == subject_category, 0.7),
@@ -1418,7 +2135,20 @@ class RetrievalOrchestrator:
             )
         elif intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
             score = score + case(
-                (LegalFact.fact_type.in_(["deadline", "review_period", "payment_deadline"]), 0.9),
+                (
+                    LegalFact.fact_type.in_(
+                        [
+                            "deadline",
+                            "review_period",
+                            "decision_deadline",
+                            "notification_deadline",
+                            "payment_deadline",
+                            "registration_deadline",
+                            "correction_deadline",
+                        ]
+                    ),
+                    0.9,
+                ),
                 else_=0.0,
             )
         elif intent_type == QuestionIntentEnum.REJECTION_QUESTION:
@@ -1504,7 +2234,9 @@ class RetrievalOrchestrator:
     ):
         score = literal(0.0)
 
-        for term in text_terms[:6]:
+        term_window = text_terms[:10] if intent_type == QuestionIntentEnum.DEADLINE_QUESTION else text_terms[:6]
+
+        for term in term_window:
             like_term = f"%{term}%"
             score = score + case(
                 (
@@ -1513,6 +2245,45 @@ class RetrievalOrchestrator:
                 ),
                 else_=0.0,
             )
+
+        if intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
+            score = score + case(
+                (
+                    or_(
+                        DocumentBlock.content_clean.ilike("%в течение%"),
+                        DocumentBlock.content_clean.ilike("%не позднее%"),
+                        DocumentBlock.content_clean.ilike("%не более%"),
+                        DocumentBlock.content_clean.ilike("%рабочих дней%"),
+                        DocumentBlock.content_clean.ilike("%календарных дней%"),
+                        DocumentBlock.content_clean.ilike("%26-го числа%"),
+                        DocumentBlock.content_clean.ilike("%26 числа%"),
+                    ),
+                    0.45,
+                ),
+                else_=0.0,
+            )
+
+            score = score + case(
+                (
+                    or_(
+                        DocumentBlock.content_clean.ilike("%уведом%"),
+                        DocumentBlock.content_clean.ilike("%сообщение о решении%"),
+                        DocumentBlock.content_clean.ilike("%выплат%"),
+                        DocumentBlock.content_clean.ilike("%перечисл%"),
+                        DocumentBlock.content_clean.ilike("%зачисл%"),
+                        DocumentBlock.content_clean.ilike("%решение о предоставлении%"),
+                        DocumentBlock.content_clean.ilike("%решение о назначении%"),
+                    ),
+                    0.25,
+                ),
+                else_=0.0,
+            )
+
+            score = score + case(
+                (DocumentBlock.block_type.in_(["paragraph", "list"]), 0.18),
+                else_=0.0,
+            )
+            return score
 
         if intent_type in {
             QuestionIntentEnum.PROCEDURE_QUESTION,
@@ -1799,133 +2570,370 @@ class RetrievalOrchestrator:
         return selected_document_ids
 
     def _select_final_candidates(
-            self,
-            *,
-            payload: RetrievalInput,
-            strategy: RetrievalStrategy,
-            candidates: list[RetrievedCandidate],
-            document_stats: dict[UUID, dict[str, Any]],
-            priority_document_ids: list[UUID],
-        ) -> list[RetrievedCandidate]:
-            """
-            Select final balanced evidence set.
+        self,
+        *,
+        payload: RetrievalInput,
+        strategy: RetrievalStrategy,
+        query_bundle: dict[str, Any],
+        candidates: list[RetrievedCandidate],
+        document_stats: dict[UUID, dict[str, Any]],
+        priority_document_ids: list[UUID],
+    ) -> list[RetrievedCandidate]:
+        """
+        Select final balanced evidence set.
 
-            Special rule for DOCUMENTS_QUESTION:
-            - prefer table_row evidence from the priority document
-            - allow a noticeably larger pool of row candidates
-            - suppress noisy blocks/facts because deterministic builder
-              needs rows, not a mixed bag of snippets
-            """
-            if not candidates:
-                return []
+        Специальное правило для DEADLINE_QUESTION:
+        - первыми берём реальные temporal blocks и deadline rows;
+        - режем deadline-noise из таблиц отказов/сокращений;
+        - не заставляем builder жить только на table_row, потому что
+          в текущем документе сроки часто лежат в list_item блоках.
+        """
+        if not candidates:
+            return []
 
-            is_documents_question = payload.intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION
+        is_documents_question = payload.intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION
+        is_deadline_question = payload.intent_type == QuestionIntentEnum.DEADLINE_QUESTION
+        is_rejection_question = payload.intent_type == QuestionIntentEnum.REJECTION_QUESTION
+        is_eligibility_question = payload.intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION
+        wants_full_documents_list = bool(query_bundle.get("wants_full_documents_list"))
+        resolved_service_key = self._get_resolved_service_key(payload)
 
-            if is_documents_question:
-                # Для questions типа "какие документы нужны..."
-                # builder должен получить достаточный пул row-кандидатов.
+        if is_documents_question:
+            if wants_full_documents_list:
+                type_caps = {
+                    "legal_fact": 0,
+                    "table": 1,
+                    "table_row": max(30, payload.final_top_k),
+                    "block": 0,
+                }
+            elif resolved_service_key:
+                type_caps = {
+                    "legal_fact": 0,
+                    "table": 1,
+                    "table_row": max(18, payload.final_top_k),
+                    "block": 0,
+                }
+            else:
                 type_caps = {
                     "legal_fact": 1,
                     "table": min(2, payload.final_top_k),
                     "table_row": min(max(10, payload.final_top_k), 14),
                     "block": 1,
                 }
-            else:
-                type_caps = {
-                    "legal_fact": max(2, min(5, payload.final_top_k)),
-                    "table": max(2, min(4, payload.final_top_k)),
-                    "table_row": max(2, min(5, payload.final_top_k)),
-                    "block": max(2, min(5, payload.final_top_k)),
-                }
+        elif is_deadline_question:
+            type_caps = {
+                "legal_fact": 1,
+                "table": 1,
+                "table_row": min(5, payload.final_top_k),
+                "block": min(8, payload.final_top_k),
+            }
+        elif is_rejection_question:
+            type_caps = {
+                "legal_fact": 0,
+                "table": 1,
+                "table_row": min(max(8, payload.final_top_k), 12),
+                "block": 0,
+            }
+        elif is_eligibility_question:
+            # Для вопросов «могу ли получить / подать заявление» источник
+            # ответа — строки таблицы identifiers. Табличная шапка, block-и
+            # и legal_fact-и часто добавляют в ответ технический или общий шум.
+            type_caps = {
+                "legal_fact": 0,
+                "table": 0,
+                "table_row": min(max(6, payload.final_top_k), 10),
+                "block": 0,
+            }
+        else:
+            type_caps = {
+                "legal_fact": max(2, min(5, payload.final_top_k)),
+                "table": max(2, min(4, payload.final_top_k)),
+                "table_row": max(2, min(5, payload.final_top_k)),
+                "block": max(2, min(5, payload.final_top_k)),
+            }
 
-            priority_document_set = set(priority_document_ids)
-            min_score_threshold = self._get_min_candidate_score_threshold(
-                payload=payload,
-                strategy=strategy,
-                document_stats=document_stats,
+        priority_document_set = set(priority_document_ids)
+        min_score_threshold = self._get_min_candidate_score_threshold(
+            payload=payload,
+            strategy=strategy,
+            document_stats=document_stats,
+        )
+
+        ordered_candidates = list(candidates)
+
+        if is_deadline_question:
+            question_deadline_kind = str(
+                query_bundle.get("question_deadline_kind") or "other"
+            )
+            ordered_candidates.sort(
+                key=lambda candidate: (
+                    self._deadline_candidate_priority_bucket(
+                        candidate,
+                        question_deadline_kind=question_deadline_kind,
+                        priority_document_set=priority_document_set,
+                    ),
+                    -self._candidate_effective_score(candidate),
+                )
+            )
+        elif is_rejection_question:
+            question_rejection_scope = str(
+                query_bundle.get("question_rejection_scope") or "service_refusal"
+            )
+            ordered_candidates.sort(
+                key=lambda candidate: (
+                    self._rejection_candidate_priority_bucket(
+                        candidate,
+                        question_rejection_scope=question_rejection_scope,
+                        priority_document_set=priority_document_set,
+                    ),
+                    -self._candidate_effective_score(candidate),
+                )
+            )
+        elif is_eligibility_question:
+            ordered_candidates.sort(
+                key=lambda candidate: (
+                    0 if (
+                        candidate.document_id in priority_document_set
+                        and candidate.source_type == "table_row"
+                        and self._has_table_semantic_type(candidate, "identifiers")
+                    ) else 1 if (
+                        candidate.source_type == "table_row"
+                        and self._has_table_semantic_type(candidate, "identifiers")
+                    ) else 2,
+                    int((candidate.metadata_json or {}).get("row_order") or 10**9),
+                    -self._candidate_effective_score(candidate),
+                )
             )
 
-            priority_candidates: list[RetrievedCandidate] = []
-            non_priority_candidates: list[RetrievedCandidate] = []
-
-            for candidate in candidates:
-                if candidate.document_id in priority_document_set:
-                    priority_candidates.append(candidate)
-                else:
-                    non_priority_candidates.append(candidate)
-
-            ordered_candidates = [*priority_candidates, *non_priority_candidates]
-
-            # Для documents-question поднимаем наверх table_row из documents-table,
-            # чтобы сначала отбирать именно answer-bearing rows.
-            if is_documents_question:
+        if is_documents_question:
+            if wants_full_documents_list:
                 ordered_candidates.sort(
                     key=lambda candidate: (
                         0 if (
                             candidate.document_id in priority_document_set
                             and candidate.source_type == "table_row"
                             and self._has_table_semantic_type(candidate, "documents")
-                        ) else
-                        1 if (
+                        ) else 1 if (
                             candidate.document_id in priority_document_set
                             and candidate.source_type == "table"
                             and self._has_table_semantic_type(candidate, "documents")
-                        ) else
-                        2 if candidate.document_id in priority_document_set else 3,
+                        ) else 2,
+                        0 if str((candidate.metadata_json or {}).get("requirement_group") or "").strip().lower() == "required"
+                        else 1 if str((candidate.metadata_json or {}).get("requirement_group") or "").strip().lower() == "optional"
+                        else 2,
+                        int((candidate.metadata_json or {}).get("row_order") or 10**9),
+                        -self._candidate_effective_score(candidate),
+                    )
+                )
+            else:
+                ordered_candidates.sort(
+                    key=lambda candidate: (
+                        0 if (
+                            candidate.document_id in priority_document_set
+                            and candidate.source_type == "table_row"
+                            and self._has_table_semantic_type(candidate, "documents")
+                        ) else 1 if (
+                            candidate.document_id in priority_document_set
+                            and candidate.source_type == "table"
+                            and self._has_table_semantic_type(candidate, "documents")
+                        ) else 2 if candidate.document_id in priority_document_set else 3,
                         -self._candidate_effective_score(candidate),
                     )
                 )
 
-            selected: list[RetrievedCandidate] = []
-            selected_keys: set[tuple[str, UUID]] = set()
-            type_counts: dict[str, int] = {}
-            document_counts: dict[UUID, int] = {}
+        selected: list[RetrievedCandidate] = []
+        selected_keys: set[tuple[str, UUID]] = set()
+        type_counts: dict[str, int] = {}
+        document_counts: dict[UUID, int] = {}
 
+        target_final_top_k = payload.final_top_k
+        if is_documents_question and wants_full_documents_list:
+            target_final_top_k = max(payload.final_top_k, 32)
+        elif is_documents_question and resolved_service_key:
+            target_final_top_k = max(payload.final_top_k, 18)
+
+        for candidate in ordered_candidates:
+            candidate_key = (candidate.source_type, candidate.source_id)
+            if candidate_key in selected_keys:
+                continue
+
+            effective_score = self._candidate_effective_score(candidate)
+            if effective_score < min_score_threshold:
+                continue
+
+            if is_deadline_question and self._is_deadline_noise_candidate(candidate):
+                continue
+
+            if is_rejection_question:
+                candidate_row_scope = self._candidate_row_scope(candidate)
+                question_rejection_scope = str(
+                    query_bundle.get("question_rejection_scope") or "service_refusal"
+                )
+                if (
+                    candidate.source_type == "table_row"
+                    and candidate_row_scope
+                    and question_rejection_scope != "other"
+                    and candidate_row_scope != question_rejection_scope
+                ):
+                    continue
+
+            if is_documents_question:
+                if candidate.source_type == "table_row" and not self._has_table_semantic_type(candidate, "documents"):
+                    continue
+                if candidate.source_type == "table" and not self._has_table_semantic_type(candidate, "documents"):
+                    continue
+                if candidate.source_type in {"block", "legal_fact"} and resolved_service_key:
+                    continue
+
+            if is_eligibility_question:
+                if self._is_form_candidate(candidate):
+                    continue
+                if candidate.source_type != "table_row":
+                    continue
+                if not self._has_table_semantic_type(candidate, "identifiers"):
+                    continue
+                if not self._is_meaningful_identifier_row(candidate):
+                    continue
+
+            if is_deadline_question:
+                has_temporal_markers = self._has_temporal_deadline_markers(candidate)
+                is_deadline_table = self._has_table_semantic_type(candidate, "deadline") or self._has_table_semantic_type(candidate, "deadlines")
+                if candidate.source_type == "block" and not has_temporal_markers:
+                    continue
+                if candidate.source_type == "table_row" and not has_temporal_markers:
+                    continue
+                if candidate.source_type == "table" and not is_deadline_table:
+                    continue
+
+            current_type_count = type_counts.get(candidate.source_type, 0)
+            if current_type_count >= type_caps.get(candidate.source_type, payload.final_top_k):
+                continue
+
+            current_doc_count = document_counts.get(candidate.document_id, 0)
+            if is_documents_question:
+                if wants_full_documents_list:
+                    max_per_document = 40 if candidate.document_id in priority_document_set else 12
+                elif resolved_service_key:
+                    max_per_document = 20 if candidate.document_id in priority_document_set else 4
+                else:
+                    max_per_document = 12 if candidate.document_id in priority_document_set else 4
+            elif is_deadline_question:
+                max_per_document = 8 if candidate.document_id in priority_document_set else 1
+            elif is_rejection_question:
+                max_per_document = 10 if candidate.document_id in priority_document_set else 3
+            elif is_eligibility_question:
+                max_per_document = 8 if candidate.document_id in priority_document_set else 2
+            else:
+                max_per_document = 6 if candidate.document_id in priority_document_set else 3
+
+            if current_doc_count >= max_per_document:
+                continue
+
+            if (
+                is_deadline_question
+                and priority_document_set
+                and candidate.document_id not in priority_document_set
+                and len(selected) >= 4
+            ):
+                continue
+
+            if (
+                is_rejection_question
+                and priority_document_set
+                and candidate.document_id not in priority_document_set
+                and len(selected) >= 6
+            ):
+                continue
+
+            selected.append(candidate)
+            selected_keys.add(candidate_key)
+            type_counts[candidate.source_type] = current_type_count + 1
+            document_counts[candidate.document_id] = current_doc_count + 1
+
+            if len(selected) >= target_final_top_k:
+                break
+
+        if len(selected) < min(3, target_final_top_k):
             for candidate in ordered_candidates:
+                if len(selected) >= target_final_top_k:
+                    break
                 candidate_key = (candidate.source_type, candidate.source_id)
                 if candidate_key in selected_keys:
                     continue
-
-                effective_score = self._candidate_effective_score(candidate)
-                if effective_score < min_score_threshold:
+                if is_deadline_question and self._is_deadline_noise_candidate(candidate):
                     continue
-
-                current_type_count = type_counts.get(candidate.source_type, 0)
-                if current_type_count >= type_caps.get(candidate.source_type, payload.final_top_k):
-                    continue
-
-                current_doc_count = document_counts.get(candidate.document_id, 0)
+                if is_rejection_question:
+                    candidate_row_scope = self._candidate_row_scope(candidate)
+                    question_rejection_scope = str(
+                        query_bundle.get("question_rejection_scope") or "service_refusal"
+                    )
+                    if (
+                        candidate.source_type == "table_row"
+                        and candidate_row_scope
+                        and question_rejection_scope != "other"
+                        and candidate_row_scope != question_rejection_scope
+                    ):
+                        continue
                 if is_documents_question:
-                    max_per_document = 12 if candidate.document_id in priority_document_set else 4
-                else:
-                    max_per_document = 6 if candidate.document_id in priority_document_set else 3
-
-                if current_doc_count >= max_per_document:
-                    continue
-
-                selected.append(candidate)
-                selected_keys.add(candidate_key)
-                type_counts[candidate.source_type] = current_type_count + 1
-                document_counts[candidate.document_id] = current_doc_count + 1
-
-                if len(selected) >= payload.final_top_k:
-                    break
-
-            # Fallback: если балансировка оказалась слишком строгой,
-            # добираем ещё кандидатов без type/doc caps, но только до final_top_k.
-            if len(selected) < min(3, payload.final_top_k):
-                for candidate in ordered_candidates:
-                    if len(selected) >= payload.final_top_k:
-                        break
-
-                    candidate_key = (candidate.source_type, candidate.source_id)
-                    if candidate_key in selected_keys:
+                    if candidate.source_type == "table_row" and not self._has_table_semantic_type(candidate, "documents"):
+                        continue
+                    if candidate.source_type == "table" and not self._has_table_semantic_type(candidate, "documents"):
+                        continue
+                    if candidate.source_type in {"block", "legal_fact"} and resolved_service_key:
                         continue
 
-                    selected.append(candidate)
-                    selected_keys.add(candidate_key)
+                if is_eligibility_question:
+                    if self._is_form_candidate(candidate):
+                        continue
+                    if candidate.source_type != "table_row":
+                        continue
+                    if not self._has_table_semantic_type(candidate, "identifiers"):
+                        continue
+                    if not self._is_meaningful_identifier_row(candidate):
+                        continue
 
-            return selected
+                if is_deadline_question:
+                    has_temporal_markers = self._has_temporal_deadline_markers(candidate)
+                    is_deadline_table = self._has_table_semantic_type(candidate, "deadline") or self._has_table_semantic_type(candidate, "deadlines")
+                    if candidate.source_type == "block" and not has_temporal_markers:
+                        continue
+                    if candidate.source_type == "table_row" and not has_temporal_markers:
+                        continue
+                    if candidate.source_type == "table" and not is_deadline_table:
+                        continue
+                    if priority_document_set and candidate.document_id not in priority_document_set and len(selected) >= 4:
+                        continue
+                selected.append(candidate)
+                selected_keys.add(candidate_key)
+
+        if is_eligibility_question:
+            selected = self._hard_filter_eligibility_candidates(selected)
+
+        return selected
+
+    def _hard_filter_eligibility_candidates(
+        self,
+        candidates: list[RetrievedCandidate],
+    ) -> list[RetrievedCandidate]:
+        """Keep only real identifiers table rows for eligibility answers."""
+        filtered: list[RetrievedCandidate] = []
+        seen: set[tuple[str, UUID]] = set()
+
+        for candidate in candidates:
+            if candidate.source_type != "table_row":
+                continue
+            if not self._has_table_semantic_type(candidate, "identifiers"):
+                continue
+            if not self._is_meaningful_identifier_row(candidate):
+                continue
+
+            key = (candidate.source_type, candidate.source_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            filtered.append(candidate)
+
+        return filtered
 
     def _build_evidence_package(
         self,
@@ -1940,6 +2948,9 @@ class RetrievalOrchestrator:
         document_stats: dict[UUID, dict[str, Any]],
         priority_document_ids: list[UUID],
     ) -> EvidencePackage:
+        if strategy.strategy_code == "eligibility_priority":
+            final_candidates = self._hard_filter_eligibility_candidates(final_candidates)
+
         fact_ids: list[UUID] = []
         table_ids: list[UUID] = []
         row_ids: list[UUID] = []
@@ -1997,7 +3008,12 @@ class RetrievalOrchestrator:
             if self._candidate_effective_score(candidate) >= strong_candidate_threshold
         )
 
+        service_resolution = (payload.constraints_json or {}).get("service_resolution")
+        service_filter_key = self._get_resolved_service_key(payload)
+
         metrics_json = {
+            "service_filter_applied": service_filter_key is not None,
+            "service_filter_key": service_filter_key,
             "raw_candidates_count": len(raw_candidates),
             "merged_candidates_count": len(merged_candidates),
             "reranked_candidates_count": len(reranked_candidates),
@@ -2020,6 +3036,9 @@ class RetrievalOrchestrator:
 
         debug_payload_json = {
             "strategy_code": strategy.strategy_code,
+            "service_resolution": service_resolution if isinstance(service_resolution, dict) else None,
+            "service_filter_applied": service_filter_key is not None,
+            "service_filter_key": service_filter_key,
             "priority_document_ids": [str(x) for x in priority_document_ids],
             "evidence_quality": evidence_quality,
             "guard_reason": guard_reason,
@@ -2030,6 +3049,7 @@ class RetrievalOrchestrator:
                 "submission_channel": query_bundle.get("submission_channel"),
                 "requested_column_hints": query_bundle.get("requested_column_hints"),
                 "table_scope_hints": query_bundle.get("table_scope_hints"),
+                "question_rejection_scope": query_bundle.get("question_rejection_scope"),
             },
             "selected_candidates_preview": [
                 {
@@ -2049,6 +3069,8 @@ class RetrievalOrchestrator:
                         "table_number": (c.metadata_json or {}).get("table_number"),
                         "appendix_number": (c.metadata_json or {}).get("appendix_number"),
                         "row_summary": (c.metadata_json or {}).get("row_summary"),
+                        "row_scope": (c.metadata_json or {}).get("row_scope"),
+                        "row_scope_source": (c.metadata_json or {}).get("row_scope_source"),
                         "table_semantic_type": (c.metadata_json or {}).get("table_semantic_type"),
                         "column_headers": (c.metadata_json or {}).get("column_headers"),
                         "cells_text": (c.metadata_json or {}).get("cells_text"),
@@ -2267,10 +3289,9 @@ class RetrievalOrchestrator:
         """
         Local intent-aware rerank.
 
-        Goal:
-        - strengthen answer-bearing rows/tables
-        - suppress noisy blocks
-        - especially improve document-table retrieval
+        Для deadline-question здесь важны две вещи:
+        1) выкинуть ложные "сроковые" совпадения из таблиц отказов/сокращений;
+        2) поднять реальные temporal blocks и настоящие deadline rows.
         """
         if not candidates:
             return candidates
@@ -2279,33 +3300,32 @@ class RetrievalOrchestrator:
         table_question_profile = query_bundle.get("table_question_profile")
         submission_channel = query_bundle.get("submission_channel")
         requested_column_hints = query_bundle.get("requested_column_hints") or []
-
+        question_norm = self._normalize_text(payload.question_text_normalized or payload.question_text_raw)
+        question_deadline_kind = self._detect_deadline_question_kind(question_norm)
+        question_rejection_scope = str(
+            query_bundle.get("question_rejection_scope")
+            or self._detect_rejection_question_scope(question_norm)
+            or "service_refusal"
+        )
         reranked: list[RetrievedCandidate] = []
 
         for candidate in candidates:
             score = candidate.rerank_score if candidate.rerank_score is not None else candidate.score
             text = self._candidate_text_blob(candidate)
-
-            # -------------------------------
-            # Global source priors
-            # -------------------------------
+            text_norm = self._normalize_text(text)
+            metadata = candidate.metadata_json or {}
             if candidate.source_type == "table_row":
                 score += 0.05
             elif candidate.source_type == "table":
                 score += 0.03
 
-            # -------------------------------
-            # Documents questions
-            # -------------------------------
             if intent_type == QuestionIntentEnum.DOCUMENTS_QUESTION:
-                # Strong positive signal: extractor already classified table as documents
                 if self._has_table_semantic_type(candidate, "documents"):
                     if candidate.source_type == "table_row":
                         score += 0.65
                     elif candidate.source_type == "table":
                         score += 0.35
 
-                # Strong negative signal: abbreviations table is not an answer to document list question
                 if self._is_abbreviation_table_candidate(candidate):
                     if candidate.source_type == "table_row":
                         score -= 1.10
@@ -2314,54 +3334,164 @@ class RetrievalOrchestrator:
                     else:
                         score -= 0.40
 
-                # Penalize service/header-like rows inside document tables
                 if self._looks_like_service_documents_row(candidate):
                     if candidate.source_type == "table_row":
                         score -= 0.60
                     elif candidate.source_type == "table":
                         score -= 0.30
 
-                # Existing lexical/table heuristics
                 if self._is_required_documents_table_candidate(candidate):
                     if candidate.source_type == "table_row":
                         score += 0.45
                     elif candidate.source_type == "table":
                         score += 0.25
-                    elif candidate.source_type == "legal_fact":
-                        score += 0.08
-                    elif candidate.source_type == "block":
-                        score -= 0.20
 
-                # Additional boosts if candidate explicitly contains requested column hints
-                for hint in requested_column_hints:
-                    hint_norm = self._normalize_text(hint)
-                    if hint_norm and hint_norm in text:
-                        score += 0.06
+                if self._has_documents_anchor_match(candidate, query_terms=query_bundle.get("query_terms") or []):
+                    score += 0.18
 
-                # Channel-specific questions
-                if table_question_profile == "documents_by_submission_channel":
-                    if self._has_submission_channel_match(candidate, submission_channel):
+                if submission_channel and self._has_submission_channel_match(candidate, submission_channel):
+                    score += 0.16
+
+                if any(hint in text_norm for hint in requested_column_hints if hint):
+                    score += 0.08
+
+            elif intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
+                table_semantic_type = self._normalize_text(metadata.get("table_semantic_type"))
+                cells = metadata.get("cells_by_semantic_key") or metadata.get("cells_by_header_key") or {}
+                has_deadline_value = isinstance(cells, dict) and bool(cells.get("deadline_value"))
+                has_temporal_markers = self._has_temporal_deadline_markers(candidate)
+                candidate_kind = self._classify_deadline_candidate_kind(candidate)
+                exact_notification_match = self._has_exact_notification_decision_marker(candidate)                
+                legal_fact_type = self._normalize_text(candidate.title if candidate.source_type == "legal_fact" else "")
+                is_service_core_deadline = bool(metadata.get("is_service_core_deadline"))
+
+                if self._is_deadline_noise_candidate(candidate):
+                    score -= 1.20
+                    
+                if candidate.source_type == "legal_fact":
+                    score += 0.38
+                    if is_service_core_deadline:
+                        score += 0.28
+                    if legal_fact_type in {
+                        "decision_deadline",
+                        "notification_deadline",
+                        "payment_deadline",
+                        "registration_deadline",
+                        "correction_deadline",
+                    }:
+                        score += 0.18
+
+                if self._has_table_semantic_type(candidate, "deadlines") or self._has_table_semantic_type(candidate, "deadline"):
+                    if candidate.source_type == "table_row":
+                        score += 0.45
+                    elif candidate.source_type == "table":
+                        score += 0.22
+
+                if has_deadline_value:
+                    score += 0.30
+
+                if has_temporal_markers:
+                    if candidate.source_type == "block":
+                        score += 0.42
+                    elif candidate.source_type == "table_row":
+                        score += 0.22
+                    else:
+                        score += 0.12
+                else:
+                    # Для deadline path нет смысла держать block-и без явного
+                    # срока: builder потом всё равно их выкинет.
+                    if candidate.source_type == "block":
+                        score -= 0.90
+                    elif candidate.source_type == "table_row" and not has_deadline_value:
+                        score -= 0.60
+                    elif candidate.source_type == "table" and table_semantic_type not in {"deadline", "deadlines"}:
+                        score -= 0.60
+
+                if candidate.source_type == "table_row" and not has_deadline_value and table_semantic_type not in {"deadline", "deadlines"}:
+                    score -= 0.70
+
+                if self._looks_like_service_deadline_row(candidate):
+                    if candidate.source_type == "table_row":
+                        score -= 0.55
+                    elif candidate.source_type == "table":
+                        score -= 0.25
+                    else:
+                        score -= 0.10
+
+                if question_deadline_kind != "other" and candidate_kind == question_deadline_kind:
+                    score += 0.55
+                elif question_deadline_kind != "other" and candidate_kind != "other":
+                    score -= 0.30
+
+                if question_deadline_kind == "notification":
+                    if exact_notification_match:
+                        score += 0.60
+
+                    if "уведом" in text_norm:
+                        score += 0.22
+
+                    if "о принятом решении" in text_norm or "о решении" in text_norm:
+                        score += 0.20
+
+                    if "об отсутствии ошибок" in text_norm:
+                        score -= 1.20
+
+                    if "опечат" in text_norm or "ошиб" in text_norm:
+                        score -= 0.95
+
+                    if "проверки подписи" in text_norm or "электронной подписи" in text_norm:
+                        score -= 1.00
+
+                    if candidate_kind == "correction":
+                        score -= 1.10
+
+                    if candidate_kind == "decision" and not exact_notification_match:
+                        score -= 0.18
+
+                if question_deadline_kind == "payment":
+                    if (
+                        "26-го числа" in text_norm
+                        or "26 числа" in text_norm
+                        or "ежемесячно" in text_norm
+                        or "выплачива" in text_norm
+                        or "перечисля" in text_norm
+                        or "зачисля" in text_norm
+                    ):
+                        score += 0.28
+                    if candidate_kind == "payment":
+                        score += 0.22
+                    if candidate_kind == "decision":
+                        score -= 0.55
+                    if candidate_kind == "notification":
+                        score -= 0.18
+
+                if question_deadline_kind == "decision" and "решение о предоставлении" in text_norm:
+                    score += 0.16
+
+            elif intent_type == QuestionIntentEnum.REJECTION_QUESTION:
+                table_semantic_type = self._normalize_text(metadata.get("table_semantic_type"))
+                candidate_row_scope = self._candidate_row_scope(candidate)
+
+                if table_semantic_type in {"refusal_reasons", "rejection_reasons"}:
+                    if candidate.source_type == "table_row":
+                        score += 0.40
+                    elif candidate.source_type == "table":
+                        score += 0.18
+
+                if question_rejection_scope != "other":
+                    if candidate_row_scope == question_rejection_scope:
                         if candidate.source_type == "table_row":
-                            score += 0.35
+                            score += 0.75
                         elif candidate.source_type == "table":
                             score += 0.20
                         else:
-                            score += 0.08
-                    else:
-                        if candidate.source_type == "block":
-                            score -= 0.10
+                            score += 0.10
+                    elif candidate_row_scope and candidate_row_scope != question_rejection_scope:
+                        if candidate.source_type == "table_row":
+                            score -= 1.10
+                        else:
+                            score -= 0.35
 
-            # -------------------------------
-            # Deadlines
-            # -------------------------------
-            elif intent_type == QuestionIntentEnum.DEADLINE_QUESTION:
-                if "рабочих дней" in text or "календарных дней" in text or "срок" in text:
-                    score += 0.18
-
-            # -------------------------------
-            # Rejection
-            # -------------------------------
-            elif intent_type == QuestionIntentEnum.REJECTION_QUESTION:
                 if any(marker in text for marker in [
                     "основания отказа",
                     "отказа в предоставлении",
@@ -2371,9 +3501,6 @@ class RetrievalOrchestrator:
                 ]):
                     score += 0.18
 
-            # -------------------------------
-            # Eligibility
-            # -------------------------------
             elif intent_type == QuestionIntentEnum.ELIGIBILITY_QUESTION:
                 if any(marker in text for marker in [
                     "имеет право",
@@ -2390,13 +3517,322 @@ class RetrievalOrchestrator:
             key=lambda item: (
                 item.rerank_score if item.rerank_score is not None else item.score,
                 item.score,
+                1 if item.source_type == "block" else 0,
                 1 if item.source_type == "table_row" else 0,
-                1 if item.source_type == "table" else 0,
             ),
             reverse=True,
         )
         return reranked
-    
+
+    def _candidate_row_scope(
+        self,
+        candidate: RetrievedCandidate,
+    ) -> Optional[str]:
+        metadata = candidate.metadata_json or {}
+        value = self._normalize_text(metadata.get("row_scope"))
+        return value or None
+
+
+    def _rejection_candidate_priority_bucket(
+        self,
+        candidate: RetrievedCandidate,
+        *,
+        question_rejection_scope: str,
+        priority_document_set: set[UUID],
+    ) -> int:
+        table_semantic_type = self._normalize_text((candidate.metadata_json or {}).get("table_semantic_type"))
+        candidate_row_scope = self._candidate_row_scope(candidate)
+        in_priority_doc = candidate.document_id in priority_document_set
+
+        if candidate.source_type == "table_row" and table_semantic_type in {"refusal_reasons", "rejection_reasons"}:
+            if in_priority_doc and candidate_row_scope == question_rejection_scope:
+                return 0
+            if in_priority_doc and candidate_row_scope is None:
+                return 1
+            if candidate_row_scope == question_rejection_scope:
+                return 2
+            if candidate_row_scope is None:
+                return 3
+            return 20
+
+        if candidate.source_type == "legal_fact":
+            if in_priority_doc:
+                return 4
+            return 8
+
+        if candidate.source_type == "table" and table_semantic_type in {"refusal_reasons", "rejection_reasons"}:
+            return 5 if in_priority_doc else 9
+
+        if candidate.source_type == "block":
+            return 6 if in_priority_doc else 10
+
+        return 30
+        
+    def _classify_deadline_candidate_kind(
+        self,
+        candidate: RetrievedCandidate,
+    ) -> str:
+        text = self._normalize_text(self._candidate_text_blob(candidate))
+        if not text:
+            return "other"
+
+        if any(marker in text for marker in [
+            "об отсутствии ошибок",
+            "уведомления об отсутствии ошибок",
+            "исправлении ошибок",
+            "исправлении опечаток",
+            "опечаток и ошибок",
+            "нового документа",
+        ]):
+            return "correction"
+
+        notification_markers = [
+            "уведомление о принятом решении",
+            "о принятом решении",
+            "уведомление",
+            "уведомляет",
+            "уведомить",
+            "направляет заявителю",
+            "направляется заявителю",
+            "заявитель уведомляется",
+            "сообщение о решении",
+        ]
+        payment_markers = [
+            "выплаты",
+            "выплата",
+            "выплачивается",
+            "выплатят",
+            "получу выплату",
+            "получу деньги",
+            "поступят деньги",
+            "перечисления",
+            "перечисление",
+            "зачисления",
+            "зачисление",
+            "26-го числа",
+            "26 числа",
+        ]
+        registration_markers = [
+            "регистрация заявления",
+            "регистрация запроса",
+            "регистрируется",
+            "зарегистрировано",
+        ]
+        decision_markers = [
+            "решение о предоставлении",
+            "решение о назначении",
+            "принятия решения",
+            "принятие решения",
+            "рассмотрения заявления",
+            "рассмотрение заявления",
+            "назначении",
+            "назначение",
+        ]
+
+        scores = {
+            "decision": 0,
+            "notification": 0,
+            "payment": 0,
+            "registration": 0,
+            "correction": 0,
+        }
+
+        for marker in notification_markers:
+            if marker in text:
+                scores["notification"] += 2 if "уведомление о принятом решении" in marker else 1
+
+        for marker in payment_markers:
+            if marker in text:
+                scores["payment"] += 1
+
+        for marker in registration_markers:
+            if marker in text:
+                scores["registration"] += 1
+
+        for marker in decision_markers:
+            if marker in text:
+                scores["decision"] += 1
+
+        if scores["notification"] > 0 and "принятия решения" in text:
+            scores["decision"] = int(scores["decision"] * 0.55)
+
+        winner = max(scores, key=scores.get)
+        if scores[winner] <= 0:
+            return "other"
+        return winner
+
+    def _has_temporal_deadline_markers(
+        self,
+        candidate: RetrievedCandidate,
+    ) -> bool:
+        text = self._normalize_text(self._candidate_text_blob(candidate))
+        if not text:
+            return False
+
+        markers = [
+            "в течение",
+            "не позднее",
+            "не более",
+            "рабочих дней",
+            "календарных дней",
+            "26-го числа",
+            "26 числа",
+        ]
+        if any(marker in text for marker in markers):
+            return True
+
+        return any(ch.isdigit() for ch in text) and any(word in text for word in ["дней", "дня", "числа"])
+        
+    def _is_form_candidate(
+        self,
+        candidate: RetrievedCandidate,
+    ) -> bool:
+        metadata = candidate.metadata_json or {}
+        table_semantic_type = self._normalize_text(metadata.get("table_semantic_type"))
+        table_title = self._normalize_text(
+            metadata.get("table_title")
+            or metadata.get("table_name")
+            or candidate.title
+            or ""
+        )
+
+        if table_semantic_type in {"form_fields", "forms", "form"}:
+            return True
+
+        if candidate.source_type in {"table", "table_row"} and (
+            table_title.startswith("форма ")
+            or "форма заявления" in table_title
+            or "согласие на обработку персональных данных" in table_title
+        ):
+            return True
+
+        return False
+        
+    def _has_exact_notification_decision_marker(
+        self,
+        candidate: RetrievedCandidate,
+    ) -> bool:
+        text = self._normalize_text(self._candidate_text_blob(candidate))
+        if not text:
+            return False
+
+        return (
+            "уведом" in text
+            and (
+                "о принятом решении" in text
+                or "о решении" in text
+                or "направляется заявителю" in text
+                or "направляет заявителю" in text
+                or "заявитель уведомляется" in text
+                or "заявитель или представитель уведомляется" in text
+            )
+        )
+
+    def _is_deadline_noise_candidate(
+        self,
+        candidate: RetrievedCandidate,
+    ) -> bool:
+        metadata = candidate.metadata_json or {}
+        table_semantic_type = self._normalize_text(metadata.get("table_semantic_type"))
+
+        if table_semantic_type in {
+            "refusal_reasons",
+            "rejection_reasons",
+            "documents",
+            "identifiers",
+            "categories",
+            "applicant_categories",
+            "glossary",
+            "abbreviations",
+            "aliases",
+        }:
+            cells = metadata.get("cells_by_semantic_key") or metadata.get("cells_by_header_key") or {}
+            if not (isinstance(cells, dict) and cells.get("deadline_value")):
+                return True
+
+        if self._is_abbreviation_table_candidate(candidate):
+            return True
+
+        text = self._normalize_text(self._candidate_text_blob(candidate))
+
+        if "отказа в предоставлении" in text or "перечень оснований" in text:
+            return True
+
+        if any(marker in text for marker in [
+            "уведомления об отсутствии ошибок",
+            "об отсутствии ошибок",
+            "опечаток и ошибок",
+            "исправлении опечаток",
+            "исправлении ошибок",
+            "проверки подписи",
+            "электронной подписи",
+            "статьи 9",
+            "статьи 11",
+        ]):
+            return True
+
+        return False
+
+    def _deadline_candidate_priority_bucket(
+        self,
+        candidate: RetrievedCandidate,
+        *,
+        question_deadline_kind: str,
+        priority_document_set: set[UUID],
+    ) -> int:
+        kind = self._classify_deadline_candidate_kind(candidate)
+        has_temporal_markers = self._has_temporal_deadline_markers(candidate)
+        in_priority_doc = candidate.document_id in priority_document_set
+        exact_notification_match = self._has_exact_notification_decision_marker(candidate)
+
+        if self._is_deadline_noise_candidate(candidate):
+            return 99
+
+        if question_deadline_kind == "notification":
+            if in_priority_doc and candidate.source_type == "legal_fact" and kind == "notification":
+                return 0
+            if in_priority_doc and exact_notification_match:
+                return 1
+            if in_priority_doc and candidate.source_type == "block" and kind == "notification" and has_temporal_markers:
+                return 2
+            if in_priority_doc and candidate.source_type == "table_row" and kind == "notification":
+                return 3
+            if in_priority_doc and candidate.source_type == "block" and kind == "decision" and has_temporal_markers:
+                return 4
+            if in_priority_doc and candidate.source_type == "table_row" and kind == "decision":
+                return 5
+            if in_priority_doc and has_temporal_markers:
+                return 6
+            return 20
+
+        if question_deadline_kind == "decision":
+            if in_priority_doc and candidate.source_type == "legal_fact" and kind == "decision":
+                return 0
+            if in_priority_doc and candidate.source_type == "block" and kind == "decision" and has_temporal_markers:
+                return 1
+            if in_priority_doc and candidate.source_type == "table_row" and kind == "decision":
+                return 2
+            if in_priority_doc and has_temporal_markers:
+                return 3
+            return 20
+
+        if question_deadline_kind == "payment":
+            if in_priority_doc and candidate.source_type == "legal_fact" and kind == "payment":
+                return 0
+            if in_priority_doc and candidate.source_type == "block" and kind == "payment" and has_temporal_markers:
+                return 1
+            if in_priority_doc and candidate.source_type == "table_row" and kind == "payment":
+                return 2
+            if in_priority_doc and has_temporal_markers:
+                return 3
+            return 20
+
+        if in_priority_doc and has_temporal_markers:
+            return 0
+        if has_temporal_markers:
+            return 1
+        return 20
+
     def _has_min_intent_anchor_match(
         self,
         candidate: RetrievedCandidate,
@@ -2405,15 +3841,15 @@ class RetrievalOrchestrator:
         min_matches: int = 2,
     ) -> bool:
         text = self._candidate_text_blob(candidate)
-
         matched = 0
+
         for term in query_terms:
             if not term or len(term) < 3:
                 continue
             if term in text:
                 matched += 1
-            if matched >= min_matches:
-                return True
+                if matched >= min_matches:
+                    return True
 
         return False
         
@@ -2455,3 +3891,19 @@ class RetrievalOrchestrator:
             matches += 1
 
         return matches >= 2
+        
+    def _deadline_candidate_rank_key(self, candidate: RetrievedCandidate) -> tuple[int, float]:
+        metadata = candidate.metadata_json or {}
+        cells = metadata.get("cells_by_semantic_key") or {}
+
+        has_deadline_value = isinstance(cells, dict) and bool(cells.get("deadline_value"))
+        is_deadline_row = candidate.source_type == "table_row" and has_deadline_value
+        is_block = candidate.source_type == "block"
+
+        priority_bucket = 2
+        if is_deadline_row:
+            priority_bucket = 0
+        elif is_block:
+            priority_bucket = 1
+
+        return (priority_bucket, -float(candidate.score or 0.0))

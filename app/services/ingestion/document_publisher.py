@@ -6,7 +6,7 @@
 #
 # Responsibilities:
 #   - create/update document registry entry
-#   - write blocks, tables, rows, legal facts, aliases
+#   - write blocks, tables, rows, legal facts
 #   - ensure publication is atomic
 #   - replace old active revision when business rules require it
 #   - prevent partial publication
@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
-from sqlalchemy import Select, delete, select
+from sqlalchemy import Select, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
@@ -43,15 +43,15 @@ try:
         DocumentTable,
         DocumentTableRow,
         LegalFact,
-        MeasureAlias,
     )  # pragma: no cover
+    from app.db.models.services import ServiceRegistry  # pragma: no cover
 except Exception:  # pragma: no cover
     DocumentRegistry = None  # type: ignore
     DocumentBlock = None  # type: ignore
     DocumentTable = None  # type: ignore
     DocumentTableRow = None  # type: ignore
     LegalFact = None  # type: ignore
-    MeasureAlias = None  # type: ignore
+    ServiceRegistry = None  # type: ignore
 
 
 # ============================================================
@@ -82,6 +82,11 @@ class ExtractionResult:
     doc_uid_base: Optional[str]
     revision_date: Optional[datetime]
 
+    document_number: Optional[str] = None
+    document_date: Optional[datetime] = None
+    service_name_full: Optional[str] = None
+    service_name_short: Optional[str] = None
+
     blocks: list[dict[str, Any]] = field(default_factory=list)
     tables: list[dict[str, Any]] = field(default_factory=list)
     table_rows: list[dict[str, Any]] = field(default_factory=list)
@@ -93,9 +98,7 @@ class ExtractionResult:
 class SemanticEnrichmentResult:
     source_authority: Optional[str]
     document_type: Optional[str]
-    measure_codes: list[str] = field(default_factory=list)
     legal_facts: list[dict[str, Any]] = field(default_factory=list)
-    aliases: list[dict[str, Any]] = field(default_factory=list)
     enrichment_payload_json: dict[str, Any] = field(default_factory=dict)
 
 
@@ -147,6 +150,22 @@ class PublicationPlan:
     mode: str = "insert_new_active"
 
 
+@dataclass(slots=True)
+class ServiceBinding:
+    """
+    Concrete service resolved from service_registry for a published document.
+    """
+    service_key: Optional[str]
+    service_name_full: str
+    service_name_short: str
+    frgu_1: Optional[str]
+    frgu_3: Optional[str]
+    raw_filename: str
+    cleaned_filename: str
+    match_field: str
+
+
+
 # ============================================================
 # Exceptions
 # ============================================================
@@ -176,8 +195,14 @@ class DocumentPublisher:
     Transactional publisher for active knowledge base.
     """
 
-    def __init__(self, db: AsyncSession) -> None:
+    def __init__(
+        self,
+        db: AsyncSession,
+        *,
+        require_service_binding: bool = True,
+    ) -> None:
         self.db = db
+        self.require_service_binding = require_service_binding
 
     async def publish(
         self,
@@ -198,11 +223,13 @@ class DocumentPublisher:
         self._validate_publish_input(payload)
 
         plan = await self._build_publication_plan(payload)
+        service_binding = await self._resolve_service_binding(payload)
 
         try:
             document = await self._upsert_document_registry(
                 payload=payload,
                 plan=plan,
+                service_binding=service_binding,
             )
 
             await self._replace_document_children(
@@ -226,9 +253,9 @@ class DocumentPublisher:
                 "tables_count": len(payload.extraction_result.tables or []),
                 "table_rows_count": len(payload.extraction_result.table_rows or []),
                 "legal_facts_count": len(payload.enrichment_result.legal_facts or []),
-                "aliases_count": len(payload.enrichment_result.aliases or []),
                 "file_hash": payload.file_info.file_hash,
                 "content_hash": payload.normalized_result.normalized_content_hash,
+                "service_binding": self._service_binding_payload(service_binding),
             }
 
             logger.info(
@@ -272,7 +299,7 @@ class DocumentPublisher:
             DocumentTable,
             DocumentTableRow,
             LegalFact,
-            MeasureAlias,
+            ServiceRegistry,
         ]
         if any(model is None for model in required):
             raise DocumentPublisherDependencyError(
@@ -362,6 +389,118 @@ class DocumentPublisher:
         return list(result.scalars().all())
 
     # ---------------------------------------------------------
+    # Service binding
+    # ---------------------------------------------------------
+
+    async def _resolve_service_binding(
+        self,
+        payload: PublishInput,
+    ) -> ServiceBinding:
+        """
+        Resolve concrete service for the document before publication.
+
+        The stable anchor for the current corpus is the filename from
+        Актуальный_приказ5.xlsx:
+        - cleaned_filename for processed DOCX;
+        - raw_filename as a safe fallback for raw DOCX smoke checks.
+
+        For the 110-document production corpus missing binding is a data error,
+        not a warning: publishing unbound active documents would reintroduce the
+        ambiguity that appeared with the old measure_code layer.
+        """
+        candidate_filename = self._filename_basename(payload.file_info.original_filename)
+        if not candidate_filename:
+            raise DocumentPublicationValidationError(
+                "Cannot resolve service: original_filename is empty."
+            )
+
+        normalized_filename = self._normalize_filename_for_match(candidate_filename)
+
+        stmt: Select[Any] = (
+            select(ServiceRegistry)
+            .where(ServiceRegistry.is_active.is_(True))
+            .where(
+                or_(
+                    func.lower(ServiceRegistry.cleaned_filename) == normalized_filename,
+                    func.lower(ServiceRegistry.raw_filename) == normalized_filename,
+                )
+            )
+        )
+        result = await self.db.execute(stmt)
+        matches = list(result.scalars().all())
+
+        if len(matches) == 1:
+            service = matches[0]
+            cleaned = self._str_or_none(getattr(service, "cleaned_filename", None)) or ""
+            raw = self._str_or_none(getattr(service, "raw_filename", None)) or ""
+            match_field = "cleaned_filename"
+            if self._normalize_filename_for_match(raw) == normalized_filename:
+                match_field = "raw_filename"
+
+            return ServiceBinding(
+                service_key=str(getattr(service, "service_key")),
+                service_name_full=str(getattr(service, "service_name_full")),
+                service_name_short=str(getattr(service, "service_name_short")),
+                frgu_1=self._str_or_none(getattr(service, "frgu_1", None)),
+                frgu_3=self._str_or_none(getattr(service, "frgu_3", None)),
+                raw_filename=raw,
+                cleaned_filename=cleaned,
+                match_field=match_field,
+            )
+
+        if len(matches) > 1:
+            raise DocumentPublicationValidationError(
+                "Cannot resolve service: several active services match filename "
+                f"'{candidate_filename}'."
+            )
+
+        if self.require_service_binding:
+            raise DocumentPublicationValidationError(
+                "Cannot resolve service: no active service_registry row matches "
+                f"filename '{candidate_filename}'. Import Актуальный_приказ5.xlsx "
+                "before full-corpus ingestion and check cleaned_filename/raw_filename."
+            )
+
+        extracted_full_name = (payload.extraction_result.service_name_full or "").strip()
+        extracted_short_name = (payload.extraction_result.service_name_short or "").strip()
+        return ServiceBinding(
+            service_key=None,
+            service_name_full=extracted_full_name or "Услуга не привязана к service_registry",
+            service_name_short=extracted_short_name or "Услуга не привязана",
+            frgu_1=None,
+            frgu_3=None,
+            raw_filename=candidate_filename,
+            cleaned_filename=candidate_filename,
+            match_field="unbound",
+        )
+
+    def _service_binding_payload(
+        self,
+        binding: ServiceBinding,
+    ) -> dict[str, Any]:
+        return {
+            "service_key": binding.service_key,
+            "service_name_full": binding.service_name_full,
+            "service_name_short": binding.service_name_short,
+            "frgu_1": binding.frgu_1,
+            "frgu_3": binding.frgu_3,
+            "raw_filename": binding.raw_filename,
+            "cleaned_filename": binding.cleaned_filename,
+            "match_field": binding.match_field,
+        }
+
+    def _filename_basename(self, value: Any) -> Optional[str]:
+        text = self._str_or_none(value)
+        if text is None:
+            return None
+        text = text.replace("\\", "/")
+        return text.rsplit("/", 1)[-1].strip() or None
+
+    def _normalize_filename_for_match(self, value: Any) -> str:
+        text = self._filename_basename(value) or ""
+        return text.strip().lower()
+
+    # ---------------------------------------------------------
     # Registry upsert
     # ---------------------------------------------------------
 
@@ -370,6 +509,7 @@ class DocumentPublisher:
         *,
         payload: PublishInput,
         plan: PublicationPlan,
+        service_binding: ServiceBinding,
     ) -> Any:
         """
         Create a new active document row.
@@ -383,6 +523,14 @@ class DocumentPublisher:
 
             doc_uid_base=payload.extraction_result.doc_uid_base,
             revision_date=payload.extraction_result.revision_date,
+
+            document_number=payload.extraction_result.document_number,
+            document_date=payload.extraction_result.document_date,
+            service_name_full=service_binding.service_name_full,
+            service_name_short=service_binding.service_name_short,
+            service_key=service_binding.service_key,
+            service_frgu_1=service_binding.frgu_1,
+            service_frgu_3=service_binding.frgu_3,
 
             document_name=payload.extraction_result.document_title,
             document_type=payload.enrichment_result.document_type,
@@ -412,6 +560,22 @@ class DocumentPublisher:
                 "warnings": payload.qc_result.warnings,
                 "input_metadata": payload.input_payload.metadata_json,
                 "uploaded_by": payload.input_payload.uploaded_by,
+                "extracted_document_metadata": {
+                    "document_number": payload.extraction_result.document_number,
+                    "document_date": (
+                        payload.extraction_result.document_date.isoformat()
+                        if payload.extraction_result.document_date is not None
+                        else None
+                    ),
+                    "revision_date": (
+                        payload.extraction_result.revision_date.isoformat()
+                        if payload.extraction_result.revision_date is not None
+                        else None
+                    ),
+                    "service_name_full": payload.extraction_result.service_name_full,
+                    "service_name_short": payload.extraction_result.service_name_short,
+                },
+                "service_registry_binding": self._service_binding_payload(service_binding),
             },
 
             created_at=self._utcnow(),
@@ -455,11 +619,6 @@ class DocumentPublisher:
         await self._write_legal_facts(
             document_id=document_id,
             legal_facts=payload.enrichment_result.legal_facts or [],
-        )
-
-        await self._write_aliases(
-            document_id=document_id,
-            aliases=payload.enrichment_result.aliases or [],
         )
 
     async def _write_blocks(
@@ -575,7 +734,6 @@ class DocumentPublisher:
                 document_id=document_id,
 
                 fact_type=self._str_or_none(fact.get("fact_type")) or "other",
-                measure_code=self._str_or_none(fact.get("measure_code")),
                 subject_category=self._str_or_none(fact.get("subject_category")),
 
                 condition_json=self._dict_or_empty(fact.get("condition_json")),
@@ -584,29 +742,6 @@ class DocumentPublisher:
 
                 citation_json=self._dict_or_empty(fact.get("citation_json")),
                 metadata_json=self._dict_or_empty(fact.get("metadata_json")),
-            )
-            self.db.add(model)
-
-        await self.db.flush()
-
-    async def _write_aliases(
-        self,
-        *,
-        document_id: UUID,
-        aliases: list[dict[str, Any]],
-    ) -> None:
-        """
-        For current stage we store aliases bound to document.
-        Later alias governance can be centralized if needed.
-        """
-        for alias in aliases:
-            model = MeasureAlias(
-                alias_id=uuid4(),
-                document_id=document_id,
-                alias=self._str_or_none(alias.get("alias")) or "",
-                measure_code=self._str_or_none(alias.get("measure_code")),
-                canonical_name=self._str_or_none(alias.get("canonical_name")),
-                metadata_json=self._dict_or_empty(alias.get("metadata_json")),
             )
             self.db.add(model)
 

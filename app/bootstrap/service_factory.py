@@ -27,9 +27,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.services.answers.answer_orchestrator import (
     AnswerOrchestrator,
     IntentClassifierProtocol,
+<<<<<<< HEAD
+    LLMAnswerComposerProtocol,
+=======
+<<<<<<< HEAD
+    LLMAnswerComposerProtocol,
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
+>>>>>>> 4c04853102b91a0c6e1fdd3692b3fb98688e2646
+    MessageGuardProtocol,
+    MessageUnderstandingProtocol,
     QuestionEmbeddingProtocol,
     QuestionNormalizerProtocol,
 )
+from app.services.answers.message_guard import RuleBasedMessageGuard
 from app.services.answers.runtime_answer_service import RuntimeAnswerService
 from app.services.channels.messenger_response_builder import MessengerResponseBuilder
 from app.services.feedback.feedback_service import FeedbackService
@@ -43,6 +54,8 @@ from app.services.retrieval.retrieval_orchestrator import (
     RetrievalOrchestrator,
     RetrievalRerankerProtocol,
 )
+from app.services.retrieval.service_discovery import ServiceDiscovery
+from app.services.retrieval.service_resolver import ServiceResolver
 from app.services.reuse.reuse_gate import ReuseGate
 from app.adapters.telegram.telegram_message_adapter import TelegramMessageAdapter
 
@@ -103,19 +116,41 @@ class ServiceFactory:
         *,
         intent_classifier: IntentClassifierProtocol,
         question_normalizer: QuestionNormalizerProtocol,
+        message_guard: Optional[MessageGuardProtocol] = None,
         question_embedding_service: Optional[QuestionEmbeddingProtocol] = None,
+        message_understanding_service: Optional[MessageUnderstandingProtocol] = None,
+<<<<<<< HEAD
+        llm_answer_composer_service: Optional[LLMAnswerComposerProtocol] = None,
+=======
+<<<<<<< HEAD
+        llm_answer_composer_service: Optional[LLMAnswerComposerProtocol] = None,
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
+>>>>>>> 4c04853102b91a0c6e1fdd3692b3fb98688e2646
         config: Optional[ServiceFactoryConfig] = None,
     ) -> None:
         self.db = db
         self.intent_classifier = intent_classifier
         self.question_normalizer = question_normalizer
+        self.message_guard = message_guard or RuleBasedMessageGuard()
         self.question_embedding_service = question_embedding_service
+        self.message_understanding_service = message_understanding_service
+<<<<<<< HEAD
+        self.llm_answer_composer_service = llm_answer_composer_service
+=======
+<<<<<<< HEAD
+        self.llm_answer_composer_service = llm_answer_composer_service
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
+>>>>>>> 4c04853102b91a0c6e1fdd3692b3fb98688e2646
         self.config = config or ServiceFactoryConfig()
 
         self._feedback_service: Optional[FeedbackService] = None
         self._sampling_policy: Optional[SamplingPolicy] = None
         self._reuse_gate: Optional[ReuseGate] = None
         self._retrieval_orchestrator: Optional[RetrievalOrchestrator] = None
+        self._service_resolver: Optional[ServiceResolver] = None
+        self._service_discovery: Optional[ServiceDiscovery] = None
         self._generation_pipeline: Optional[GenerationPipeline] = None
         self._runtime_answer_service: Optional[RuntimeAnswerService] = None
         self._answer_orchestrator: Optional[AnswerOrchestrator] = None
@@ -152,6 +187,16 @@ class ServiceFactory:
             )
         return self._retrieval_orchestrator
 
+    def get_service_resolver(self) -> ServiceResolver:
+        if self._service_resolver is None:
+            self._service_resolver = ServiceResolver(self.db)
+        return self._service_resolver
+
+    def get_service_discovery(self) -> ServiceDiscovery:
+        if self._service_discovery is None:
+            self._service_discovery = ServiceDiscovery(self.db)
+        return self._service_discovery
+
     def get_generation_pipeline(self) -> GenerationPipeline:
         if self._generation_pipeline is None:
             self._generation_pipeline = GenerationPipeline(
@@ -166,6 +211,8 @@ class ServiceFactory:
             self._runtime_answer_service = RuntimeAnswerService(
                 retrieval_orchestrator=self.get_retrieval_orchestrator(),
                 generation_pipeline=self.get_generation_pipeline(),
+                service_resolver=self.get_service_resolver(),
+                service_discovery=self.get_service_discovery(),
             )
         return self._runtime_answer_service
 
@@ -187,7 +234,17 @@ class ServiceFactory:
                 reuse_gate=self.get_reuse_gate(),
                 intent_classifier=self.intent_classifier,
                 question_normalizer=self.question_normalizer,
+                message_guard=self.message_guard,
                 question_embedding_service=self.question_embedding_service,
+                message_understanding_service=self.message_understanding_service,
+<<<<<<< HEAD
+                llm_answer_composer_service=self.llm_answer_composer_service,
+=======
+<<<<<<< HEAD
+                llm_answer_composer_service=self.llm_answer_composer_service,
+=======
+>>>>>>> bba36515540dbe4eec46b473a736432fb4d55ceb
+>>>>>>> 4c04853102b91a0c6e1fdd3692b3fb98688e2646
                 runtime_answer_service=self.get_runtime_answer_service(),
                 sampling_policy=self.get_sampling_policy(),
             )
@@ -216,6 +273,8 @@ class ServiceFactory:
             "sampling_policy": self.get_sampling_policy(),
             "reuse_gate": self.get_reuse_gate(),
             "retrieval_orchestrator": self.get_retrieval_orchestrator(),
+            "service_resolver": self.get_service_resolver(),
+            "service_discovery": self.get_service_discovery(),
             "generation_pipeline": self.get_generation_pipeline(),
             "runtime_answer_service": self.get_runtime_answer_service(),
             "answer_orchestrator": self.get_answer_orchestrator(),
